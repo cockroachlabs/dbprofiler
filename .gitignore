@@ -1,0 +1,15 @@
+# Local test environment — contains connection strings and the HMAC key.
+# Never commit.
+.env.test.local
+
+# Profile bundles produced by running the tool.
+*.zip
+*.zip.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
