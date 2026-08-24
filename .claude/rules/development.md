@@ -34,9 +34,13 @@ that property true.
 
 ## Credentials
 
-- No connection string or credential in source, tests, fixtures, docs, output, logs,
-  or error messages — not even a fake-looking one, which reviewers cannot distinguish
-  from a real leak.
+- No real connection string or credential in source, tests, fixtures, docs, output,
+  logs, or error messages.
+- Tests that must exercise connection strings use only these synthetic values, so that
+  a reviewer grepping for a leak can tell test data from the real thing at a glance:
+  host `db.invalid` (`.invalid` is reserved by RFC 2606 and can never resolve), user
+  `example-user`, password `example-password`, database `example-db`. Do not invent
+  new ones.
 - Credentials reach child processes only through `env=`, never through `argv`.
 - Redact subprocess stderr before it is surfaced. Assume every error path is printed.
 - `.env.test.local` holds local test configuration, is gitignored, and is never
