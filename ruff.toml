@@ -1,0 +1,12 @@
+target-version = "py39"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+# S404/S603: this tool's whole job is invoking psql and pg_dump. Argument
+# construction is audited by hand and covered by tests in test_dbprofiler.py.
+ignore = ["S404", "S603"]
+
+[lint.per-file-ignores]
+"test_dbprofiler.py" = ["S101", "S105", "S106"]
+"integration_test.py" = ["S101", "S105", "S106"]
