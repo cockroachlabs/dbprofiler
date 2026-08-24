@@ -162,12 +162,39 @@ connection-string scan remain for task 3.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write failing tests for: env-sourced connection config (`DBPROFILER_POSTGRES_URL` and `--url`), URL parsing into `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `.zip` output validation, PostgreSQL major 16 assertion, schema include/exclude flag conflicts, `ContractVersion == "1.0"`. Use `unittest.mock.patch.dict(os.environ, ...)`; never embed a URL.
-- [ ] Implement `argparse` with `postgres` subparser, `--check-safety`, `--version`.
-- [ ] Implement URL parser (stdlib `urllib.parse`) → dict of libpq env vars; strip password before any log/repr.
-- [ ] Implement server-version probe via `SELECT current_setting('server_version_num')::int`; require `>= 160000 AND < 170000` for MVP; error message must not leak connection details.
-- [ ] Define `@dataclass` contract types (Profile, Source, Table, Column, Relationship, FanOut, Manifest, Warning, Observation). No `dict[str, Any]` in the public contract.
-- [ ] Run focused tests; expect PASS.
+- [x] Write failing tests for: env-sourced connection config (`DBPROFILER_POSTGRES_URL` and `--url`), URL parsing into `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `.zip` output validation, PostgreSQL major 16 assertion, schema include/exclude flag conflicts, `ContractVersion == "1.0"`. Use `unittest.mock.patch.dict(os.environ, ...)`; never embed a URL. → 36 new tests, confirmed red before implementation.
+- [x] Implement `argparse` with `postgres` subparser, `--check-safety`, `--version`.
+- [x] Implement URL parser (stdlib `urllib.parse`) → dict of libpq env vars; strip password before any log/repr.
+- [x] Implement server-version probe via `SELECT current_setting('server_version_num')::int`; require `>= 160000 AND < 170000` for MVP; error message must not leak connection details. → `SQL_SERVER_VERSION` and `require_supported_version()` are in; issuing the query waits on `run_psql` in task 3.
+- [x] Define `@dataclass` contract types (Profile, Source, Table, Column, Relationship, FanOut, Manifest, Warning, Observation). No `dict[str, Any]` in the public contract.
+- [x] Run focused tests; expect PASS. → 47 tests pass, `--check-safety` exit 0, `ruff check` clean.
+
+**Additions beyond the checklist:**
+
+- **The URL parser rejects unknown query parameters.** The plan named five libpq
+  variables. A URL carrying `?sslmode=require` would have had that silently dropped,
+  downgrading a connection the customer asked to encrypt. Twelve libpq parameters are
+  now mapped to their `PG*` equivalents (`sslmode`, the three `ssl*` file paths,
+  `connect_timeout`, `application_name`, `options`, and the five originals) and anything
+  outside the map is a hard error rather than a silent omission.
+- **Absent URL components are omitted, not defaulted.** Inventing `PGPORT=5432` would
+  override a customer's own environment. libpq's defaults are better than ours.
+- **Ports and the database name are validated.** Port must be 1-65535 (`urlsplit`
+  accepts 0); a URL with no database is an error rather than a libpq fallback to the
+  username.
+- **`Warning` is named `ProfileWarning`.** The plan's name shadows the builtin exception
+  class, which would turn any `except Warning:` in this file into a `TypeError`.
+- **Contract collections are tuples, not lists.** A frozen dataclass holding a list is
+  still mutable through that list.
+- **`DbprofilerError` base class**, caught in `main()` and printed as a message rather
+  than a traceback — stack frames can carry values we have promised not to print.
+
+**Test convention adopted:** tests that must exercise connection strings use only
+`db.invalid` / `example-user` / `example-password` / `example-db`. `.invalid` is reserved
+by RFC 2606 and can never resolve, so a reviewer grepping for a leak can tell test data
+from a real credential at a glance. Recorded in `.claude/rules/development.md`, which
+previously banned connection strings in tests outright — a rule this task could not have
+satisfied while still testing the parser.
 
 ### Task 3: Safe subprocess helpers and `--check-safety`
 
