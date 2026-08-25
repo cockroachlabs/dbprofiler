@@ -289,11 +289,55 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`, `testdata/golden/`.
 
-- [ ] Write failing golden tests for typed rows from `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type`, `pg_constraint`, `pg_index`, `pg_stats`, `pg_stats_ext` using recorded `psql --csv` output as fixtures. Each fixture is sanitized: no real customer identifiers.
-- [ ] Assert `SQL_*` constants for these collectors pass `--check-safety`.
-- [ ] Implement `collect_catalog(cfg)` returning typed lists: tables (row/size estimates), columns (supported stats), FKs (ordered columns + actions), extended stats (multicolumn n-distinct/MCV).
-- [ ] Detect partitioned/inherited tables (`relkind IN ('p','I')` or `pg_inherits` membership); fail with an unsupported-MVP error before any normalized output.
-- [ ] Run tests; expect PASS.
+- [x] Write failing golden tests for typed rows from `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type`, `pg_constraint`, `pg_index`, `pg_stats`, `pg_stats_ext` using recorded `psql --csv` output as fixtures. Each fixture is sanitized: no real customer identifiers.
+- [x] Assert `SQL_*` constants for these collectors pass `--check-safety`.
+- [x] Implement `collect_catalog(cfg)` returning typed lists: tables (row/size estimates), columns (supported stats), FKs (ordered columns + actions), extended stats (multicolumn n-distinct/MCV).
+- [x] Detect partitioned/inherited tables (`relkind IN ('p','I')` or `pg_inherits` membership); fail with an unsupported-MVP error before any normalized output.
+- [x] Run tests; expect PASS. → 157 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **The layout check runs after two queries, not after all seven.** `SQL_TABLES` and
+  `SQL_INHERITED` are issued first and `require_supported_layout` raises immediately, so
+  an unsupported database does not pay for five more round trips. The error names the
+  offending relation and says why the estimate would be wrong rather than just that the
+  feature is unimplemented: a partitioned parent's `reltuples` is not the sum of its
+  children, so a fan-out derived from it is silently incorrect, which is worse than
+  refusing.
+- **Collector records are separate types from the contract dataclasses.** `CatalogTable`,
+  `CatalogColumn`, `ColumnStatistics`, `ExtendedStatistics`, `CatalogForeignKey`,
+  `CatalogIndex` hold PostgreSQL's own encodings — including raw MCVs and histogram
+  bounds — and none of them is serialized. Normalization (task 8) maps them onto the
+  contract types after tokenization (task 7). Keeping raw values in a type that is never
+  written is the structural half of the guarantee; the negative assertions are the other.
+- **`parse_pg_array` is a real parser, not a `split(",")`.** PostgreSQL quotes and
+  backslash-escapes elements containing a comma, brace, quote or backslash. Splitting
+  would corrupt exactly the values that matter most — keys with embedded punctuation —
+  and would do it silently.
+- **`pg_ndistinct` keys are resolved to column names at collection time.** PostgreSQL
+  renders extended n-distinct as `{"2, 3": 4200}`, keyed by comma-separated attnums.
+  `parse_extended_n_distinct` maps those through the collected `pg_attribute` rows to
+  `{("user_id", "placed_at"): 4200.0}`. Downstream code should not have to carry attnum
+  arithmetic, and the mapping is only available while the column rows are in hand.
+- **Foreign keys are assembled from one row per column.** `SQL_FOREIGN_KEYS` uses
+  `unnest(conkey, confkey) WITH ORDINALITY`, and `assemble_foreign_keys` groups by
+  constraint and sorts by the ordinal, so composite keys keep their declared column
+  order. Referential action characters are expanded to their SQL spelling via
+  `REFERENTIAL_ACTIONS`; an unrecognized character maps to `""` rather than raising.
+- **Type support is decided by an allowlist, not a denylist.** `SUPPORTED_TYPE_NAMES`
+  enumerates base types with a CockroachDB equivalent; anything absent is reported
+  unsupported. For a migration plan a false negative costs an investigation, while a
+  false positive costs a failed cutover. Enums (`typtype = 'e'`) are supported;
+  composites, domains, ranges and multiranges are not. Arrays are resolved by stripping
+  the element type's leading underscore.
+- **`pg_inherits` was added to `ALLOWED_RELATIONS`** in this change, per the house rule
+  that a relation is allowlisted alongside the collector that reads it.
+- **New error type `UnsupportedObject`,** distinct from the version errors: the remedy is
+  to narrow `--schema-include`, not to upgrade anything.
+- **`testdata/golden/README.md`** records the fixture conventions — `-t` means no header
+  row, NULL is an empty field, booleans are `t`/`f`, arrays cast to text arrive as
+  `{a,b,c}` — so a later contributor can add a fixture without re-deriving them from
+  `psql`.
 
 ### Task 6: Tier 1 workload telemetry
 

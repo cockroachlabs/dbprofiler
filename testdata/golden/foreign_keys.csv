@@ -1,0 +1,2 @@
+orders_user_id_fkey,public,orders,public,users,user_id,id,1,a,c
+invoices_order_fkey,sales,invoices,public,orders,order_id,id,1,a,a

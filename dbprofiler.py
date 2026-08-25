@@ -51,6 +51,7 @@ import ast
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import subprocess
@@ -109,6 +110,10 @@ class UnsupportedClientVersion(DbprofilerError):
     """The local psql or pg_dump is too old for the source server."""
 
 
+class UnsupportedObject(DbprofilerError):
+    """The source contains an object shape this release does not model."""
+
+
 class CommandError(DbprofilerError):
     """A psql or pg_dump invocation failed. Any stderr here is already redacted."""
 
@@ -139,6 +144,7 @@ ALLOWED_RELATIONS = frozenset(
         "pg_constraint",
         "pg_description",
         "pg_index",
+        "pg_inherits",
         "pg_namespace",
         "pg_sequence",
         "pg_stat_statements",
@@ -331,6 +337,97 @@ SQL_SERVER_VERSION = "SELECT current_setting('server_version_num')::int"
 SQL_SCHEMA_FINGERPRINT = """
 SELECT n.nspname, c.relname, c.relkind
 FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
+
+# Row-count and size estimates. reltuples is the planner's estimate, maintained
+# by autovacuum -- reading it is what makes profiling a large table free. The
+# relkind filter includes 'p' and 'I' deliberately: the layout check below has
+# to see a partitioned object in order to reject it.
+SQL_TABLES = """
+SELECT n.nspname, c.relname, c.relkind, c.reltuples,
+       pg_catalog.pg_total_relation_size(c.oid)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'm', 'p', 'I')
+  AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
+
+# Inheritance children, for the same layout check.
+SQL_INHERITED = """
+SELECT n.nspname, c.relname
+FROM pg_catalog.pg_inherits inh
+JOIN pg_catalog.pg_class c ON c.oid = inh.inhrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
+
+# Column shape. format_type gives the declared type as an operator would write
+# it; typname, typtype and typcategory give the classifier something stable to
+# match on, since "character varying(50)" and "varchar" are the same type.
+SQL_COLUMNS = """
+SELECT n.nspname, c.relname, a.attname, a.attnum,
+       pg_catalog.format_type(a.atttypid, a.atttypmod),
+       t.typname, t.typtype, t.typcategory, a.attnotnull
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+WHERE a.attnum > 0 AND NOT a.attisdropped
+  AND c.relkind IN ('r', 'm')
+  AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
+
+# Per-column statistics as PostgreSQL already computed them. pg_stats is a view
+# over pg_statistic that shows a row only where the caller could read the table
+# itself, which is why this reads the view and never the underlying catalog.
+# most_common_vals and histogram_bounds are raw customer values; they are held in
+# memory here and tokenized before anything is written.
+SQL_COLUMN_STATS = """
+SELECT s.schemaname, s.tablename, s.attname, s.null_frac, s.avg_width, s.n_distinct,
+       s.most_common_vals::text, s.most_common_freqs::text, s.histogram_bounds::text
+FROM pg_catalog.pg_stats s
+WHERE left(s.schemaname, 3) <> 'pg_' AND s.schemaname <> 'information_schema'
+"""
+
+# Multicolumn statistics, where the operator has already created them. Only the
+# n-distinct estimate and the existence of an MCV list are read: the MCV entries
+# themselves are raw values, and their presence is all a migration plan needs.
+SQL_EXTENDED_STATS = """
+SELECT e.schemaname, e.tablename, e.statistics_name, e.attnames::text,
+       e.n_distinct::text, (e.most_common_freqs IS NOT NULL)
+FROM pg_catalog.pg_stats_ext e
+WHERE left(e.schemaname, 3) <> 'pg_' AND e.schemaname <> 'information_schema'
+"""
+
+# One row per foreign-key column, ordered by position within the key. unnest
+# pairs each child attnum with its parent attnum so composite keys keep their
+# declared order; Python reassembles the rows into one record per constraint.
+SQL_FOREIGN_KEYS = """
+SELECT con.conname, cn.nspname, cc.relname, pn.nspname, pc.relname,
+       ca.attname, pa.attname, k.ord, con.confupdtype, con.confdeltype
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class cc ON cc.oid = con.conrelid
+JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace
+JOIN pg_catalog.pg_class pc ON pc.oid = con.confrelid
+JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(child, parent, ord)
+  ON true
+JOIN pg_catalog.pg_attribute ca ON ca.attrelid = con.conrelid AND ca.attnum = k.child
+JOIN pg_catalog.pg_attribute pa ON pa.attrelid = con.confrelid AND pa.attnum = k.parent
+WHERE con.contype = 'f'
+  AND left(cn.nspname, 3) <> 'pg_' AND cn.nspname <> 'information_schema'
+ORDER BY con.conname, k.ord
+"""
+
+# Index inventory. The DDL is already in schema.sql; this is the machine-readable
+# form that pairs with the Tier 1 usage counters.
+SQL_INDEXES = """
+SELECT n.nspname, c.relname, ic.relname, i.indisunique, i.indisprimary
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
 """
@@ -901,6 +998,388 @@ def collect_schema(config: PostgresConfig, server_version_num: int) -> tuple[str
     digest = schema_fingerprint(config)
     schema_sql = run_pg_dump(build_pg_dump_args(config), config)
     return schema_sql, digest
+
+
+# --- catalog value parsing -------------------------------------------------
+# psql --csv renders NULL as an empty field, booleans as t/f, and arrays as
+# their PostgreSQL text form. These turn that back into Python.
+
+
+def pg_bool(text: str) -> bool:
+    return text == "t"
+
+
+def pg_int(text: str, default: int = 0) -> int:
+    try:
+        return int(float(text))
+    except ValueError:
+        return default
+
+
+def pg_float(text: str) -> float | None:
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_pg_array(text: str) -> tuple[str, ...]:
+    """Parse a PostgreSQL array literal into its elements.
+
+    Elements containing a comma, brace, quote or backslash arrive quoted and
+    escaped. Splitting on "," would corrupt exactly the values -- keys with
+    embedded commas, text with punctuation -- that matter most for join shape.
+    """
+    if not text.startswith("{") or not text.endswith("}"):
+        return ()
+    body = text[1:-1]
+    if not body:
+        return ()
+
+    items: list[str] = []
+    current: list[str] = []
+    quoted = False
+    escaped = False
+    for char in body:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == "," and not quoted:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    items.append("".join(current))
+    return tuple(items)
+
+
+def parse_pg_float_array(text: str) -> tuple[float, ...]:
+    parsed = (pg_float(item) for item in parse_pg_array(text))
+    return tuple(value for value in parsed if value is not None)
+
+
+# --- type support ----------------------------------------------------------
+
+# PostgreSQL base types with a direct CockroachDB equivalent. Anything absent is
+# reported unsupported: for a migration plan a false negative costs an
+# investigation, while a false positive costs a failed cutover.
+SUPPORTED_TYPE_NAMES = frozenset(
+    {
+        "bit",
+        "bool",
+        "bpchar",
+        "bytea",
+        "char",
+        "date",
+        "float4",
+        "float8",
+        "inet",
+        "int2",
+        "int4",
+        "int8",
+        "interval",
+        "json",
+        "jsonb",
+        "name",
+        "numeric",
+        "oid",
+        "text",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "timetz",
+        "uuid",
+        "varbit",
+        "varchar",
+    }
+)
+
+# pg_type.typtype values with no CockroachDB equivalent: composite, domain,
+# range, multirange. Enums ('e') are supported and handled separately.
+UNSUPPORTED_TYPE_KINDS = frozenset({"c", "d", "r", "m"})
+
+ENUM_TYPE_KIND = "e"
+ARRAY_TYPE_CATEGORY = "A"
+
+
+def is_supported_type(type_name: str, type_kind: str, type_category: str) -> bool:
+    """Report whether a column type has a CockroachDB equivalent."""
+    if type_kind == ENUM_TYPE_KIND:
+        return True
+    if type_kind in UNSUPPORTED_TYPE_KINDS:
+        return False
+    if type_category == ARRAY_TYPE_CATEGORY:
+        # An array's element type is its own type name with a leading underscore.
+        return type_name.lstrip("_") in SUPPORTED_TYPE_NAMES
+    return type_name in SUPPORTED_TYPE_NAMES
+
+
+# --- collected records -----------------------------------------------------
+# Raw catalog rows, one dataclass per query. Deliberately separate from the
+# contract types above: these hold PostgreSQL's own encodings, including raw
+# statistic values, and nothing here is serialized directly.
+
+
+@dataclass(frozen=True)
+class CatalogTable:
+    schema: str
+    name: str
+    relkind: str
+    reltuples: float
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class CatalogColumn:
+    schema: str
+    table: str
+    name: str
+    ordinal: int
+    data_type: str
+    type_name: str
+    is_nullable: bool
+    is_supported: bool
+
+
+@dataclass(frozen=True)
+class ColumnStatistics:
+    """One pg_stats row. most_common_vals and histogram_bounds are raw values."""
+
+    schema: str
+    table: str
+    column: str
+    null_frac: float
+    avg_width: int
+    n_distinct: float  # negative means "fraction of rows"; resolved in normalization
+    most_common_vals: tuple[str, ...]
+    most_common_freqs: tuple[float, ...]
+    histogram_bounds: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExtendedStatistics:
+    schema: str
+    table: str
+    name: str
+    columns: tuple[str, ...]
+    # Column-set -> distinct estimate. A mapping rather than a tuple because
+    # composite fan-out looks up an exact column set; this is a collection
+    # record, not part of the serialized contract.
+    n_distinct: dict
+    has_most_common_values: bool
+
+
+@dataclass(frozen=True)
+class CatalogForeignKey:
+    constraint_name: str
+    child_schema: str
+    child_table: str
+    child_columns: tuple[str, ...]
+    parent_schema: str
+    parent_table: str
+    parent_columns: tuple[str, ...]
+    on_update: str
+    on_delete: str
+
+
+@dataclass(frozen=True)
+class CatalogIndex:
+    schema: str
+    table: str
+    name: str
+    is_unique: bool
+    is_primary: bool
+
+
+@dataclass(frozen=True)
+class CatalogObservations:
+    tables: tuple[CatalogTable, ...] = ()
+    columns: tuple[CatalogColumn, ...] = ()
+    column_stats: tuple[ColumnStatistics, ...] = ()
+    extended_stats: tuple[ExtendedStatistics, ...] = ()
+    foreign_keys: tuple[CatalogForeignKey, ...] = ()
+    indexes: tuple[CatalogIndex, ...] = ()
+
+
+# pg_constraint stores referential actions as single characters.
+REFERENTIAL_ACTIONS = {
+    "a": "NO ACTION",
+    "r": "RESTRICT",
+    "c": "CASCADE",
+    "n": "SET NULL",
+    "d": "SET DEFAULT",
+}
+
+# Relation kinds this release cannot model. Partitioning and inheritance change
+# row-count and fan-out arithmetic -- a parent's reltuples is not the sum of its
+# children, and a fan-out computed as though it were would be silently wrong.
+UNSUPPORTED_RELKINDS = {"p": "partitioned table", "I": "partitioned index"}
+
+
+def collect_catalog(config: PostgresConfig) -> CatalogObservations:
+    """Read the catalog and statistics views. Reads no user table.
+
+    Ordering is deliberate: tables and inheritance come first so an unsupported
+    layout aborts before five more queries run against a database that cannot
+    produce a usable profile anyway.
+    """
+    def in_scope(schema: str) -> bool:
+        return schema_is_selected(schema, config)
+
+    tables = tuple(
+        CatalogTable(
+            schema=row[0],
+            name=row[1],
+            relkind=row[2],
+            reltuples=pg_float(row[3]) or 0.0,
+            size_bytes=pg_int(row[4]),
+        )
+        for row in run_psql(SQL_TABLES, config)
+        if len(row) == 5 and in_scope(row[0])
+    )
+    inherited = tuple(
+        (row[0], row[1]) for row in run_psql(SQL_INHERITED, config) if row and in_scope(row[0])
+    )
+    require_supported_layout(tables, inherited)
+
+    columns = tuple(
+        CatalogColumn(
+            schema=row[0],
+            table=row[1],
+            name=row[2],
+            ordinal=pg_int(row[3]),
+            data_type=row[4],
+            type_name=row[5],
+            is_nullable=not pg_bool(row[8]),
+            is_supported=is_supported_type(row[5], row[6], row[7]),
+        )
+        for row in run_psql(SQL_COLUMNS, config)
+        if len(row) == 9 and in_scope(row[0])
+    )
+
+    column_stats = tuple(
+        ColumnStatistics(
+            schema=row[0],
+            table=row[1],
+            column=row[2],
+            null_frac=pg_float(row[3]) or 0.0,
+            avg_width=pg_int(row[4]),
+            n_distinct=pg_float(row[5]) or 0.0,
+            most_common_vals=parse_pg_array(row[6]),
+            most_common_freqs=parse_pg_float_array(row[7]),
+            histogram_bounds=parse_pg_array(row[8]),
+        )
+        for row in run_psql(SQL_COLUMN_STATS, config)
+        if len(row) == 9 and in_scope(row[0])
+    )
+
+    attnums = {(c.schema, c.table, c.ordinal): c.name for c in columns}
+    extended_stats = tuple(
+        ExtendedStatistics(
+            schema=row[0],
+            table=row[1],
+            name=row[2],
+            columns=parse_pg_array(row[3]),
+            n_distinct=parse_extended_n_distinct(row[4], row[0], row[1], attnums),
+            has_most_common_values=pg_bool(row[5]),
+        )
+        for row in run_psql(SQL_EXTENDED_STATS, config)
+        if len(row) == 6 and in_scope(row[0])
+    )
+
+    foreign_keys = assemble_foreign_keys(
+        [row for row in run_psql(SQL_FOREIGN_KEYS, config) if len(row) == 10 and in_scope(row[1])]
+    )
+
+    indexes = tuple(
+        CatalogIndex(
+            schema=row[0],
+            table=row[1],
+            name=row[2],
+            is_unique=pg_bool(row[3]),
+            is_primary=pg_bool(row[4]),
+        )
+        for row in run_psql(SQL_INDEXES, config)
+        if len(row) == 5 and in_scope(row[0])
+    )
+
+    return CatalogObservations(
+        tables=tuple(t for t in tables if t.relkind not in UNSUPPORTED_RELKINDS),
+        columns=columns,
+        column_stats=column_stats,
+        extended_stats=extended_stats,
+        foreign_keys=foreign_keys,
+        indexes=indexes,
+    )
+
+
+def require_supported_layout(tables, inherited) -> None:
+    """Reject partitioned and inherited tables before anything else is read."""
+    for table in tables:
+        if table.relkind in UNSUPPORTED_RELKINDS:
+            raise UnsupportedObject(
+                f"{table.schema}.{table.name} is a {UNSUPPORTED_RELKINDS[table.relkind]}; "
+                f"this release of {PROG} does not model partitioning, and a row-count or "
+                "fan-out estimate derived from a partitioned parent would be wrong"
+            )
+    if inherited:
+        schema, name = inherited[0]
+        raise UnsupportedObject(
+            f"{schema}.{name} inherits from another table; this release of {PROG} does not "
+            "model inheritance, and estimates derived from it would be wrong"
+        )
+
+
+def parse_extended_n_distinct(text: str, schema: str, table: str, attnums: dict) -> dict:
+    """Resolve pg_ndistinct's attnum-keyed JSON into column-name keys.
+
+    PostgreSQL renders it as {"2, 3": 4200}, where the key is a comma-separated
+    list of attribute numbers. Consumers should not have to know that.
+    """
+    if not text:
+        return {}
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return {}
+
+    resolved = {}
+    for key, value in raw.items():
+        names = tuple(attnums.get((schema, table, pg_int(part))) for part in key.split(","))
+        if all(names):
+            resolved[names] = float(value)
+    return resolved
+
+
+def assemble_foreign_keys(rows) -> tuple[CatalogForeignKey, ...]:
+    """Group one-row-per-column output into one record per constraint."""
+    grouped: dict = {}
+    for row in rows:
+        key = (row[0], row[1], row[2])
+        grouped.setdefault(key, []).append(row)
+
+    keys = []
+    for (name, child_schema, child_table), members in grouped.items():
+        members.sort(key=lambda row: pg_int(row[7]))
+        first = members[0]
+        keys.append(
+            CatalogForeignKey(
+                constraint_name=name,
+                child_schema=child_schema,
+                child_table=child_table,
+                child_columns=tuple(row[5] for row in members),
+                parent_schema=first[3],
+                parent_table=first[4],
+                parent_columns=tuple(row[6] for row in members),
+                on_update=REFERENTIAL_ACTIONS.get(first[8], ""),
+                on_delete=REFERENTIAL_ACTIONS.get(first[9], ""),
+            )
+        )
+    return tuple(sorted(keys, key=lambda fk: (fk.child_schema, fk.child_table, fk.constraint_name)))
 
 
 # ---------------------------------------------------------------------------

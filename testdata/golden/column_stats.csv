@@ -1,0 +1,7 @@
+public,users,id,0,8,-1,,,"{1,250,500,750,1000}"
+public,users,email,0,24,-1,,,"{alpha@example.invalid,zulu@example.invalid}"
+public,users,legacy_balance,0.5,8,12,"{$1.00,$2.00}","{0.4,0.1}",
+public,orders,id,0,8,-1,,,"{1,2500,5000}"
+public,orders,user_id,0,8,500,"{1,2,3}","{0.1,0.05,0.02}",
+public,orders,placed_at,0.25,8,-0.5,,,"{2026-01-01,2026-06-01}"
+sales,invoices,order_id,0,8,-1,,,"{1,125,250}"
