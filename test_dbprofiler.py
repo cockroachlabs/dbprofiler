@@ -1661,6 +1661,324 @@ class TestTokenizeSequences(unittest.TestCase):
         self.assertEqual(a_tokenizer().tokens((), "d", "text"), ())
 
 
+def a_catalog(**overrides):
+    """The golden catalog, collected once and reused across normalization tests."""
+    with mock.patch("subprocess.run", side_effect=catalog_calls(**overrides)):
+        return dbprofiler.collect_catalog(a_config())
+
+
+class NormalizationCase(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+        self.catalog = a_catalog()
+        self.tables = dbprofiler.normalize_tables(self.catalog, self.tokenizer)
+        self.by_table = {(t.schema, t.name): t for t in self.tables}
+
+    def column(self, schema, table, name):
+        return next(c for c in self.by_table[(schema, table)].columns if c.name == name)
+
+
+class TestNormalizeTables(NormalizationCase):
+    def test_row_counts_come_from_reltuples(self):
+        self.assertEqual(self.by_table[("public", "users")].row_count_estimate, 1000.0)
+        self.assertEqual(self.by_table[("public", "orders")].row_count_estimate, 5000.0)
+
+    def test_sizes_are_carried_through(self):
+        self.assertEqual(self.by_table[("public", "users")].size_bytes, 163840)
+
+    def test_tables_are_sorted_deterministically(self):
+        self.assertEqual(
+            [(t.schema, t.name) for t in self.tables],
+            [("public", "orders"), ("public", "users"), ("sales", "invoices")],
+        )
+
+    def test_columns_are_ordered_by_ordinal(self):
+        columns = self.by_table[("public", "users")].columns
+        self.assertEqual([c.ordinal for c in columns], sorted(c.ordinal for c in columns))
+        self.assertEqual(columns[0].name, "id")
+
+    def test_table_provenance_names_the_postgresql_source(self):
+        provenance = self.by_table[("public", "users")].provenance
+        self.assertIn("reltuples", provenance)
+        self.assertIn("estimate", provenance)
+
+
+class TestNormalizeColumns(NormalizationCase):
+    def test_a_relative_n_distinct_is_resolved_against_the_row_count(self):
+        # -1 means "every row is distinct". 1.0 * 1000 rows.
+        self.assertEqual(self.column("public", "users", "id").distinct_estimate, 1000.0)
+        # -0.5 over 5000 rows.
+        self.assertEqual(self.column("public", "orders", "placed_at").distinct_estimate, 2500.0)
+
+    def test_an_absolute_n_distinct_is_used_as_is(self):
+        self.assertEqual(self.column("public", "orders", "user_id").distinct_estimate, 500.0)
+
+    def test_null_fraction_and_width_are_carried_through(self):
+        placed_at = self.column("public", "orders", "placed_at")
+        self.assertEqual(placed_at.null_fraction, 0.25)
+        self.assertEqual(placed_at.avg_width_bytes, 8)
+
+    def test_a_column_with_no_statistics_row_reports_nothing_rather_than_zero(self):
+        """profile is jsonb and has never been analyzed. Reporting 0 distinct
+        values would be a claim; reporting nothing is the truth."""
+        profile = self.column("public", "users", "profile")
+        self.assertIsNone(profile.distinct_estimate)
+        self.assertIsNone(profile.null_fraction)
+        self.assertIsNone(profile.avg_width_bytes)
+        self.assertEqual(profile.most_common_tokens, ())
+        self.assertIn("no pg_stats row", profile.provenance)
+
+    def test_type_support_is_carried_onto_the_contract(self):
+        self.assertTrue(self.column("public", "users", "id").is_supported)
+        self.assertFalse(self.column("public", "users", "legacy_balance").is_supported)
+        self.assertTrue(self.column("sales", "invoices", "region").is_supported)
+
+    def test_declared_types_are_the_readable_form(self):
+        self.assertEqual(self.column("public", "users", "tags").data_type, "text[]")
+        self.assertEqual(
+            self.column("public", "orders", "placed_at").data_type, "timestamp with time zone"
+        )
+
+    def test_nullability_is_carried_through(self):
+        self.assertFalse(self.column("public", "users", "id").is_nullable)
+        self.assertTrue(self.column("public", "users", "email").is_nullable)
+
+    def test_column_provenance_records_the_n_distinct_encoding(self):
+        relative = self.column("public", "users", "id").provenance
+        self.assertIn("n_distinct=-1", relative)
+        self.assertIn("fraction of rows", relative)
+        absolute = self.column("public", "orders", "user_id").provenance
+        self.assertIn("n_distinct=500", absolute)
+        self.assertIn("absolute", absolute)
+
+
+class TestNormalizedValuesAreTokens(NormalizationCase):
+    def test_most_common_values_are_replaced_by_tokens(self):
+        user_id = self.column("public", "orders", "user_id")
+        self.assertEqual(len(user_id.most_common_tokens), 3)
+        for raw in ("1", "2", "3"):
+            for token in user_id.most_common_tokens:
+                self.assertNotEqual(token, raw)
+
+    def test_frequencies_survive_tokenization_in_order(self):
+        # The tokens hide which parent is hot. The frequencies must not.
+        user_id = self.column("public", "orders", "user_id")
+        self.assertEqual(user_id.most_common_freqs, (0.1, 0.05, 0.02))
+        self.assertEqual(len(user_id.most_common_tokens), len(user_id.most_common_freqs))
+
+    def test_histogram_bounds_are_replaced_by_tokens(self):
+        bounds = self.column("public", "users", "id").histogram_token_bounds
+        self.assertEqual(len(bounds), 5)
+        self.assertNotIn("250", bounds)
+
+    def test_an_email_never_appears_in_a_normalized_record(self):
+        planted = "alpha@example.invalid"
+        self.assertIn(planted, golden("column_stats"))
+        self.assertNotIn(planted, repr(self.tables))
+
+    def test_a_foreign_key_still_joins_after_tokenization(self):
+        """The whole point. orders.user_id = 1 and users.id = 1 have to produce
+        the same token, or the profile shows no relationship at all."""
+        child = self.column("public", "orders", "user_id").most_common_tokens[0]
+        parent = self.column("public", "users", "id").histogram_token_bounds[0]
+        self.assertEqual(child, parent)
+
+    def test_a_transitive_foreign_key_chain_resolves_to_one_domain(self):
+        # invoices.order_id -> orders.id, and orders.id is nobody's child.
+        child = self.column("sales", "invoices", "order_id").histogram_token_bounds[0]
+        parent = self.column("public", "orders", "id").histogram_token_bounds[0]
+        self.assertEqual(child, parent)
+
+    def test_unrelated_columns_do_not_share_a_domain(self):
+        users_id = self.column("public", "users", "id").histogram_token_bounds[0]
+        orders_id = self.column("public", "orders", "id").histogram_token_bounds[0]
+        self.assertNotEqual(users_id, orders_id)
+
+
+class TestNormalizeRelationships(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+        self.catalog = a_catalog()
+        self.relationships = dbprofiler.normalize_relationships(self.catalog)
+        self.by_name = {r.constraint_name: r for r in self.relationships}
+
+    def test_relationships_carry_ordered_columns_and_actions(self):
+        fk = self.by_name["orders_user_id_fkey"]
+        self.assertEqual(fk.child_schema, "public")
+        self.assertEqual(fk.child_table, "orders")
+        self.assertEqual(fk.child_columns, ("user_id",))
+        self.assertEqual(fk.parent_table, "users")
+        self.assertEqual(fk.parent_columns, ("id",))
+        self.assertEqual(fk.on_delete, "CASCADE")
+        self.assertEqual(fk.on_update, "NO ACTION")
+
+    def test_relationships_are_sorted_deterministically(self):
+        self.assertEqual(
+            [(r.child_schema, r.child_table, r.constraint_name) for r in self.relationships],
+            sorted((r.child_schema, r.child_table, r.constraint_name) for r in self.relationships),
+        )
+
+
+class TestSingleColumnFanOut(unittest.TestCase):
+    def setUp(self):
+        self.catalog = a_catalog()
+        self.by_name = {
+            r.constraint_name: r for r in dbprofiler.normalize_relationships(self.catalog)
+        }
+
+    def test_the_mean_is_non_null_child_rows_over_distinct_values(self):
+        # 5000 orders, no nulls, 500 distinct user_id values.
+        fan_out = self.by_name["orders_user_id_fkey"].fan_out
+        self.assertEqual(fan_out.status, "estimated")
+        self.assertEqual(fan_out.basis, "single_column")
+        self.assertAlmostEqual(fan_out.mean, 10.0)
+
+    def test_nulls_are_excluded_from_the_numerator(self):
+        # A nullable foreign key with half its rows null has half the children
+        # to distribute, and counting them would double the estimate.
+        stats = "public,orders,user_id,0.5,8,500,,,\n"
+        catalog = a_catalog(column_stats=stats)
+        fan_out = next(
+            r for r in dbprofiler.normalize_relationships(catalog)
+            if r.constraint_name == "orders_user_id_fkey"
+        ).fan_out
+        self.assertAlmostEqual(fan_out.mean, 5.0)
+
+    def test_the_hot_parent_shape_survives_as_p99(self):
+        """The mean says 10 children per parent. The most common user_id holds
+        10% of 5000 rows. A migration sized on the mean would be wrong by 50x."""
+        fan_out = self.by_name["orders_user_id_fkey"].fan_out
+        self.assertIsNotNone(fan_out.p99)
+        self.assertGreater(fan_out.p99, fan_out.mean)
+
+    def test_a_uniform_key_has_a_fan_out_of_one(self):
+        fan_out = self.by_name["invoices_order_fkey"].fan_out
+        self.assertAlmostEqual(fan_out.mean, 1.0)
+
+    def test_a_child_column_with_no_statistics_is_insufficient(self):
+        catalog = a_catalog(column_stats="")
+        for relationship in dbprofiler.normalize_relationships(catalog):
+            with self.subTest(constraint=relationship.constraint_name):
+                self.assertEqual(relationship.fan_out.status, "insufficient_statistics")
+                self.assertIsNone(relationship.fan_out.mean)
+
+    def test_an_unknown_n_distinct_is_insufficient_not_a_division_by_zero(self):
+        # PostgreSQL writes 0 for "no estimate available".
+        stats = "public,orders,user_id,0,8,0,,,\n"
+        fan_out = next(
+            r for r in dbprofiler.normalize_relationships(a_catalog(column_stats=stats))
+            if r.constraint_name == "orders_user_id_fkey"
+        ).fan_out
+        self.assertEqual(fan_out.status, "insufficient_statistics")
+
+
+class TestCompositeFanOut(unittest.TestCase):
+    """A composite key's distinct count is not the product of its columns'.
+
+    user_id has 500 distinct values and placed_at has 2500, but orders are not
+    placed at independently random times: the real pair count is 4200, not
+    1,250,000. Multiplying would understate fan-out by 300x and size the
+    migration against a workload that does not exist.
+    """
+
+    def composite_catalog(self, extended_stats=None):
+        foreign_keys = (
+            "orders_user_placed_fkey,public,orders,public,users,user_id,id,1,a,c\n"
+            "orders_user_placed_fkey,public,orders,public,users,placed_at,created_at,2,a,c\n"
+        )
+        overrides = {"foreign_keys": foreign_keys}
+        if extended_stats is not None:
+            overrides["extended_stats"] = extended_stats
+        return a_catalog(**overrides)
+
+    def fan_out(self, catalog):
+        return dbprofiler.normalize_relationships(catalog)[0].fan_out
+
+    def test_matching_extended_statistics_give_an_estimate(self):
+        fan_out = self.fan_out(self.composite_catalog())
+        self.assertEqual(fan_out.status, "estimated")
+        self.assertEqual(fan_out.basis, "extended_statistics")
+        # 5000 rows and 4200 distinct pairs, less the nulls. A composite key
+        # references a parent only when every column is non-null, and PostgreSQL
+        # has no joint null fraction, so the most-null column -- placed_at at
+        # 0.25 -- is the tightest bound available and the estimate errs high.
+        self.assertAlmostEqual(fan_out.mean, 5000 * 0.75 / 4200)
+
+    def test_column_order_does_not_matter_to_the_lookup(self):
+        # n-distinct over a column set is order-independent; pg_stats_ext lists
+        # attnums in catalog order, which need not match the key's.
+        reordered = (
+            "orders_user_placed_fkey,public,orders,public,users,placed_at,created_at,1,a,c\n"
+            "orders_user_placed_fkey,public,orders,public,users,user_id,id,2,a,c\n"
+        )
+        fan_out = self.fan_out(a_catalog(foreign_keys=reordered))
+        self.assertEqual(fan_out.status, "estimated")
+
+    def test_without_extended_statistics_it_is_insufficient(self):
+        fan_out = self.fan_out(self.composite_catalog(extended_stats=""))
+        self.assertEqual(fan_out.status, "insufficient_statistics")
+        self.assertEqual(fan_out.basis, "composite")
+        self.assertIsNone(fan_out.mean)
+
+    def test_independent_single_column_estimates_are_never_multiplied(self):
+        fan_out = self.fan_out(self.composite_catalog(extended_stats=""))
+        self.assertNotAlmostEqual(fan_out.mean or 0.0, 5000 / (500 * 2500))
+
+    def test_extended_statistics_for_a_different_column_set_do_not_count(self):
+        other = (
+            'public,orders,orders_other_stx,"{id,placed_at}","{""1, 3"": 900}",t\n'
+        )
+        fan_out = self.fan_out(self.composite_catalog(extended_stats=other))
+        self.assertEqual(fan_out.status, "insufficient_statistics")
+
+
+class TestProfileAssembly(unittest.TestCase):
+    def build(self):
+        catalog = a_catalog()
+        with mock.patch("subprocess.run", side_effect=workload_calls()):
+            workload = dbprofiler.collect_workload(a_config())
+        source = dbprofiler.Source(
+            kind="postgres",
+            server_version_num=160002,
+            server_version="16.2",
+            database=DATABASE,
+            collected_schemas=("public", "sales"),
+        )
+        return dbprofiler.build_profile(source, catalog, workload, a_tokenizer())
+
+    def test_the_profile_carries_the_contract_version(self):
+        self.assertEqual(self.build().contract_version, dbprofiler.CONTRACT_VERSION)
+
+    def test_the_profile_carries_tables_and_relationships(self):
+        profile = self.build()
+        self.assertEqual(len(profile.tables), 3)
+        self.assertEqual(len(profile.relationships), 2)
+
+    def test_workload_warnings_reach_the_profile(self):
+        catalog = a_catalog()
+        with mock.patch("subprocess.run", side_effect=workload_calls(statements_installed="")):
+            workload = dbprofiler.collect_workload(a_config())
+        profile = dbprofiler.build_profile(
+            dbprofiler.Source("postgres", 160002, "16.2", DATABASE), catalog, workload,
+            a_tokenizer(),
+        )
+        self.assertIn("pg_stat_statements_missing", [w.code for w in profile.warnings])
+
+    def test_the_contract_reserves_postgresql_native_names_for_provenance(self):
+        """A consumer reading profile.json should not have to know that
+        reltuples is an estimate or that n_distinct can be negative."""
+        native = ("reltuples", "n_distinct", "null_frac", "attnum", "relkind")
+        fields = set()
+        for record in (dbprofiler.Table, dbprofiler.Column, dbprofiler.Relationship):
+            fields.update(f.name for f in dataclasses.fields(record))
+        for name in native:
+            with self.subTest(name=name):
+                self.assertNotIn(name, fields)
+
+    def test_the_build_is_deterministic(self):
+        self.assertEqual(repr(self.build()), repr(self.build()))
+
+
 class TestCLI(unittest.TestCase):
     def test_no_subcommand_prints_help_and_returns_two(self):
         stderr = io.StringIO()

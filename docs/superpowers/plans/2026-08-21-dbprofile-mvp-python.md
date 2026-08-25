@@ -460,12 +460,59 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`, `testdata/golden/`.
 
-- [ ] Write failing golden tests for: reltuples, absolute vs. relative n-distinct (`n_distinct` negative → `abs(n_distinct) * row_count_estimate`), null fraction, width, MCV/frequency, histogram bounds, supported/unsupported types, extended n-distinct/MCV.
-- [ ] Write failing single-FK fan-out tests using non-null child rows divided by distinct FK values; assert tokenized MCV frequencies preserve hot-parent shape.
-- [ ] Write failing composite-FK fan-out tests requiring matching extended n-distinct; otherwise emit `insufficient_statistics`. Never multiply independent single-column estimates.
-- [ ] Sort all output deterministically. Reserve PostgreSQL-native names for provenance/observations.
-- [ ] Retain PostgreSQL semantics in `provenance` fields on every normalized record.
-- [ ] Run tests; expect PASS.
+- [x] Write failing golden tests for: reltuples, absolute vs. relative n-distinct (`n_distinct` negative → `abs(n_distinct) * row_count_estimate`), null fraction, width, MCV/frequency, histogram bounds, supported/unsupported types, extended n-distinct/MCV.
+- [x] Write failing single-FK fan-out tests using non-null child rows divided by distinct FK values; assert tokenized MCV frequencies preserve hot-parent shape.
+- [x] Write failing composite-FK fan-out tests requiring matching extended n-distinct; otherwise emit `insufficient_statistics`. Never multiply independent single-column estimates.
+- [x] Sort all output deterministically. Reserve PostgreSQL-native names for provenance/observations.
+- [x] Retain PostgreSQL semantics in `provenance` fields on every normalized record.
+- [x] Run tests; expect PASS. → 253 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **Token domains follow foreign-key chains to their root.** A child column borrows its
+  parent's domain so both sides of a key tokenize alike — but with `A.x → B.y` and
+  `B.y → C.z`, resolving only one hop would have `A.x` tokenize under `B.y` while `B.y`
+  tokenized under `C.z`, making the A-to-B join invisible: the exact failure the domains
+  exist to prevent. `resolve_domain_root` walks to the root and stops on a cycle, because
+  self-referential and mutually referential keys are legal. The root column's type also
+  wins, so a `text` column referencing a `uuid` one canonicalizes and shapes the same way
+  on both sides. Tested with the fixture's `invoices.order_id → orders.id` chain.
+- **`n_distinct = 0` is "no estimate", not zero distinct values.** PostgreSQL writes 0
+  when it has none. Resolving it as a count would put a zero in the denominator of every
+  fan-out; the contract carries `None` and the fan-out says `insufficient_statistics`.
+- **Nulls are excluded from the fan-out numerator.** A null foreign key references no
+  parent, so those rows are not children to distribute. On a nullable key, counting them
+  inflates every estimate — the fixture's half-null variant is a test.
+- **A composite key uses the most-null column's fraction.** It references a parent only
+  when every column is non-null, and PostgreSQL has no joint null fraction. The
+  most-null column is the tightest bound available, so the estimate errs high. That
+  direction is deliberate and is stated in the code: an under-reported hot parent is
+  discovered during the migration, which is the expensive place to discover it.
+- **`p99` is computed from the most-common-value frequencies,** which is what makes the
+  hot-parent shape survive tokenization. Only the MCVs are known individually, so the
+  estimator ranks those and reads off the percentile; when the MCV list is shorter than
+  the percentile's rank — the usual case, since PostgreSQL keeps at most a few hundred —
+  every parent past the list has no more children than the last MCV, so the last MCV's
+  count is returned as an upper bound. The fixture's `orders.user_id` has a mean of 10
+  and a p99 of 100: a migration sized on the mean alone would be wrong by an order of
+  magnitude, which is the entire reason this field exists.
+- **Extended-statistics lookup is by column *set*, not sequence.** N-distinct over a
+  column set is order-independent, and `pg_stats_ext` lists attnums in catalog order,
+  which need not match the key's declared order. Keyed on `frozenset`, with a test that
+  reversing the key's columns still finds the statistic and that a statistic covering a
+  *different* set does not count.
+- **`build_profile(source, catalog, workload, tokenizer)`** composes the three
+  normalizers and carries the workload warnings onto the profile, so task 10's
+  orchestration stays thin.
+- **A test asserts the contract reserves PostgreSQL-native names.** `reltuples`,
+  `n_distinct`, `null_frac`, `attnum` and `relkind` appear in no field name on `Table`,
+  `Column` or `Relationship` — they appear in `provenance`, where the derivation is
+  recorded rather than discarded. A number without its derivation is not auditable.
+- **Determinism is asserted directly** (`repr(build()) == repr(build())`) rather than
+  only through per-collection sort tests, so a future dict-ordering regression fails
+  loudly.
+- **The negative assertion is in place:** a planted email from the statistics fixture is
+  proven absent from the normalized records.
 
 ### Task 9: Atomic bundle publication
 
