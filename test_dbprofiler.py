@@ -1170,6 +1170,259 @@ class TestSupportedTypes(unittest.TestCase):
         self.assertFalse(dbprofiler.is_supported_type("some_extension_type", "b", "U"))
 
 
+# The order collect_workload issues its queries in. The extension probe comes
+# first so a database without pg_stat_statements costs one query, not three.
+WORKLOAD_FIXTURES = (
+    "table_activity",
+    "index_activity",
+    "statements_installed",
+    "statements_reset",
+    "statements",
+)
+
+
+def workload_calls(**overrides):
+    """A subprocess.run side_effect list covering one collect_workload() run."""
+    calls = []
+    for name in WORKLOAD_FIXTURES:
+        value = overrides.get(name, golden(name))
+        # A str override supplies stdout; anything else is a CompletedProcess
+        # standing in for a failure.
+        calls.append(completed(stdout=value) if isinstance(value, str) else value)
+    return calls
+
+
+def denied(relation):
+    """What psql does when the role cannot read a statistics view."""
+    return completed(returncode=1, stderr=f'ERROR:  permission denied for view {relation}\n')
+
+
+class TestWorkloadSql(unittest.TestCase):
+    def test_the_workload_collectors_declare_their_sql_as_constants(self):
+        for name in (
+            "SQL_TABLE_ACTIVITY",
+            "SQL_INDEX_ACTIVITY",
+            "SQL_STATEMENTS",
+            "SQL_STATEMENTS_RESET",
+            "SQL_STATEMENTS_INSTALLED",
+        ):
+            with self.subTest(name=name):
+                self.assertIsInstance(getattr(dbprofiler, name), str)
+
+    def test_every_workload_query_passes_the_safety_audit(self):
+        for name, sql in dbprofiler.iter_sql_constants():
+            with self.subTest(name=name):
+                self.assertEqual(dbprofiler.audit_sql(sql), [])
+
+    def test_the_new_relations_are_on_the_allowlist(self):
+        # Allowlisted in the same change as the collectors that read them.
+        for relation in ("pg_stat_user_tables", "pg_stat_user_indexes",
+                         "pg_stat_statements", "pg_stat_statements_info",
+                         "pg_extension", "pg_database"):
+            with self.subTest(relation=relation):
+                self.assertIn(relation, dbprofiler.ALLOWED_RELATIONS)
+
+    def test_the_statement_query_bounds_what_it_transfers(self):
+        # Unbounded, this reads every entry in a shared-memory hash that can hold
+        # tens of thousands. The cap belongs in SQL, not in Python.
+        self.assertIn("200", dbprofiler.SQL_STATEMENTS)
+
+    def test_the_statement_query_is_scoped_to_the_profiled_database(self):
+        # pg_stat_statements is cluster-wide. Without this filter the profile
+        # would describe a workload that never touched the target database.
+        self.assertIn("current_database()", dbprofiler.SQL_STATEMENTS)
+
+
+class TestForbiddenTokenMatching(unittest.TestCase):
+    """ANALYZE is forbidden as a statement, not as a substring.
+
+    pg_stat_user_tables exposes last_analyze, analyze_count, autoanalyze_count
+    and n_mod_since_analyze. A substring match would make those columns
+    unreadable, and the workaround -- dropping them -- would cost real signal
+    about whether the source statistics are stale.
+    """
+
+    def test_an_analyze_statement_is_still_rejected(self):
+        for sql in ("ANALYZE public.users", "VACUUM ANALYZE", "analyze;", "ANALYZE (VERBOSE) t"):
+            with self.subTest(sql=sql):
+                self.assertTrue(any("ANALYZE" in v for v in dbprofiler.audit_sql(sql)))
+
+    def test_a_column_name_ending_in_analyze_is_allowed(self):
+        sql = (
+            "SELECT s.last_analyze, s.analyze_count, s.autoanalyze_count, "
+            "s.n_mod_since_analyze FROM pg_catalog.pg_stat_user_tables s"
+        )
+        self.assertEqual(dbprofiler.audit_sql(sql), [])
+
+    def test_count_is_still_rejected_however_it_is_spaced(self):
+        for sql in ("SELECT count(*) FROM pg_catalog.pg_class",
+                    "SELECT COUNT (*) FROM pg_catalog.pg_class",
+                    "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class"):
+            with self.subTest(sql=sql):
+                self.assertTrue(any("COUNT(" in v for v in dbprofiler.audit_sql(sql)))
+
+    def test_a_word_ending_in_count_is_not_a_row_count(self):
+        self.assertEqual(
+            dbprofiler.audit_sql("SELECT s.autovacuum_count FROM pg_catalog.pg_stat_user_tables s"),
+            [],
+        )
+
+    def test_create_statistics_is_still_rejected(self):
+        self.assertTrue(dbprofiler.audit_sql("CREATE STATISTICS s ON a, b FROM t"))
+
+
+class TestCollectWorkload(unittest.TestCase):
+    def collect(self, config=None, **overrides):
+        with mock.patch("subprocess.run", side_effect=workload_calls(**overrides)):
+            return dbprofiler.collect_workload(config or a_config())
+
+    def test_table_activity_carries_the_full_column_set(self):
+        workload = self.collect()
+        users = next(t for t in workload.table_activity if t.table == "users")
+        self.assertEqual(users.schema, "public")
+        self.assertEqual(users.seq_scan, 12)
+        self.assertEqual(users.idx_scan, 4500)
+        self.assertEqual(users.n_live_tup, 1000)
+        self.assertEqual(users.n_dead_tup, 40)
+        self.assertEqual(users.n_mod_since_analyze, 5)
+        self.assertEqual(users.autovacuum_count, 7)
+        self.assertEqual(users.last_analyze, "2026-08-20 03:15:00+00")
+
+    def test_a_table_that_has_never_been_vacuumed_reports_no_timestamp(self):
+        workload = self.collect()
+        invoices = next(t for t in workload.table_activity if t.table == "invoices")
+        self.assertEqual(invoices.last_vacuum, "")
+        self.assertEqual(invoices.last_autovacuum, "")
+
+    def test_index_activity_carries_scan_counts_and_size(self):
+        workload = self.collect()
+        idx = next(i for i in workload.index_activity if i.index == "orders_user_id_idx")
+        self.assertEqual(idx.schema, "public")
+        self.assertEqual(idx.table, "orders")
+        self.assertEqual(idx.idx_scan, 38000)
+        self.assertEqual(idx.idx_tup_read, 410000)
+        self.assertEqual(idx.size_bytes, 901120)
+
+    def test_an_unused_index_is_reported_not_dropped(self):
+        # A zero-scan index is the single most actionable thing in this report.
+        workload = self.collect(index_activity="public,users,users_unused_idx,0,0,0,8192\n")
+        self.assertEqual(len(workload.index_activity), 1)
+        self.assertEqual(workload.index_activity[0].idx_scan, 0)
+
+    def test_statements_are_collected_with_their_counters(self):
+        workload = self.collect()
+        top = workload.statements[0]
+        self.assertEqual(top.queryid, "-4123456789012345678")
+        self.assertEqual(top.calls, 480000)
+        self.assertAlmostEqual(top.total_exec_time, 912345.5)
+        self.assertAlmostEqual(top.mean_exec_time, 1.9)
+        self.assertEqual(top.rows, 480000)
+        self.assertEqual(top.shared_blks_hit, 1920000)
+
+    def test_statements_are_deduplicated_by_queryid(self):
+        # The same queryid appears once per role that ran it. The fixture has
+        # one queryid twice; the more expensive occurrence is the one kept.
+        workload = self.collect()
+        ids = [s.queryid for s in workload.statements]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), 3)
+        first = next(s for s in workload.statements if s.queryid == "-4123456789012345678")
+        self.assertEqual(first.calls, 480000)
+
+    def test_the_statistics_reset_timestamp_is_captured(self):
+        workload = self.collect()
+        self.assertEqual(workload.stats_reset, "2026-08-01 00:00:00+00")
+
+    def test_workload_collection_reads_no_user_table(self):
+        with mock.patch("subprocess.run", side_effect=workload_calls()) as run:
+            dbprofiler.collect_workload(a_config())
+        for call in run.call_args_list:
+            sql = call.args[0][-1]
+            with self.subTest(sql=sql[:40]):
+                self.assertEqual(dbprofiler.audit_sql(sql), [])
+
+
+class TestWorkloadScopeFiltering(unittest.TestCase):
+    def test_schema_exclude_drops_table_and_index_activity(self):
+        with mock.patch("subprocess.run", side_effect=workload_calls()):
+            workload = dbprofiler.collect_workload(a_config(schema_exclude=["sales"]))
+        self.assertNotIn("sales", {t.schema for t in workload.table_activity})
+        self.assertNotIn("sales", {i.schema for i in workload.index_activity})
+
+    def test_schema_include_keeps_only_the_named_schema(self):
+        with mock.patch("subprocess.run", side_effect=workload_calls()):
+            workload = dbprofiler.collect_workload(a_config(schema_include=["sales"]))
+        self.assertEqual({t.schema for t in workload.table_activity}, {"sales"})
+        self.assertEqual({i.schema for i in workload.index_activity}, {"sales"})
+
+
+class TestWorkloadDegradation(unittest.TestCase):
+    """Telemetry is best-effort. A restricted role still gets a bundle."""
+
+    def collect(self, **overrides):
+        with mock.patch("subprocess.run", side_effect=workload_calls(**overrides)):
+            return dbprofiler.collect_workload(a_config())
+
+    def codes(self, workload):
+        return [w.code for w in workload.warnings]
+
+    def test_a_missing_pg_stat_statements_warns_and_omits(self):
+        workload = self.collect(statements_installed="")
+        self.assertEqual(workload.statements, ())
+        self.assertIsNone(workload.stats_reset)
+        self.assertIn("pg_stat_statements_missing", self.codes(workload))
+
+    def test_a_missing_pg_stat_statements_does_not_cost_three_queries(self):
+        calls = workload_calls(statements_installed="")
+        with mock.patch("subprocess.run", side_effect=calls) as run:
+            dbprofiler.collect_workload(a_config())
+        # table activity, index activity, extension probe. Nothing after it.
+        self.assertEqual(run.call_count, 3)
+
+    def test_permission_denied_on_table_activity_warns_and_omits(self):
+        workload = self.collect(table_activity=denied("pg_stat_user_tables"))
+        self.assertEqual(workload.table_activity, ())
+        self.assertIn("pg_stat_user_tables_unavailable", self.codes(workload))
+        # The rest of the collection still happened.
+        self.assertTrue(workload.index_activity)
+        self.assertTrue(workload.statements)
+
+    def test_permission_denied_on_index_activity_warns_and_omits(self):
+        workload = self.collect(index_activity=denied("pg_stat_user_indexes"))
+        self.assertEqual(workload.index_activity, ())
+        self.assertIn("pg_stat_user_indexes_unavailable", self.codes(workload))
+        self.assertTrue(workload.table_activity)
+
+    def test_permission_denied_on_statements_warns_and_omits(self):
+        workload = self.collect(statements=denied("pg_stat_statements"))
+        self.assertEqual(workload.statements, ())
+        self.assertIn("pg_stat_statements_unavailable", self.codes(workload))
+
+    def test_an_unreadable_reset_timestamp_does_not_lose_the_statements(self):
+        workload = self.collect(statements_reset=denied("pg_stat_statements_info"))
+        self.assertIsNone(workload.stats_reset)
+        self.assertTrue(workload.statements)
+        self.assertIn("pg_stat_statements_info_unavailable", self.codes(workload))
+
+    def test_no_source_available_is_still_not_a_failure(self):
+        workload = self.collect(
+            table_activity=denied("pg_stat_user_tables"),
+            index_activity=denied("pg_stat_user_indexes"),
+            statements_installed="",
+        )
+        self.assertEqual(len(workload.warnings), 3)
+
+    def test_a_degradation_warning_never_carries_a_credential(self):
+        stderr = completed(
+            returncode=1,
+            stderr=f'psql: error: connection to server failed: FATAL: password "{PASSWORD}"\n',
+        )
+        workload = self.collect(table_activity=stderr)
+        message = workload.warnings[0].message
+        self.assertNotIn(PASSWORD, message)
+        self.assertIn("***", message)
+
+
 class TestCLI(unittest.TestCase):
     def test_no_subcommand_prints_help_and_returns_two(self):
         stderr = io.StringIO()

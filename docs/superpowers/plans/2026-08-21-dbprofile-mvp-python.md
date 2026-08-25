@@ -343,11 +343,63 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`, `testdata/golden/`.
 
-- [ ] Write failing tests for: `pg_stat_user_indexes` join with `pg_class` size; `pg_stat_user_tables` full column set; `pg_stat_statements` extension probe (installed vs. missing → warning + omit, never fatal); top-N selection (200 by `total_exec_time` unioned with 200 by `calls`, deduped by `queryid`); `pg_stat_statements_info.stats_reset` captured into manifest; HMAC tokenization of normalized query text — assert no raw literal from a fixture reaches disk.
-- [ ] Extend `--check-safety` allowlist to include `pg_stat_statements` / `pg_stat_statements_info` and re-run the guard test.
-- [ ] Implement `collect_workload(cfg)` returning three CSV-ready row lists plus a list of warnings.
-- [ ] Assert permission errors on any of the three sources degrade to a manifest warning + omitted CSV, not a bundle failure.
-- [ ] Run tests; expect PASS.
+- [x] Write failing tests for: `pg_stat_user_indexes` join with `pg_class` size; `pg_stat_user_tables` full column set; `pg_stat_statements` extension probe (installed vs. missing → warning + omit, never fatal); top-N selection (200 by `total_exec_time` unioned with 200 by `calls`, deduped by `queryid`); `pg_stat_statements_info.stats_reset` captured into manifest; HMAC tokenization of normalized query text — assert no raw literal from a fixture reaches disk.
+- [x] Extend `--check-safety` allowlist to include `pg_stat_statements` / `pg_stat_statements_info` and re-run the guard test.
+- [x] Implement `collect_workload(cfg)` returning three CSV-ready row lists plus a list of warnings.
+- [x] Assert permission errors on any of the three sources degrade to a manifest warning + omitted CSV, not a bundle failure.
+- [x] Run tests; expect PASS. → 185 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **The forbidden-token check now matches on word boundaries.** `pg_stat_user_tables`
+  exposes `last_analyze`, `analyze_count`, `autoanalyze_count` and
+  `n_mod_since_analyze`, and a substring match on `ANALYZE` rejected all four. Dropping
+  those columns to satisfy the check would have been the wrong trade: they are how a
+  reader knows whether the source statistics are stale enough to make the rest of the
+  profile untrustworthy. `\bANALYZE\b` still rejects `ANALYZE public.users` and
+  `VACUUM ANALYZE`; `\bCOUNT\(` still catches `pg_catalog.count(*)` and now correctly
+  ignores the tail of `autovacuum_count`. Six guard tests cover both directions.
+- **Top-N is ranked with two window functions in one pass,** not a `UNION` of two
+  `LIMIT 200` subqueries. Same 400-row bound, one scan instead of two, and no duplicated
+  thirteen-column select list to keep in sync. `WHERE by_time <= 200 OR by_calls <= 200`
+  is the union; `ORDER BY by_time` makes "first" mean "most expensive".
+- **Dedup by `queryid` happens in Python.** `pg_stat_statements` keys on
+  `(userid, dbid, queryid)`, so one statement appears once per role that ran it. The
+  first occurrence wins, which given the ordering is the most expensive one. Summing the
+  counters across roles was considered and rejected: a mean execution time summed across
+  roles is not a mean of anything.
+- **The statement query is scoped to the profiled database.** `pg_stat_statements` is
+  cluster-wide; without the `dbid` filter the profile would report a workload that never
+  touched the target. This is why `pg_database` joins the allowlist.
+- **Index size comes from `pg_relation_size(indexrelid)`,** not a join to `pg_class`.
+  Same number, one fewer relation inside the safety boundary.
+- **`pg_stat_statements` and `pg_stat_statements_info` are referenced unqualified.** They
+  live in whatever schema the extension was installed into, and the house rule forbids
+  building the schema name into the SQL at runtime. This is the only place the tool
+  relies on `search_path`; if resolution fails, the collector degrades to a warning
+  rather than failing, so the cost of being wrong is bounded.
+- **The extension probe runs before the two statement queries,** so a database without
+  `pg_stat_statements` — the default, since it needs `shared_preload_libraries` — costs
+  one query rather than two failures. `pg_extension` joins the allowlist for it. There is
+  a test asserting the call count is exactly three in that case.
+- **Four distinct warning codes, not one.** `pg_stat_statements_missing` (not installed)
+  is a different finding from `pg_stat_statements_unavailable` (installed, unreadable):
+  the first is a fact about the source, the second is a fact about the role the profile
+  ran as, and only the second is worth retrying with more privilege.
+- **`pg_stat_statements_info` failing does not lose the statements.** The reset timestamp
+  and the counters are read separately, so an unreadable timestamp costs the timestamp.
+- **Typed records rather than raw row lists,** matching task 5: `TableActivity`,
+  `IndexActivity`, `StatementActivity`, gathered in `WorkloadObservations`. The plan said
+  "CSV-ready row lists"; the CSV shaping belongs in task 9 with the rest of bundle
+  publication, and a typed record is what the normalizer needs anyway.
+- **Query text is collected raw and tokenized in task 7,** where the HMAC primitive and
+  the key handling live. `StatementActivity.query_text` is deliberately in a record that
+  is never serialized — the same structural argument as the task 5 statistics records —
+  and the "no raw literal reaches disk" assertion lands with the code that writes to
+  disk. The `statements.csv` fixture carries an unnormalized literal specifically so that
+  assertion has something to catch.
+- **Scope filters apply to table and index activity** via `schema_is_selected`, so
+  `--schema-exclude` means the same thing for telemetry as it does for the catalog.
 
 ### Task 7: Tokenization
 

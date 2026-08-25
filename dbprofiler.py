@@ -130,6 +130,26 @@ SAFETY_FORBIDDEN = (
     "CREATE STATISTICS",
 )
 
+
+def _forbidden_pattern(token: str) -> re.Pattern[str]:
+    """Compile one forbidden token, anchored at word boundaries where they apply.
+
+    A plain substring match would reject `pg_stat_user_tables.last_analyze`,
+    `analyze_count`, `autoanalyze_count` and `n_mod_since_analyze` -- exactly the
+    columns that say whether the source statistics are stale enough to make the
+    rest of this profile untrustworthy. Dropping them to satisfy the check would
+    trade real signal for a false sense of rigour. A word boundary keeps
+    `ANALYZE` as a statement forbidden while letting the column names through;
+    `COUNT(` still matches `pg_catalog.count(*)`, because `.` is not a word
+    character, and no longer matches the tail of `autovacuum_count`.
+    """
+    prefix = r"\b" if token[:1].isalnum() or token[:1] == "_" else ""
+    suffix = r"\b" if token[-1:].isalnum() or token[-1:] == "_" else ""
+    return re.compile(prefix + re.escape(token) + suffix)
+
+
+SAFETY_FORBIDDEN_PATTERNS = tuple((token, _forbidden_pattern(token)) for token in SAFETY_FORBIDDEN)
+
 # Every relation this tool is permitted to read, enumerated one by one. There is
 # deliberately no "pg_catalog.*" wildcard: pg_catalog holds role password hashes
 # (pg_authid, pg_shadow), actual user data (pg_largeobject), and raw statistic
@@ -142,7 +162,9 @@ ALLOWED_RELATIONS = frozenset(
         "pg_attribute",
         "pg_class",
         "pg_constraint",
+        "pg_database",
         "pg_description",
+        "pg_extension",
         "pg_index",
         "pg_inherits",
         "pg_namespace",
@@ -238,8 +260,8 @@ def audit_sql(sql: str) -> list[str]:
     # Collapse whitespace and close the "COUNT (*)" gap so the token match
     # cannot be evaded by formatting.
     normalized = " ".join(sql.split()).upper().replace(" (", "(")
-    for token in SAFETY_FORBIDDEN:
-        if token in normalized:
+    for token, pattern in SAFETY_FORBIDDEN_PATTERNS:
+        if pattern.search(normalized):
             violations.append(f"contains forbidden token {token!r}")
 
     for match in RELATION_REFERENCE.finditer(sql):
@@ -423,6 +445,61 @@ ORDER BY con.conname, k.ord
 
 # Index inventory. The DDL is already in schema.sql; this is the machine-readable
 # form that pairs with the Tier 1 usage counters.
+SQL_TABLE_ACTIVITY = """
+SELECT s.schemaname, s.relname, s.seq_scan, s.seq_tup_read, s.idx_scan,
+       s.idx_tup_fetch, s.n_tup_ins, s.n_tup_upd, s.n_tup_del, s.n_tup_hot_upd,
+       s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze,
+       s.last_vacuum::text, s.last_autovacuum::text,
+       s.last_analyze::text, s.last_autoanalyze::text,
+       s.vacuum_count, s.autovacuum_count, s.analyze_count, s.autoanalyze_count
+FROM pg_catalog.pg_stat_user_tables s
+"""
+
+SQL_INDEX_ACTIVITY = """
+SELECT s.schemaname, s.relname, s.indexrelname, s.idx_scan, s.idx_tup_read,
+       s.idx_tup_fetch, pg_catalog.pg_relation_size(s.indexrelid)
+FROM pg_catalog.pg_stat_user_indexes s
+"""
+
+SQL_STATEMENTS_INSTALLED = """
+SELECT e.extversion
+FROM pg_catalog.pg_extension e
+WHERE e.extname = 'pg_stat_statements'
+"""
+
+# pg_stat_statements and pg_stat_statements_info live in whatever schema the
+# extension was installed into, so they are referenced unqualified and resolved
+# through search_path. That is the one place this tool relies on search_path;
+# if resolution fails the collector degrades to a warning rather than failing.
+SQL_STATEMENTS_RESET = """
+SELECT i.stats_reset::text
+FROM pg_stat_statements_info i
+"""
+
+# Ranked in SQL, not fetched and sorted here: the view is backed by a
+# shared-memory hash that can hold tens of thousands of entries, and pulling all
+# of them across the wire to keep 400 would be the largest transfer this tool
+# performs. Two rankings, because the slowest statements and the most frequent
+# ones are different questions and a migration plan needs both.
+SQL_STATEMENTS = """
+SELECT t.queryid::text, t.query, t.calls, t.total_exec_time, t.mean_exec_time,
+       t.stddev_exec_time, t.rows, t.shared_blks_hit, t.shared_blks_read,
+       t.shared_blks_dirtied, t.shared_blks_written, t.temp_blks_read,
+       t.temp_blks_written
+FROM (
+    SELECT s.*,
+           row_number() OVER (ORDER BY s.total_exec_time DESC NULLS LAST) AS by_time,
+           row_number() OVER (ORDER BY s.calls DESC NULLS LAST) AS by_calls
+    FROM pg_stat_statements s
+    WHERE s.dbid = (
+        SELECT d.oid FROM pg_catalog.pg_database d
+        WHERE d.datname = pg_catalog.current_database()
+    )
+) t
+WHERE t.by_time <= 200 OR t.by_calls <= 200
+ORDER BY t.by_time
+"""
+
 SQL_INDEXES = """
 SELECT n.nspname, c.relname, ic.relname, i.indisunique, i.indisprimary
 FROM pg_catalog.pg_index i
@@ -1380,6 +1457,251 @@ def assemble_foreign_keys(rows) -> tuple[CatalogForeignKey, ...]:
             )
         )
     return tuple(sorted(keys, key=lambda fk: (fk.child_schema, fk.child_table, fk.constraint_name)))
+
+
+# --- workload telemetry ----------------------------------------------------
+# Tier 1: what the source actually does, as opposed to what it contains. All of
+# it is best-effort. A role with catalog access but no statistics access still
+# gets a bundle -- an omitted section with a warning beside it is more useful
+# than a failed run, and the operator is often not the person who can grant the
+# missing privilege.
+
+
+@dataclass(frozen=True)
+class TableActivity:
+    schema: str
+    table: str
+    seq_scan: int
+    seq_tup_read: int
+    idx_scan: int
+    idx_tup_fetch: int
+    n_tup_ins: int
+    n_tup_upd: int
+    n_tup_del: int
+    n_tup_hot_upd: int
+    n_live_tup: int
+    n_dead_tup: int
+    n_mod_since_analyze: int
+    # Timestamps stay as the server rendered them. Empty means never.
+    last_vacuum: str
+    last_autovacuum: str
+    last_analyze: str
+    last_autoanalyze: str
+    vacuum_count: int
+    autovacuum_count: int
+    analyze_count: int
+    autoanalyze_count: int
+
+
+@dataclass(frozen=True)
+class IndexActivity:
+    schema: str
+    table: str
+    index: str
+    idx_scan: int
+    idx_tup_read: int
+    idx_tup_fetch: int
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class StatementActivity:
+    """One pg_stat_statements entry. query_text is raw and is never serialized."""
+
+    queryid: str
+    query_text: str
+    calls: int
+    total_exec_time: float
+    mean_exec_time: float
+    stddev_exec_time: float
+    rows: int
+    shared_blks_hit: int
+    shared_blks_read: int
+    shared_blks_dirtied: int
+    shared_blks_written: int
+    temp_blks_read: int
+    temp_blks_written: int
+
+
+@dataclass(frozen=True)
+class WorkloadObservations:
+    table_activity: tuple[TableActivity, ...] = ()
+    index_activity: tuple[IndexActivity, ...] = ()
+    statements: tuple[StatementActivity, ...] = ()
+    stats_reset: str | None = None
+    warnings: tuple[ProfileWarning, ...] = ()
+
+
+def collect_workload(config: PostgresConfig) -> WorkloadObservations:
+    """Read the statistics views. Reads no user table.
+
+    Every source is independently optional: one unreadable view costs its own
+    section and nothing else.
+    """
+    warnings: list[ProfileWarning] = []
+
+    table_activity = tuple(
+        TableActivity(
+            schema=row[0],
+            table=row[1],
+            seq_scan=pg_int(row[2]),
+            seq_tup_read=pg_int(row[3]),
+            idx_scan=pg_int(row[4]),
+            idx_tup_fetch=pg_int(row[5]),
+            n_tup_ins=pg_int(row[6]),
+            n_tup_upd=pg_int(row[7]),
+            n_tup_del=pg_int(row[8]),
+            n_tup_hot_upd=pg_int(row[9]),
+            n_live_tup=pg_int(row[10]),
+            n_dead_tup=pg_int(row[11]),
+            n_mod_since_analyze=pg_int(row[12]),
+            last_vacuum=row[13],
+            last_autovacuum=row[14],
+            last_analyze=row[15],
+            last_autoanalyze=row[16],
+            vacuum_count=pg_int(row[17]),
+            autovacuum_count=pg_int(row[18]),
+            analyze_count=pg_int(row[19]),
+            autoanalyze_count=pg_int(row[20]),
+        )
+        for row in optional_rows(
+            SQL_TABLE_ACTIVITY, config, "pg_stat_user_tables", warnings, width=21
+        )
+        if schema_is_selected(row[0], config)
+    )
+
+    index_activity = tuple(
+        IndexActivity(
+            schema=row[0],
+            table=row[1],
+            index=row[2],
+            idx_scan=pg_int(row[3]),
+            idx_tup_read=pg_int(row[4]),
+            idx_tup_fetch=pg_int(row[5]),
+            size_bytes=pg_int(row[6]),
+        )
+        for row in optional_rows(
+            SQL_INDEX_ACTIVITY, config, "pg_stat_user_indexes", warnings, width=7
+        )
+        if schema_is_selected(row[0], config)
+    )
+
+    statements, stats_reset = collect_statements(config, warnings)
+
+    return WorkloadObservations(
+        table_activity=table_activity,
+        index_activity=index_activity,
+        statements=statements,
+        stats_reset=stats_reset,
+        warnings=tuple(warnings),
+    )
+
+
+def optional_rows(sql, config, relation, warnings, width):
+    """Run one statistics query, degrading a failure to a warning.
+
+    The CommandError message is already redacted by run_command, so it is safe
+    to carry into a warning that ends up in the manifest.
+    """
+    try:
+        rows = run_psql(sql, config)
+    except CommandError as error:
+        warnings.append(
+            ProfileWarning(
+                code=f"{relation}_unavailable",
+                message=f"{relation} could not be read, so its section is omitted: {error}",
+                relation=relation,
+            )
+        )
+        return []
+    return [row for row in rows if len(row) == width]
+
+
+def collect_statements(config, warnings):
+    """Return (statements, stats_reset), warning instead of failing.
+
+    The extension probe comes first: on a database without pg_stat_statements
+    -- the common case, since it is not installed by default -- this costs one
+    query rather than two failures.
+    """
+    try:
+        installed = run_psql(SQL_STATEMENTS_INSTALLED, config)
+    except CommandError as error:
+        warnings.append(
+            ProfileWarning(
+                code="pg_stat_statements_unavailable",
+                message=f"could not determine whether pg_stat_statements is installed: {error}",
+                relation="pg_stat_statements",
+            )
+        )
+        return (), None
+
+    if not any(row and row[0].strip() for row in installed):
+        warnings.append(
+            ProfileWarning(
+                code="pg_stat_statements_missing",
+                message=(
+                    "pg_stat_statements is not installed, so no workload telemetry was "
+                    "collected; the profile describes the schema but not how it is used"
+                ),
+                relation="pg_stat_statements",
+            )
+        )
+        return (), None
+
+    stats_reset = None
+    try:
+        raw = run_psql_scalar(SQL_STATEMENTS_RESET, config)
+        stats_reset = raw or None
+    except CommandError as error:
+        warnings.append(
+            ProfileWarning(
+                code="pg_stat_statements_info_unavailable",
+                message=(
+                    "pg_stat_statements_info could not be read, so the age of the "
+                    f"statement counters is unknown: {error}"
+                ),
+                relation="pg_stat_statements_info",
+            )
+        )
+
+    rows = optional_rows(SQL_STATEMENTS, config, "pg_stat_statements", warnings, width=13)
+    return dedupe_statements(rows), stats_reset
+
+
+def dedupe_statements(rows) -> tuple[StatementActivity, ...]:
+    """One record per queryid, keeping the first occurrence.
+
+    pg_stat_statements holds a separate entry per (userid, dbid, queryid), so
+    the same statement appears once per role that ran it. The query arrives
+    ordered by total execution time, so "first" is the most expensive
+    occurrence -- the one a migration plan should be sized against.
+    """
+    seen = set()
+    statements = []
+    for row in rows:
+        queryid = row[0]
+        if queryid in seen:
+            continue
+        seen.add(queryid)
+        statements.append(
+            StatementActivity(
+                queryid=queryid,
+                query_text=row[1],
+                calls=pg_int(row[2]),
+                total_exec_time=pg_float(row[3]) or 0.0,
+                mean_exec_time=pg_float(row[4]) or 0.0,
+                stddev_exec_time=pg_float(row[5]) or 0.0,
+                rows=pg_int(row[6]),
+                shared_blks_hit=pg_int(row[7]),
+                shared_blks_read=pg_int(row[8]),
+                shared_blks_dirtied=pg_int(row[9]),
+                shared_blks_written=pg_int(row[10]),
+                temp_blks_read=pg_int(row[11]),
+                temp_blks_written=pg_int(row[12]),
+            )
+        )
+    return tuple(statements)
 
 
 # ---------------------------------------------------------------------------

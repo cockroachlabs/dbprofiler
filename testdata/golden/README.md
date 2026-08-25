@@ -15,3 +15,8 @@ Conventions that match what `psql --csv -t` actually emits:
 
 Email-like values use the `.invalid` TLD, which RFC 2606 reserves so it can never
 resolve.
+
+`statements.csv` records `pg_stat_statements` output. Its query text is deliberately
+representative of the worst case: normalized statements with `$1` placeholders, one
+statement carrying an unnormalized literal, and one `queryid` appearing twice. Those
+three shapes are what the top-N dedup and the tokenization tests are written against.
