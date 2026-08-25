@@ -591,10 +591,61 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write a failing orchestration test asserting the sequence: validate config → probe version → fingerprint-before → `pg_dump` → catalog collection → workload telemetry → tokenize → normalize → fingerprint-after → publish. Fingerprint mismatch, catalog failure, cancellation (SIGINT via `KeyboardInterrupt`), or any missing core artifact must prevent publication (no partial `.zip` on disk, no `.zip.tmp` leak).
-- [ ] Assert no connection data (URL, `PGPASSWORD`, `PGUSER`) appears in `sys.stderr` capture, exception messages, or bundle contents across the full flow.
-- [ ] Implement `run_postgres(args)` invoked from `main()` under the `postgres` subparser.
-- [ ] Run tests; expect PASS.
+- [x] Write a failing orchestration test asserting the sequence: validate config → probe version → fingerprint-before → `pg_dump` → catalog collection → workload telemetry → tokenize → normalize → fingerprint-after → publish. Fingerprint mismatch, catalog failure, cancellation (SIGINT via `KeyboardInterrupt`), or any missing core artifact must prevent publication (no partial `.zip` on disk, no `.zip.tmp` leak).
+- [x] Assert no connection data (URL, `PGPASSWORD`, `PGUSER`) appears in `sys.stderr` capture, exception messages, or bundle contents across the full flow.
+- [x] Implement `run_postgres(args)` invoked from `main()` under the `postgres` subparser.
+- [x] Run tests; expect PASS. → 354 tests, `--check-safety` OK, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **A bug was found and fixed: `Path.resolve()` was following a symlinked destination.**
+  `build_postgres_config` resolved the whole output path, so by the time task 9's
+  symlink check ran there was no symlink left to see and the tool would have published
+  straight through it. The config now resolves the *parent* and keeps the final component
+  as given. Two regression tests cover it: the symlink survives into the config, and a
+  `..` in the directory part is still normalized away.
+- **The child-process fake dispatches on the query, not on call position.** A positional
+  `side_effect` list would need renumbering every time a step moves, and asserting
+  "17 calls happened" proves nothing about their order. `FakePostgres` keys off the
+  `SQL_*` constant on the command line and records a step name, so the order assertion is
+  a single comparison against `FULL_RUN` and an override names the step it replaces.
+  A list-valued override is consumed one entry per call, which is how the two fingerprint
+  reads are given different answers to simulate concurrent DDL.
+- **The tokenization key and the destination are both validated before a connection is
+  opened.** Neither was called for by the checklist, and both are worth a few lines: a
+  missing `DBPROFILER_TOKEN_KEY` discovered after collection costs the operator a full
+  pass over a production catalog, and so does a destination that cannot be written to.
+  Two tests assert the failure happens with zero child processes spawned.
+- **`Source.collected_schemas` records the outcome, not the intent.** It is derived from
+  the schemas the catalog actually returned rather than from `--schema-include`, so a
+  bundle that covered less than the operator expected says so on its face.
+- **An empty `pg_dump` is fatal.** `pg_dump` exits zero when the role can see no objects,
+  which would otherwise publish a bundle with an empty `schema.sql` and no other
+  complaint. `REQUIRED_BUNDLE_PATHS` covers the same class of failure for the profile and
+  the three catalog CSVs: those may not degrade, and a bundle missing one of them looks
+  complete and is not.
+- **`SchemaDrift` is its own error class,** so the concurrent-DDL failure is distinguishable
+  from a command failure by a caller and not only by its message text.
+- **`KeyboardInterrupt` is handled in `main()` and exits 130,** the conventional code for
+  SIGINT. `write_bundle` already removes its own temporary file on the way out, so the
+  handler only has something to say, not something to clean up.
+- **Progress goes to stderr; stdout is the bundle path and nothing else,** so the run can
+  be used in a shell substitution. Every progress line is composed from constants and
+  from values the server itself reported.
+- **Secrecy is asserted across the whole flow, not only in the bundle.** Five values --
+  the URL, password, user, host, and tokenization key -- are checked against stdout,
+  stderr, and the bundle bytes, on the success path and on two failure paths where a
+  server error deliberately echoes the URL and the password back. Two further tests
+  assert the credentials reach the child through `env=` and never through `argv`, and that
+  neither `DBPROFILER_*` variable is passed down.
+- **The orchestration guarantees were mutation-tested,** as in task 9: dropping the
+  after-collection fingerprint comparison, neutering the comparison itself, publishing an
+  incomplete bundle, and deferring the key load until after collection are each caught by
+  the suite.
+- **Two fixtures were added,** `server_version.csv` and `schema_fingerprint.csv`, since an
+  end-to-end run needs a reply for every query. The fixture README says what they are for.
+- **The obsolete `test_collection_is_not_implemented_yet` was replaced** by a test that
+  `--output` must name a `.zip`.
 
 ### Task 11: Docker PostgreSQL 16 test environment
 
