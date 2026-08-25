@@ -16,6 +16,9 @@ Conventions that match what `psql --csv -t` actually emits:
 Email-like values use the `.invalid` TLD, which RFC 2606 reserves so it can never
 resolve.
 
+`server_version.csv` and `schema_fingerprint.csv` are only used by the end-to-end
+orchestration tests, which drive every query in one run and need a reply for each.
+
 `statements.csv` records `pg_stat_statements` output. Its query text is deliberately
 representative of the worst case: normalized statements with `$1` placeholders, one
 statement carrying an unnormalized literal, and one `queryid` appearing twice. Those

@@ -6,7 +6,8 @@ Data and workload profiling for migrating workloads to CockroachDB, starting wit
 data-shape profile, and writes a checksummed ZIP bundle you can share with a migration
 team — **without reading your data**.
 
-> **Status: pre-release.** The `postgres` subcommand is not implemented yet. See
+> **Status: pre-release.** The `postgres` subcommand collects and publishes a bundle;
+> it has not yet been exercised against a live server by the integration suite. See
 > `docs/superpowers/plans/` for the implementation plan.
 
 ## Safety boundary
@@ -71,6 +72,15 @@ python3 dbprofiler.py postgres --output ./source-profile.zip
 The connection string may also be passed with `--url`. Either way it is parsed into
 libpq environment variables for the child processes and never placed on their command
 lines.
+
+Progress goes to stderr; stdout is the path of the bundle and nothing else, so
+`OUT=$(python3 dbprofiler.py postgres --output ./source-profile.zip)` works. Restrict
+the run with `--schema-include NAME` or `--schema-exclude NAME`, both repeatable.
+
+The catalog is fingerprinted before and after collection. Each query is its own
+transaction, so a migration running concurrently would otherwise produce a bundle that
+mixed two versions of a schema; if the fingerprints disagree the run fails and writes
+nothing. Cancelling with Ctrl-C leaves no partial bundle behind.
 
 `DBPROFILER_TOKEN_KEY` is read from the environment only — never from an argument, so it
 cannot appear in a process listing — and there is no default, because a default would

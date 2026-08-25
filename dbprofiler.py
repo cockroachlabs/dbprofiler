@@ -125,6 +125,10 @@ class CommandError(DbprofilerError):
     """A psql or pg_dump invocation failed. Any stderr here is already redacted."""
 
 
+class SchemaDrift(DbprofilerError):
+    """The source schema changed while it was being collected."""
+
+
 class BundleError(DbprofilerError):
     """The bundle about to be written violates its own rules.
 
@@ -817,6 +821,11 @@ def build_postgres_config(
     output = Path(args.output).expanduser()
     if output.suffix != ".zip":
         raise ConfigError("--output must name a .zip file")
+    # Resolve the directory, never the file. Path.resolve() on the whole path
+    # follows a symlinked destination, which would hide it from the symlink
+    # check at publication time -- publishing through a symlink is refused, not
+    # quietly redirected.
+    output = output.parent.resolve() / output.name
 
     schema_include = _dedupe(args.schema_include)
     schema_exclude = _dedupe(args.schema_exclude)
@@ -830,7 +839,7 @@ def build_postgres_config(
 
     return PostgresConfig(
         env=parse_connection_url(url),
-        output=output.resolve(),
+        output=output,
         schema_include=schema_include,
         schema_exclude=schema_exclude,
         psql_path=args.psql_path,
@@ -2244,6 +2253,19 @@ BUNDLE_PAYLOAD_PATHS = (
 
 BUNDLE_ALLOWED_PATHS = frozenset(BUNDLE_PAYLOAD_PATHS)
 
+# The entries that make a bundle worth publishing. The statistics sections are
+# allowed to degrade to a warning; these are not -- a bundle missing one of
+# them looks complete and is not.
+REQUIRED_BUNDLE_PATHS = frozenset(
+    {
+        BUNDLE_PROFILE,
+        BUNDLE_SCHEMA,
+        OBSERVATION_TABLES,
+        OBSERVATION_COLUMNS,
+        OBSERVATION_FOREIGN_KEYS,
+    }
+)
+
 # A section is omitted when the collector that feeds it degraded, and the
 # manifest warning says why. Omission is keyed off the warning rather than off
 # an empty record set so that "the role could not read this view" stays
@@ -2689,12 +2711,98 @@ def write_bundle(destination, payloads, manifest: Manifest) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def progress(message: str) -> None:
+    """Report a step. stderr, so stdout stays the bundle path and nothing else.
+
+    Every message here is composed from constants and from values the source
+    itself reported; nothing derived from the connection string reaches it.
+    """
+    print(f"{PROG}: {message}", file=sys.stderr)
+
+
+def collected_schemas(catalog: CatalogObservations) -> tuple[str, ...]:
+    """The schemas the run actually read, not the ones it was asked for.
+
+    --schema-include names an intent; this records the outcome, so a bundle
+    that silently covered less than the operator expected says so.
+    """
+    return tuple(sorted({table.schema for table in catalog.tables}))
+
+
+def require_complete_bundle(payloads) -> None:
+    missing = REQUIRED_BUNDLE_PATHS.difference(entry.path for entry in payloads)
+    if missing:
+        raise BundleError(
+            "refusing to publish an incomplete bundle, missing: " + ", ".join(sorted(missing))
+        )
+
+
+def require_stable_schema(before: str, after: str) -> None:
+    """Fail on concurrent DDL rather than publish two versions of one schema.
+
+    Each psql invocation is its own transaction, so the collection is not
+    isolated. Comparing the catalog fingerprint on either side of it turns
+    that relaxation into a detected condition instead of a silent one.
+    """
+    if before != after:
+        raise SchemaDrift(
+            "the source schema changed during collection, so the bundle would mix two "
+            "versions of it; re-run when no migration is in flight"
+        )
+
+
 def run_postgres(args: argparse.Namespace) -> int:
     """Collect a profile from a PostgreSQL source and publish the bundle."""
-    build_postgres_config(args)
-    # (task 10) probe version -> fingerprint-before -> pg_dump -> catalog ->
-    # workload -> tokenize -> normalize -> fingerprint-after -> publish.
-    raise NotImplementedError("collection is not implemented yet")
+    config = build_postgres_config(args)
+
+    # Both of these fail before a connection is opened. A tokenization key that
+    # turns out to be missing after collection, or a destination that cannot be
+    # written to, costs the operator a full pass over the catalog to discover.
+    tokenizer = Tokenizer(load_token_key())
+    require_publishable_destination(config.output)
+
+    progress("checking the source server version")
+    server_version_num = probe_server_version(config)
+    server_version = format_server_version(server_version_num)
+
+    progress(f"reading the schema of PostgreSQL {server_version}")
+    schema_sql, fingerprint = collect_schema(config, server_version_num)
+    if not schema_sql.strip():
+        raise CommandError("pg_dump produced no schema; the role may not see any objects")
+
+    progress("reading the catalog")
+    catalog = collect_catalog(config)
+
+    progress("reading the statistics views")
+    workload = collect_workload(config)
+    for warning in workload.warnings:
+        progress(f"warning: {warning.code}: {warning.message}")
+
+    progress("checking the schema did not change during collection")
+    require_stable_schema(fingerprint, schema_fingerprint(config))
+
+    source = Source(
+        kind="postgres",
+        server_version_num=server_version_num,
+        server_version=server_version,
+        database=config.env.get("PGDATABASE", ""),
+        collected_schemas=collected_schemas(catalog),
+    )
+    profile = build_profile(source, catalog, workload, tokenizer)
+    payloads = build_payloads(profile, catalog, workload, tokenizer, schema_sql)
+    require_complete_bundle(payloads)
+    manifest = build_manifest(
+        source=source,
+        schema_fingerprint=fingerprint,
+        payloads=payloads,
+        warnings=workload.warnings,
+        stats_reset=workload.stats_reset,
+    )
+
+    progress("publishing the bundle")
+    write_bundle(config.output, payloads, manifest)
+    print(config.output)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2795,6 +2903,11 @@ def main(argv: list[str] | None = None) -> int:
             # we have promised not to print.
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
+        except KeyboardInterrupt:
+            # write_bundle removes its own temporary file on the way out, so
+            # there is nothing to clean up here -- only something to say.
+            print(f"{PROG}: cancelled; no bundle was written", file=sys.stderr)
+            return 130
 
     parser.print_help(sys.stderr)
     return 2

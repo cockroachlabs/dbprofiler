@@ -222,6 +222,28 @@ class TestBuildPostgresConfig(unittest.TestCase):
         self.assertIsInstance(cfg.output, Path)
         self.assertTrue(cfg.output.is_absolute())
 
+    def test_a_symlinked_output_is_not_resolved_away(self):
+        """Path.resolve() follows the final symlink, which would leave the
+        publication-time symlink check with nothing to see."""
+        with tempfile.TemporaryDirectory() as directory:
+            link = Path(directory) / "link.zip"
+            link.symlink_to(Path(directory) / "elsewhere.zip")
+            cfg = dbprofiler.build_postgres_config(
+                postgres_args(output=str(link)), {"DBPROFILER_POSTGRES_URL": URL}
+            )
+            self.assertTrue(cfg.output.is_symlink())
+            self.assertEqual(cfg.output.name, "link.zip")
+
+    def test_the_output_directory_is_still_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nested = Path(directory) / "sub"
+            nested.mkdir()
+            cfg = dbprofiler.build_postgres_config(
+                postgres_args(output=str(nested / ".." / "profile.zip")),
+                {"DBPROFILER_POSTGRES_URL": URL},
+            )
+        self.assertNotIn("..", cfg.output.parts)
+
     def test_schema_include_and_exclude_are_mutually_exclusive(self):
         args = postgres_args(schema_include="app", schema_exclude="audit")
         with self.assertRaises(dbprofiler.ConfigError):
@@ -2533,6 +2555,380 @@ class TestNothingRawReachesDisk(BundleCase):
         self.assertEqual(manifest["source"]["database"], DATABASE)
 
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+# Which fixture answers which query. Keyed on the SQL constant itself so the
+# fake dispatches on what the run asked for rather than on how many calls have
+# gone by -- a positional list would have to be renumbered every time a step
+# moves, and would not prove the order was the intended one.
+SQL_FIXTURES = {
+    dbprofiler.SQL_SERVER_VERSION: "server_version",
+    dbprofiler.SQL_SCHEMA_FINGERPRINT: "schema_fingerprint",
+    dbprofiler.SQL_TABLES: "tables",
+    dbprofiler.SQL_INHERITED: "inherited",
+    dbprofiler.SQL_COLUMNS: "columns",
+    dbprofiler.SQL_COLUMN_STATS: "column_stats",
+    dbprofiler.SQL_EXTENDED_STATS: "extended_stats",
+    dbprofiler.SQL_FOREIGN_KEYS: "foreign_keys",
+    dbprofiler.SQL_INDEXES: "indexes",
+    dbprofiler.SQL_TABLE_ACTIVITY: "table_activity",
+    dbprofiler.SQL_INDEX_ACTIVITY: "index_activity",
+    dbprofiler.SQL_STATEMENTS_INSTALLED: "statements_installed",
+    dbprofiler.SQL_STATEMENTS_RESET: "statements_reset",
+    dbprofiler.SQL_STATEMENTS: "statements",
+}
+
+PG_DUMP_VERSION_OUTPUT = "pg_dump (PostgreSQL) 16.2\n"
+
+
+class FakePostgres:
+    """A stand-in for every child process one run makes.
+
+    Records the step names in order. An override supplies a replacement for a
+    step: a str is stdout, a CompletedProcess or an exception is a failure, and
+    a list is consumed one entry per call, which is how the two fingerprint
+    reads are given different answers.
+    """
+
+    def __init__(self, **overrides):
+        self.calls = []
+        self.queues = {
+            name: list(value) if isinstance(value, list) else [value]
+            for name, value in overrides.items()
+        }
+
+    def __call__(self, argv, **kwargs):
+        if "pg_dump" in argv[0]:
+            step = "pg_dump_version" if "--version" in argv else "pg_dump"
+            default = PG_DUMP_VERSION_OUTPUT if step == "pg_dump_version" else SCHEMA_SQL
+        else:
+            step = SQL_FIXTURES[argv[argv.index("-c") + 1]]
+            default = golden(step)
+        self.calls.append(step)
+
+        queue = self.queues.get(step)
+        reply = default if not queue else (queue.pop(0) if len(queue) > 1 else queue[0])
+        if isinstance(reply, BaseException):
+            raise reply
+        return completed(stdout=reply) if isinstance(reply, str) else reply
+
+
+# Every step of a complete run, in the order the plan specifies.
+FULL_RUN = [
+    "server_version",
+    "pg_dump_version",
+    "schema_fingerprint",
+    "pg_dump",
+    "tables",
+    "inherited",
+    "columns",
+    "column_stats",
+    "extended_stats",
+    "foreign_keys",
+    "indexes",
+    "table_activity",
+    "index_activity",
+    "statements_installed",
+    "statements_reset",
+    "statements",
+    "schema_fingerprint",
+]
+
+
+class OrchestrationCase(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name) / "source-profile.zip"
+        self.stderr = io.StringIO()
+        self.stdout = io.StringIO()
+
+    def run_cli(self, fake=None, output=None, env=None, extra=()):
+        fake = FakePostgres() if fake is None else fake
+        environment = {
+            dbprofiler.URL_ENV_VAR: URL,
+            dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY,
+        }
+        environment.update(env or {})
+        argv = ["postgres", "--output", str(output or self.output), *extra]
+        with mock.patch.dict("os.environ", environment, clear=True):
+            with mock.patch("subprocess.run", side_effect=fake):
+                with contextlib.redirect_stderr(self.stderr):
+                    with contextlib.redirect_stdout(self.stdout):
+                        return dbprofiler.main(argv), fake
+
+    def leftovers(self):
+        return sorted(p.name for p in Path(self.directory.name).iterdir())
+
+    def archive(self, path=None):
+        with zipfile.ZipFile(path or self.output) as handle:
+            return {name: handle.read(name) for name in handle.namelist()}
+
+    def manifest(self):
+        return json.loads(self.archive()["manifest.json"])
+
+
+class TestOrchestrationOrder(OrchestrationCase):
+    def test_the_run_follows_the_documented_sequence(self):
+        code, fake = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.calls, FULL_RUN)
+
+    def test_the_client_is_checked_before_anything_is_dumped(self):
+        _, fake = self.run_cli()
+        self.assertLess(fake.calls.index("pg_dump_version"), fake.calls.index("pg_dump"))
+
+    def test_the_catalog_is_fingerprinted_before_and_after_collection(self):
+        """Each psql call is its own transaction, so drift is caught by
+        comparison rather than prevented by isolation."""
+        _, fake = self.run_cli()
+        first = fake.calls.index("schema_fingerprint")
+        last = len(fake.calls) - 1 - fake.calls[::-1].index("schema_fingerprint")
+        self.assertNotEqual(first, last)
+        self.assertLess(first, fake.calls.index("pg_dump"))
+        self.assertGreater(last, fake.calls.index("statements"))
+
+    def test_the_bundle_is_the_only_thing_left_on_disk(self):
+        self.run_cli()
+        self.assertEqual(self.leftovers(), ["source-profile.zip"])
+
+    def test_the_bundle_holds_every_documented_entry(self):
+        self.run_cli()
+        self.assertEqual(
+            sorted(self.archive()),
+            [
+                "manifest.json",
+                "observations/foreign_keys.csv",
+                "observations/pg_class.csv",
+                "observations/pg_stat_indexes.csv",
+                "observations/pg_stat_statements.csv",
+                "observations/pg_stat_tables.csv",
+                "observations/pg_stats.csv",
+                "observations/pg_stats_ext.csv",
+                "profile.json",
+                "schema.sql",
+            ],
+        )
+
+    def test_the_output_path_is_reported(self):
+        self.run_cli()
+        self.assertIn(str(self.output), self.stdout.getvalue())
+
+
+class TestOrchestrationContent(OrchestrationCase):
+    def setUp(self):
+        super().setUp()
+        self.run_cli()
+
+    def test_the_source_records_the_server_it_profiled(self):
+        source = self.manifest()["source"]
+        self.assertEqual(source["kind"], "postgres")
+        self.assertEqual(source["server_version_num"], 160002)
+        self.assertEqual(source["server_version"], "16.2")
+        self.assertEqual(source["database"], DATABASE)
+
+    def test_the_source_records_the_schemas_actually_collected(self):
+        self.assertEqual(self.manifest()["source"]["collected_schemas"], ["public", "sales"])
+
+    def test_the_manifest_carries_the_verified_fingerprint(self):
+        self.assertRegex(self.manifest()["schema_fingerprint"], r"\A[0-9a-f]{64}\Z")
+
+    def test_the_manifest_carries_the_statistics_reset_time(self):
+        self.assertEqual(self.manifest()["stats_reset"], golden("statements_reset").strip())
+
+    def test_the_schema_dump_is_stored_verbatim(self):
+        self.assertEqual(self.archive()["schema.sql"], SCHEMA_SQL.encode("utf-8"))
+
+    def test_the_profile_carries_the_normalized_contract(self):
+        profile = json.loads(self.archive()["profile.json"])
+        self.assertEqual(profile["contract_version"], dbprofiler.CONTRACT_VERSION)
+        self.assertEqual(len(profile["tables"]), 3)
+        self.assertEqual(len(profile["relationships"]), 2)
+
+    def test_every_payload_hash_in_the_manifest_matches_what_was_stored(self):
+        entries = self.archive()
+        for observation in self.manifest()["payloads"]:
+            with self.subTest(path=observation["path"]):
+                stored = hashlib.sha256(entries[observation["path"]]).hexdigest()
+                self.assertEqual(stored, observation["sha256"])
+
+    def test_a_clean_run_reports_no_warnings(self):
+        self.assertEqual(self.manifest()["warnings"], [])
+
+
+class TestOrchestrationScope(OrchestrationCase):
+    def test_an_excluded_schema_is_left_out_of_the_bundle(self):
+        self.run_cli(extra=["--schema-exclude", "sales"])
+        self.assertEqual(self.manifest()["source"]["collected_schemas"], ["public"])
+        profile = json.loads(self.archive()["profile.json"])
+        self.assertEqual([t["schema"] for t in profile["tables"]], ["public", "public"])
+
+    def test_an_included_schema_is_the_only_one_collected(self):
+        self.run_cli(extra=["--schema-include", "sales"])
+        self.assertEqual(self.manifest()["source"]["collected_schemas"], ["sales"])
+
+
+class TestOrchestrationDegradation(OrchestrationCase):
+    def test_a_missing_extension_warns_and_still_publishes(self):
+        code, _ = self.run_cli(FakePostgres(statements_installed=""))
+        self.assertEqual(code, 0)
+        self.assertNotIn("observations/pg_stat_statements.csv", self.archive())
+        self.assertIn(
+            "pg_stat_statements_missing", [w["code"] for w in self.manifest()["warnings"]]
+        )
+
+    def test_an_unreadable_statistics_view_warns_and_still_publishes(self):
+        code, _ = self.run_cli(FakePostgres(table_activity=denied("pg_stat_user_tables")))
+        self.assertEqual(code, 0)
+        self.assertNotIn("observations/pg_stat_tables.csv", self.archive())
+
+    def test_degradations_are_reported_to_the_operator(self):
+        self.run_cli(FakePostgres(statements_installed=""))
+        self.assertIn("pg_stat_statements_missing", self.stderr.getvalue())
+
+
+class TestOrchestrationFailures(OrchestrationCase):
+    def expect_failure(self, fake=None, code=2, **kwargs):
+        actual, fake = self.run_cli(fake, **kwargs)
+        self.assertEqual(actual, code)
+        self.assertEqual(self.leftovers(), [], "publication left something behind")
+        self.assertNotIn("Traceback", self.stderr.getvalue())
+        return fake
+
+    def test_concurrent_ddl_prevents_publication(self):
+        """The two fingerprints disagree, so the bundle would mix two versions
+        of a schema."""
+        drifted = golden("schema_fingerprint") + "public,new_table,r\n"
+        self.expect_failure(FakePostgres(schema_fingerprint=[golden("schema_fingerprint"),
+                                                            drifted]))
+        self.assertIn("changed during collection", self.stderr.getvalue())
+
+    def test_a_catalog_failure_prevents_publication(self):
+        self.expect_failure(FakePostgres(columns=denied("pg_attribute")))
+
+    def test_an_unreadable_schema_dump_prevents_publication(self):
+        self.expect_failure(FakePostgres(pg_dump=completed(returncode=1, stderr="denied\n")))
+
+    def test_an_empty_schema_dump_prevents_publication(self):
+        """pg_dump exiting zero with nothing to say means the run collected no
+        schema, which is not a bundle worth publishing."""
+        self.expect_failure(FakePostgres(pg_dump="   \n"))
+
+    def test_an_unsupported_server_version_prevents_publication(self):
+        fake = self.expect_failure(FakePostgres(server_version="150004\n"))
+        self.assertEqual(fake.calls, ["server_version"])
+
+    def test_an_unsupported_layout_prevents_publication(self):
+        partitioned = golden("tables") + "public,events,p,0,0\n"
+        self.expect_failure(FakePostgres(tables=partitioned))
+
+    def test_cancellation_prevents_publication(self):
+        """SIGINT arrives as KeyboardInterrupt. Nothing half-written survives."""
+        fake = self.expect_failure(FakePostgres(table_activity=KeyboardInterrupt()), code=130)
+        self.assertEqual(fake.calls[-1], "table_activity")
+        self.assertIn("cancelled", self.stderr.getvalue())
+
+    def test_a_missing_tokenization_key_fails_before_connecting(self):
+        """A key that is only discovered missing after collection wastes minutes
+        of the operator's time and a full pass over the catalog."""
+        fake = self.expect_failure(env={dbprofiler.TOKEN_KEY_ENV_VAR: ""})
+        self.assertEqual(fake.calls, [])
+        self.assertIn(dbprofiler.TOKEN_KEY_ENV_VAR, self.stderr.getvalue())
+
+    def test_an_unusable_destination_fails_before_connecting(self):
+        link = Path(self.directory.name) / "link.zip"
+        link.symlink_to(Path(self.directory.name) / "elsewhere.zip")
+        actual, fake = self.run_cli(output=link)
+        self.assertEqual(actual, 2)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("symlink", self.stderr.getvalue())
+
+    def test_an_existing_bundle_survives_a_failed_run(self):
+        self.output.write_bytes(b"previous bundle")
+        actual, _ = self.run_cli(FakePostgres(columns=denied("pg_attribute")))
+        self.assertEqual(actual, 2)
+        self.assertEqual(self.output.read_bytes(), b"previous bundle")
+        self.assertEqual(self.leftovers(), ["source-profile.zip"])
+
+
+class TestOrchestrationSecrecy(OrchestrationCase):
+    SECRETS = (URL, PASSWORD, USER, HOST, TOKEN_KEY)
+
+    def assert_nothing_leaked(self):
+        for stream, name in ((self.stderr, "stderr"), (self.stdout, "stdout")):
+            for secret in self.SECRETS:
+                with self.subTest(stream=name, secret=secret):
+                    self.assertNotIn(secret, stream.getvalue())
+
+    def test_a_successful_run_prints_no_connection_detail(self):
+        self.run_cli()
+        self.assert_nothing_leaked()
+
+    def test_a_successful_run_writes_no_connection_detail_into_the_bundle(self):
+        self.run_cli()
+        published = zip_bytes(self.output)
+        for secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret.encode("utf-8"), published)
+
+    def test_a_server_error_quoting_the_url_is_redacted(self):
+        """psql echoes the connection string in some failures. Whatever it says
+        passes through redaction before an operator or a log file sees it."""
+        echoed = completed(returncode=2, stderr=f'could not connect to "{URL}"\n')
+        self.run_cli(FakePostgres(server_version=echoed))
+        self.assert_nothing_leaked()
+
+    def test_a_server_error_quoting_the_password_is_redacted(self):
+        echoed = completed(returncode=2, stderr=f"password={PASSWORD} rejected\n")
+        self.run_cli(FakePostgres(tables=echoed))
+        self.assert_nothing_leaked()
+
+    def test_the_child_environment_carries_the_credentials_and_not_our_key(self):
+        captured = {}
+        fake = FakePostgres()
+
+        def record(argv, **kwargs):
+            captured.update(kwargs.get("env", {}))
+            return fake(argv, **kwargs)
+
+        with mock.patch.dict(
+            "os.environ",
+            {dbprofiler.URL_ENV_VAR: URL, dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY},
+            clear=True,
+        ):
+            with mock.patch("subprocess.run", side_effect=record):
+                with contextlib.redirect_stderr(self.stderr):
+                    with contextlib.redirect_stdout(self.stdout):
+                        dbprofiler.main(["postgres", "--output", str(self.output)])
+        self.assertEqual(captured["PGPASSWORD"], PASSWORD)
+        self.assertNotIn(dbprofiler.TOKEN_KEY_ENV_VAR, captured)
+        self.assertNotIn(dbprofiler.URL_ENV_VAR, captured)
+
+    def test_no_credential_reaches_a_child_command_line(self):
+        seen = []
+        fake = FakePostgres()
+
+        def record(argv, **kwargs):
+            seen.append(" ".join(argv))
+            return fake(argv, **kwargs)
+
+        with mock.patch.dict(
+            "os.environ",
+            {dbprofiler.URL_ENV_VAR: URL, dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY},
+            clear=True,
+        ):
+            with mock.patch("subprocess.run", side_effect=record):
+                with contextlib.redirect_stderr(self.stderr):
+                    with contextlib.redirect_stdout(self.stdout):
+                        dbprofiler.main(["postgres", "--output", str(self.output)])
+        for line in seen:
+            for secret in self.SECRETS:
+                with self.subTest(secret=secret):
+                    self.assertNotIn(secret, line)
+
+
 class TestCLI(unittest.TestCase):
     def test_no_subcommand_prints_help_and_returns_two(self):
         stderr = io.StringIO()
@@ -2554,11 +2950,12 @@ class TestCLI(unittest.TestCase):
         self.assertIn("DBPROFILER_POSTGRES_URL", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_collection_is_not_implemented_yet(self):
-        # Replace with a real orchestration test in task 10.
-        with mock.patch.dict("os.environ", {"DBPROFILER_POSTGRES_URL": URL}, clear=True):
-            with self.assertRaises(NotImplementedError):
-                dbprofiler.main(["postgres", "--output", "profile.zip"])
+    def test_an_output_that_is_not_a_zip_is_rejected(self):
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", {dbprofiler.URL_ENV_VAR: URL}, clear=True):
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(dbprofiler.main(["postgres", "--output", "profile.tar"]), 2)
+        self.assertIn(".zip", stderr.getvalue())
 
 
 if __name__ == "__main__":
