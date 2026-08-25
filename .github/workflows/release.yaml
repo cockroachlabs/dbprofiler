@@ -1,0 +1,84 @@
+# Publishes a tagged dbprofiler.py, unmodified, with a checksum and a signed
+# provenance attestation.
+#
+# The whole value of a single-file tool is that a security reviewer can read
+# what they are about to run. That only holds if the download is byte-identical
+# to the tag, so no step here rewrites the script -- not even to stamp a version
+# into it. The version is committed before the tag, and the job refuses to
+# publish if the two disagree.
+#
+# To cut a release:
+#
+#   1. Edit VERSION in dbprofiler.py, commit, merge.
+#   2. git tag -a v1.2.3 -m 'v1.2.3' && git push origin v1.2.3
+#
+# Anything else -- a tag on an unmerged branch, a tag that does not match
+# VERSION, a file that fails the safety audit -- fails here rather than reaching
+# a customer.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and attach its assets
+      id-token: write # sign the provenance attestation
+      attestations: write # record it against this repository
+    steps:
+      - uses: actions/checkout@v4
+
+      # The oldest version the tool claims to support. If the release artifact
+      # only works on something newer, that is a release-blocking bug.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Safety audit
+        run: python dbprofiler.py --check-safety
+
+      - name: Unit tests
+        run: python -m unittest
+
+      - name: Tag must agree with the version in the script
+        run: |
+          set -euo pipefail
+          version="$(python dbprofiler.py --version)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+            echo "bump VERSION in dbprofiler.py, merge, then re-tag" >&2
+            exit 1
+          fi
+
+      # Written with a bare filename so `sha256sum -c` works from whatever
+      # directory the customer downloaded into.
+      - name: Checksum
+        run: sha256sum dbprofiler.py > dbprofiler.py.sha256
+
+      - name: Verify the checksum the way a customer will
+        run: sha256sum -c dbprofiler.py.sha256
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dbprofiler.py
+
+      # --verify-tag refuses to invent a tag that is not already pushed, so a
+      # typo cannot create a release pointing at the wrong commit.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            dbprofiler.py dbprofiler.py.sha256
