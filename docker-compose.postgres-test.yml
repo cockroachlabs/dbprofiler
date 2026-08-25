@@ -1,0 +1,54 @@
+# A disposable PostgreSQL 16 for dbprofiler's integration tests.
+#
+# Every credential here is a ${...} substitution read from .env.test.local,
+# which is gitignored. This file holds no password, no port, and no connection
+# string, so it is safe to commit and safe to read in a public repository.
+#
+#   docker compose --env-file .env.test.local \
+#       -f docker-compose.postgres-test.yml up -d --wait
+#
+# See docs/TESTING.md for the full loop, including how to reset the volume.
+
+name: dbprofiler-postgres-test
+
+services:
+  postgres:
+    image: postgres:16
+    # :? rather than a default value. A default would let a typo in the env
+    # file start a container with credentials nobody chose, and the integration
+    # test would then fail somewhere less obvious than here.
+    environment:
+      POSTGRES_USER: ${DBPROFILER_TEST_PGUSER:?missing from .env.test.local}
+      POSTGRES_PASSWORD: ${DBPROFILER_TEST_PGPASSWORD:?missing from .env.test.local}
+      POSTGRES_DB: ${DBPROFILER_TEST_PGDATABASE:?missing from .env.test.local}
+    command:
+      - postgres
+      # pg_stat_statements needs a preload, so the profiler's degradation path
+      # is not the one under test here. track=all counts statements inside
+      # functions too, which is closer to what a real source looks like.
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+    ports:
+      # Loopback only. The fixtures are disposable and the credentials are
+      # synthetic, but a PostgreSQL listening on 0.0.0.0 is not something to
+      # leave running on a laptop on a conference network.
+      - "127.0.0.1:${DBPROFILER_TEST_PGPORT:?missing from .env.test.local}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, when the volume is empty. `down -v` and up again is how you
+      # get a clean database; see docs/TESTING.md.
+      - ./testdata/postgres-test-init.sql:/docker-entrypoint-initdb.d/10-dbprofiler.sql:ro
+    healthcheck:
+      # $$ escapes the substitution so the shell inside the container expands
+      # it, not Compose. --wait blocks on this, so a test run never races the
+      # first connection.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pgdata:

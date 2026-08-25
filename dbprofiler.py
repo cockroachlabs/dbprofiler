@@ -1020,8 +1020,15 @@ PG_DUMP_VERSION = re.compile(r"(\d+)")
 
 
 def probe_pg_dump_major(config: PostgresConfig) -> int:
-    """Read the local pg_dump major version. Makes no connection."""
-    output = run_command([config.pg_dump_path, *PG_DUMP_ARGS, "--version"], config, "pg_dump")
+    """Read the local pg_dump major version. Makes no connection.
+
+    --version has to be argv[1], alone. pg_dump special-cases it by comparing
+    argv[1] before getopt runs, and its long-option table has no entry for it,
+    so putting anything ahead of it -- even PG_DUMP_ARGS' harmless -w -- makes
+    it an unrecognized option and pg_dump exits 1. Nothing here connects, so
+    there is no prompt for -w to suppress anyway.
+    """
+    output = run_command([config.pg_dump_path, "--version"], config, "pg_dump")
     match = PG_DUMP_VERSION.search(output)
     if not match:
         raise CommandError("pg_dump did not report a usable version")

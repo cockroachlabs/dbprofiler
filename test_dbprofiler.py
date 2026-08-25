@@ -19,6 +19,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -697,11 +699,20 @@ class TestProbeServerVersion(unittest.TestCase):
 
 class TestPgDumpVersion(unittest.TestCase):
     def test_version_is_probed_without_connecting(self):
+        """--version must be argv[1] and nothing may follow it.
+
+        pg_dump handles --version by inspecting argv[1] directly, before getopt
+        runs, and its option table has no entry for it. Anything ahead of it --
+        even a harmless -w -- sends it down the getopt path, where it is an
+        unrecognized option and the process exits 1 with only a "try --help"
+        hint. Real pg_dump 16.15 does this; a mock that matches on
+        `"--version" in argv` does not.
+        """
         with mock.patch(
             "subprocess.run", return_value=completed(stdout="pg_dump (PostgreSQL) 16.2\n")
         ) as run:
             self.assertEqual(dbprofiler.probe_pg_dump_major(a_config()), 16)
-        self.assertEqual(run.call_args.args[0], ["pg_dump", "-w", "--version"])
+        self.assertEqual(run.call_args.args[0], ["pg_dump", "--version"])
 
     def test_version_parsing_tolerates_packager_suffixes(self):
         for text, expected in (
@@ -906,7 +917,7 @@ class TestCollectSchema(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=self.calls()) as run:
             dbprofiler.collect_schema(a_config(), 160002)
         argvs = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(argvs[0], ["pg_dump", "-w", "--version"])
+        self.assertEqual(argvs[0], ["pg_dump", "--version"])
         self.assertIn(dbprofiler.SQL_SCHEMA_FINGERPRINT, argvs[1])
         self.assertIn("--schema-only", argvs[2])
 
@@ -2956,6 +2967,116 @@ class TestCLI(unittest.TestCase):
             with contextlib.redirect_stderr(stderr):
                 self.assertEqual(dbprofiler.main(["postgres", "--output", "profile.tar"]), 2)
         self.assertIn(".zip", stderr.getvalue())
+
+
+REPO = Path(__file__).resolve().parent
+COMPOSE_FILE = REPO / "docker-compose.postgres-test.yml"
+COMPOSE_INIT_SQL = REPO / "testdata" / "postgres-test-init.sql"
+TESTING_DOC = REPO / "docs" / "TESTING.md"
+ENV_FILE = ".env.test.local"
+
+
+GIT = shutil.which("git")
+
+
+def git(*args):
+    """Run git in this repository, or return None if that is not possible.
+
+    Absolute path because a relative one resolves against PATH at call time;
+    these tests also run in CI, where being precise about which binary answers
+    a question about what is committed is worth one lookup.
+    """
+    if GIT is None:
+        return None
+    done = subprocess.run([GIT, "-C", str(REPO), *args], capture_output=True, text=True)
+    return None if done.returncode == 128 else done
+
+
+def tracked_files():
+    """Everything git would ship, or None outside a work tree."""
+    done = git("ls-files", "-z")
+    if done is None or done.returncode != 0:
+        return None
+    return [name for name in done.stdout.split("\0") if name]
+
+
+class TestComposeSecrecy(unittest.TestCase):
+    """The Docker environment is committed; the credentials it uses are not.
+
+    docker-compose.postgres-test.yml is readable by anyone who can read this
+    public repository. Everything secret in it has to arrive by substitution
+    from the gitignored .env.test.local, and nothing may hardcode a value that
+    a reader could mistake for a real one.
+    """
+
+    def setUp(self):
+        self.text = COMPOSE_FILE.read_text()
+
+    def test_the_compose_file_holds_no_connection_string(self):
+        self.assertNotIn("://", self.text)
+
+    def test_the_compose_file_holds_no_token_key(self):
+        # The HMAC key belongs to the tool, not the server. If it appeared here
+        # it would also be handed to the container for no reason.
+        self.assertNotIn("DBPROFILER_TOKEN_KEY", self.text)
+
+    def test_every_credential_field_is_a_substitution(self):
+        for key in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
+            line = next(
+                stripped
+                for stripped in (raw.strip() for raw in self.text.splitlines())
+                if stripped.startswith(key + ":")
+            )
+            value = line.split(":", 1)[1].strip()
+            self.assertTrue(
+                value.startswith("${") and value.endswith("}"),
+                f"{key} must come from .env.test.local, got {value!r}",
+            )
+
+    def test_no_substitution_carries_a_default_value(self):
+        """${VAR:-fallback} would start a server with credentials nobody chose."""
+        for match in re.finditer(r"\$\{([^}]*)\}", self.text):
+            self.assertNotIn(":-", match.group(1))
+            self.assertNotIn("-", match.group(1).split(":?")[0])
+
+    def test_the_published_port_is_loopback_only(self):
+        published = [
+            raw.strip().lstrip("- ").strip('"')
+            for raw in self.text.splitlines()
+            if ":5432\"" in raw
+        ]
+        self.assertTrue(published, "expected a published port")
+        for mapping in published:
+            self.assertTrue(
+                mapping.startswith("127.0.0.1:"),
+                f"port must bind to loopback, got {mapping!r}",
+            )
+
+    def test_pg_stat_statements_is_preloaded(self):
+        # Otherwise the integration test silently exercises the degraded path.
+        self.assertIn("shared_preload_libraries=pg_stat_statements", self.text)
+        self.assertIn("CREATE EXTENSION", COMPOSE_INIT_SQL.read_text())
+
+    def test_the_env_file_is_ignored_by_git(self):
+        done = git("check-ignore", ENV_FILE)
+        if done is None:
+            self.skipTest("git unavailable, or not a work tree")
+        self.assertEqual(done.returncode, 0, f"{ENV_FILE} is not gitignored")
+
+    def test_no_env_file_is_tracked(self):
+        """Not even an example one. An example env file is where a real URL
+
+        eventually gets pasted, and the reviewer reading the diff has no way to
+        tell that the value in it was meant to be fake.
+        """
+        tracked = tracked_files()
+        if tracked is None:
+            self.skipTest("not a git work tree")
+        self.assertEqual([name for name in tracked if Path(name).name.startswith(".env")], [])
+
+    def test_the_testing_doc_holds_no_credentialed_url(self):
+        for line in TESTING_DOC.read_text().splitlines():
+            self.assertNotRegex(line, r"://[^/\s]*:[^/\s]*@")
 
 
 if __name__ == "__main__":
