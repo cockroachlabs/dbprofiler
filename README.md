@@ -31,8 +31,13 @@ This is enforced mechanically, not just documented:
 python3 dbprofiler.py --check-safety
 ```
 
-That mode reads the tool's own source, enumerates every SQL statement it can issue, and
-exits non-zero if any of them violates the boundary. CI runs it on every commit.
+That mode reads the tool's own source and exits non-zero on any violation. It enumerates
+every SQL statement the tool can issue and checks each one for forbidden operations and
+against an explicit relation allowlist — there is no `pg_catalog` wildcard, because that
+schema also holds password hashes and large objects. It then parses this file and
+verifies there is exactly one child-process call site, that it passes an explicit
+environment, that it never uses a shell, and that no connection string with credentials
+is present in the source. CI runs it on every commit.
 
 ## Requirements
 

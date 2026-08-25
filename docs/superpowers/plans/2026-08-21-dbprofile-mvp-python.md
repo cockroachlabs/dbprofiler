@@ -200,11 +200,50 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write failing tests for: `run_psql(sql, env)` never places SQL or credentials on argv beyond `-X -A -F, --csv -t -c <sql>`; credentials always flow through `env=`; stderr is redacted (URL-like strings, `password=` fragments, and libpq env values scrubbed); nonzero exit raises a wrapped exception without raw stderr.
-- [ ] Write failing tests for `--check-safety`: enumerate every `SQL_*` constant via `inspect`/reflection; assert none contains `COUNT(`, `ANALYZE`, `CREATE STATISTICS`, or references to non-allowed relations (allowlist: `pg_catalog.*`, `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type`, `pg_constraint`, `pg_index`, `pg_stats`, `pg_stats_ext`, `pg_stat_user_indexes`, `pg_stat_user_tables`, `pg_statio_user_indexes`, `pg_stat_statements`, `pg_stat_statements_info`, `pg_attrdef`, `pg_sequence`, `pg_description`).
-- [ ] Implement `SafeEnv` builder, `run_psql`, `run_pg_dump`, `redact_error` with a deterministic redaction pattern list.
-- [ ] Implement `--check-safety` mode.
-- [ ] Run tests; expect PASS.
+- [x] Write failing tests for: `run_psql(sql, env)` never places SQL or credentials on argv beyond `-X -A -F, --csv -t -c <sql>`; credentials always flow through `env=`; stderr is redacted (URL-like strings, `password=` fragments, and libpq env values scrubbed); nonzero exit raises a wrapped exception without raw stderr.
+- [x] Write failing tests for `--check-safety`: enumerate every `SQL_*` constant via `inspect`/reflection; assert none contains `COUNT(`, `ANALYZE`, `CREATE STATISTICS`, or references to non-allowed relations (allowlist: ~~`pg_catalog.*`,~~ `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type`, `pg_constraint`, `pg_index`, `pg_stats`, `pg_stats_ext`, `pg_stat_user_indexes`, `pg_stat_user_tables`, `pg_statio_user_indexes`, `pg_stat_statements`, `pg_stat_statements_info`, `pg_attrdef`, `pg_sequence`, `pg_description`).
+- [x] Implement `SafeEnv` builder, `run_psql`, `run_pg_dump`, `redact_error` with a deterministic redaction pattern list. → `safe_env()`, `run_psql()`, `run_psql_scalar()`, `run_pg_dump()`, `redact_error()`, all funnelling through a single `run_command()`.
+- [x] Implement `--check-safety` mode.
+- [x] Run tests; expect PASS. → 92 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **Dropped `pg_catalog.*` from the allowlist.** A blanket wildcard over `pg_catalog`
+  is not a safety boundary: it admits `pg_authid` and `pg_shadow` (role password
+  hashes), `pg_largeobject` (actual user data), `pg_statistic` (raw statistic values
+  *without* the per-permission filtering the `pg_stats` view applies),
+  `pg_subscription` (`subconninfo` carries a password) and `pg_user_mapping`
+  (`umoptions` can carry a password). `ALLOWED_RELATIONS` now enumerates names one by
+  one, and a `DENIED_RELATIONS` map records a reason per trap so a reviewer sees the
+  "why". A schema qualifier other than `pg_catalog` is itself a violation, so
+  `evil.pg_class` is rejected even though `pg_class` is allowed.
+- **Dropped `-A` and `-F,` from the psql arguments.** `--csv` is its own output format;
+  `-A` placed after it overrides it. Keeping both would have made the parse
+  order-dependent. Final set: `PSQL_ARGS = ("-X", "-w", "--csv", "-t", "-v",
+  "ON_ERROR_STOP=1")`.
+- **Added `-w` (`--no-password`) to both psql and pg_dump.** Without it, a missing
+  password makes the child block on a terminal read; the run would then fail by
+  timeout instead of immediately. `stdin=DEVNULL` backs it up.
+- **Added `-v ON_ERROR_STOP=1`,** so a SQL error is a nonzero exit rather than a
+  silently empty result set.
+- **Set-returning functions are allowlisted separately** (`unnest`, `generate_series`,
+  `generate_subscripts`). The relation scanner distinguishes `FROM name(` from
+  `FROM name`, so `FROM pg_read_file(...)` is rejected while `FROM unnest(...)` passes.
+- **`--check-safety` now also statically audits this file's own source** via `ast`, not
+  grep: exactly one `subprocess.*` call site, every call passes `env=`, none passes
+  `shell=`, and no string literal anywhere carries a credentialed connection URL. The
+  one-call-site rule is what makes the credential handling reviewable at a glance.
+- **`redact_error` scrubs short values only when they are secrets.** `PGPASSWORD` is
+  replaced however short; other libpq values are replaced only at length >= 4, because
+  a blind replace of a two-character `PGUSER` shreds unrelated words and destroys the
+  diagnostic. `PGPORT` is never replaced — a bare port number matches too much text.
+- **`probe_server_version(cfg)`** was added here rather than in task 10, so the version
+  gate from task 2 has a caller and is exercised end to end.
+- **`pg_inherits` was deliberately not added to the allowlist.** Task 5 needs it; the
+  house rule is that a relation is allowlisted in the same change as the collector that
+  reads it.
+- **`ruff.toml`:** added `S608` to the test per-file ignores. The safety tests plant
+  deliberately unsafe SQL to prove the guard rejects it.
 
 ### Task 4: Schema extraction via `pg_dump`
 
