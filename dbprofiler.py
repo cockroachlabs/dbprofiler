@@ -47,7 +47,12 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import ast
+import csv
+import io
 import os
+import re
+import subprocess
 import sys
 import urllib.parse
 from dataclasses import dataclass
@@ -99,6 +104,10 @@ class UnsupportedServerVersion(DbprofilerError):
     """The source server is not a PostgreSQL major this release supports."""
 
 
+class CommandError(DbprofilerError):
+    """A psql or pg_dump invocation failed. Any stderr here is already redacted."""
+
+
 # ---------------------------------------------------------------------------
 # Safety boundary
 # ---------------------------------------------------------------------------
@@ -110,6 +119,66 @@ SAFETY_FORBIDDEN = (
     "ANALYZE",
     "CREATE STATISTICS",
 )
+
+# Every relation this tool is permitted to read, enumerated one by one. There is
+# deliberately no "pg_catalog.*" wildcard: pg_catalog holds role password hashes
+# (pg_authid, pg_shadow), actual user data (pg_largeobject), and raw statistic
+# values that the pg_stats view would otherwise filter by permission
+# (pg_statistic). A relation earns its place here in the same change as the
+# collector that reads it, together with a test.
+ALLOWED_RELATIONS = frozenset(
+    {
+        "pg_attrdef",
+        "pg_attribute",
+        "pg_class",
+        "pg_constraint",
+        "pg_description",
+        "pg_index",
+        "pg_namespace",
+        "pg_sequence",
+        "pg_stat_statements",
+        "pg_stat_statements_info",
+        "pg_stat_user_indexes",
+        "pg_stat_user_tables",
+        "pg_statio_user_indexes",
+        "pg_stats",
+        "pg_stats_ext",
+        "pg_type",
+    }
+)
+
+# Catalog relations that look plausible but must never be read, each with the
+# reason it is out of bounds. Reported by name so a reviewer sees the "why".
+DENIED_RELATIONS = {
+    "pg_authid": "contains role password hashes",
+    "pg_shadow": "contains role password hashes",
+    "pg_largeobject": "contains user data",
+    "pg_largeobject_metadata": "enumerates user large objects",
+    "pg_statistic": "exposes raw statistic values without the pg_stats permission filter",
+    "pg_subscription": "subconninfo contains a connection password",
+    "pg_user_mapping": "umoptions can contain a password",
+}
+
+# Set-returning functions permitted in a FROM clause. These read their arguments,
+# not the database.
+ALLOWED_FUNCTIONS = frozenset({"unnest", "generate_series", "generate_subscripts"})
+
+# The only schema a relation may be qualified with.
+ALLOWED_SCHEMA = "pg_catalog"
+
+# Matches the relation or set-returning function named by a FROM or JOIN clause.
+# A trailing "(" distinguishes a function call from a relation reference.
+RELATION_REFERENCE = re.compile(
+    r"\b(?:FROM|JOIN)\s+(?:LATERAL\s+|ONLY\s+)*"
+    r"([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*)"
+    r"\s*(\()?",
+    re.IGNORECASE,
+)
+
+# A connection URL carrying userinfo, i.e. one with an "@" before the host. A
+# bare "postgres://..." placeholder in a docstring is fine; a credentialed one
+# checked into the source is not.
+CREDENTIALED_URL = re.compile(r"postgres(?:ql)?://[^\s'\"]*@", re.IGNORECASE)
 
 
 def iter_sql_constants():
@@ -124,8 +193,102 @@ def iter_sql_constants():
             yield name, value
 
 
+def own_source() -> str:
+    """Return this script's own source text, for the static audit below."""
+    return Path(__file__).read_text(encoding="utf-8")
+
+
+def audit_relation_reference(name: str, is_function: bool) -> str:
+    """Return a violation message for one FROM/JOIN target, or "" if allowed."""
+    parts = name.lower().split(".")
+    schema = parts[0] if len(parts) > 1 else ""
+    base = parts[-1]
+
+    if is_function:
+        if schema and schema != ALLOWED_SCHEMA:
+            return f"calls set-returning function {name} outside {ALLOWED_SCHEMA}"
+        if base not in ALLOWED_FUNCTIONS:
+            return f"calls set-returning function {name}, which is not on the allowlist"
+        return ""
+
+    if base in DENIED_RELATIONS:
+        return f"reads {base}, which is explicitly denied: {DENIED_RELATIONS[base]}"
+    if schema and schema != ALLOWED_SCHEMA:
+        return f"reads {name}, which is outside {ALLOWED_SCHEMA}"
+    if base not in ALLOWED_RELATIONS:
+        return f"reads {name}, which is not on the relation allowlist"
+    return ""
+
+
+def audit_sql(sql: str) -> list[str]:
+    """Return every safety violation in one SQL statement."""
+    violations = []
+
+    # Collapse whitespace and close the "COUNT (*)" gap so the token match
+    # cannot be evaded by formatting.
+    normalized = " ".join(sql.split()).upper().replace(" (", "(")
+    for token in SAFETY_FORBIDDEN:
+        if token in normalized:
+            violations.append(f"contains forbidden token {token!r}")
+
+    for match in RELATION_REFERENCE.finditer(sql):
+        problem = audit_relation_reference(match.group(1), bool(match.group(2)))
+        if problem:
+            violations.append(problem)
+
+    return violations
+
+
+def audit_subprocess_usage(source: str) -> list[str]:
+    """Statically audit source text for unsafe child-process usage.
+
+    Parses rather than greps, so a violation cannot hide behind formatting. The
+    rules: exactly one subprocess call site in the whole file, every call passes
+    an explicit env=, none passes shell=, and no string literal anywhere carries
+    a credentialed connection URL.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        return [f"source does not parse: {error.msg}"]
+
+    violations = []
+    call_sites = 0
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if CREDENTIALED_URL.search(node.value):
+                violations.append("a string literal contains a credentialed connection URL")
+            continue
+
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and _is_name(func.value, "subprocess")):
+            continue
+
+        call_sites += 1
+        keywords = {keyword.arg for keyword in node.keywords}
+        if "shell" in keywords:
+            violations.append(f"subprocess.{func.attr} on line {node.lineno} passes shell=")
+        if "env" not in keywords:
+            violations.append(f"subprocess.{func.attr} on line {node.lineno} has no env= argument")
+
+    if call_sites > 1:
+        violations.append(
+            f"{call_sites} subprocess call sites; exactly one call site keeps "
+            "credential handling auditable"
+        )
+
+    return violations
+
+
+def _is_name(node, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
 def check_safety() -> int:
-    """Audit this file's own SQL against the safety boundary.
+    """Audit this file's own SQL and child-process usage against the safety boundary.
 
     Returns a process exit status: 0 when clean, 1 when any violation is found.
     Run in CI against every commit.
@@ -133,15 +296,9 @@ def check_safety() -> int:
     violations = []
 
     for name, sql in iter_sql_constants():
-        # Collapse whitespace and close the "COUNT (*)" gap so the token match
-        # cannot be evaded by formatting.
-        normalized = " ".join(sql.split()).upper().replace(" (", "(")
-        for token in SAFETY_FORBIDDEN:
-            if token in normalized:
-                violations.append(f"{name}: contains forbidden token {token!r}")
+        violations.extend(f"{name}: {problem}" for problem in audit_sql(sql))
 
-    # TODO(task-3): extend with the relation allowlist and a scan for connection
-    # strings passed on a subprocess command line.
+    violations.extend(f"source: {problem}" for problem in audit_subprocess_usage(own_source()))
 
     checked = sum(1 for _ in iter_sql_constants())
     if violations:
@@ -468,7 +625,148 @@ def require_supported_version(version_num: int) -> None:
 # ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
-# (task 3) SafeEnv, redact_error(), run_psql(), run_pg_dump().
+# Credentials reach psql and pg_dump through the environment only. Nothing here
+# ever places one on a command line: argv is visible to every other user on the
+# box, the environment of a running process is not.
+
+# -X ignores ~/.psqlrc, so a customer's local settings cannot change our output
+# format. -w never prompts for a password: without it psql blocks on a terminal
+# read and we would fail by timeout instead of immediately. --csv gives quoting
+# we can parse unambiguously; note that -A would override it, so it is absent
+# deliberately. -t drops the header row. ON_ERROR_STOP turns a SQL error into a
+# nonzero exit rather than a silent empty result.
+PSQL_ARGS = ("-X", "-w", "--csv", "-t", "-v", "ON_ERROR_STOP=1")
+
+# pg_dump has no --csv/-t equivalent; -w is the same no-prompt guarantee.
+PG_DUMP_ARGS = ("-w",)
+
+# Connection strings in any form, and password assignments in libpq or shell
+# syntax. Applied to child-process stderr before it is shown or logged.
+URL_IN_TEXT = re.compile(r"postgres(?:ql)?://[^\s'\"]+", re.IGNORECASE)
+# The value stops at a delimiter rather than at whitespace, so a password quoted
+# or parenthesised in the message does not swallow the punctuation around it. A
+# password that itself contains a delimiter is still caught by the env-value pass
+# below.
+PASSWORD_ASSIGNMENT = re.compile(r"\b(?:pg)?password\s*=\s*[^\s'\"();,]+", re.IGNORECASE)
+
+# Env values worth scrubbing out of an error message. PGPASSWORD always goes,
+# however short. The rest are identifiers, not secrets, but they are still the
+# customer's infrastructure, so they go too when they are long enough to be
+# distinctive. Below that length a blind replace would shred unrelated words in
+# the message and destroy the diagnostic. PGPORT is deliberately absent: a bare
+# port number matches far too much text.
+ALWAYS_REDACTED_ENV = ("PGPASSWORD",)
+REDACTED_IF_DISTINCTIVE_ENV = (
+    "PGUSER",
+    "PGHOST",
+    "PGDATABASE",
+    "PGOPTIONS",
+    "PGAPPNAME",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGSSLROOTCERT",
+)
+MIN_DISTINCTIVE_LENGTH = 4
+
+
+def safe_env(config: PostgresConfig) -> dict[str, str]:
+    """Build the environment for a child process.
+
+    Starts from our own environment so the customer's PGSSLMODE, PGSSLROOTCERT
+    and friends keep working, drops every DBPROFILER_* variable so no child ever
+    sees the raw URL or the token key, then lets the parsed connection settings
+    win. LC_ALL is pinned so error text and number formatting do not depend on
+    the operator's locale.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("DBPROFILER_")}
+    env.update(config.env)
+    env["LC_ALL"] = "C"
+    return env
+
+
+def redact_error(text: str | None, env: dict[str, str] | None = None) -> str:
+    """Scrub connection details out of child-process output."""
+    if not text:
+        return ""
+
+    redacted = URL_IN_TEXT.sub(REDACTED, text)
+    redacted = PASSWORD_ASSIGNMENT.sub(f"password={REDACTED}", redacted)
+
+    env = env or {}
+    secrets = [env[key] for key in ALWAYS_REDACTED_ENV if env.get(key)]
+    secrets += [
+        env[key]
+        for key in REDACTED_IF_DISTINCTIVE_ENV
+        if env.get(key) and len(env[key]) >= MIN_DISTINCTIVE_LENGTH
+    ]
+    # Longest first, so a value that contains another is not partly rewritten.
+    for secret in sorted(secrets, key=len, reverse=True):
+        redacted = redacted.replace(secret, REDACTED)
+
+    return redacted.strip()
+
+
+def run_command(argv: list[str], config: PostgresConfig, what: str) -> str:
+    """Run one child process and return its stdout.
+
+    The single subprocess call site in this file; audit_subprocess_usage()
+    enforces that. Every failure path raises CommandError with redacted text.
+    """
+    env = safe_env(config)
+    try:
+        completed = subprocess.run(
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=config.timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise CommandError(f"{what} not found on PATH: {argv[0]}") from None
+    except subprocess.TimeoutExpired:
+        raise CommandError(f"{what} timed out after {config.timeout}s") from None
+
+    if completed.returncode != 0:
+        detail = redact_error(completed.stderr, env)
+        raise CommandError(f"{what} exited with status {completed.returncode}: {detail}")
+
+    return completed.stdout
+
+
+def run_psql(sql: str, config: PostgresConfig) -> list[list[str]]:
+    """Run one SQL statement and return its rows, header excluded."""
+    argv = [config.psql_path, *PSQL_ARGS, "-c", sql]
+    output = run_command(argv, config, "psql")
+    return list(csv.reader(io.StringIO(output)))
+
+
+def run_psql_scalar(sql: str, config: PostgresConfig) -> str:
+    """Run a statement expected to yield exactly one row of one column."""
+    rows = run_psql(sql, config)
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise CommandError(
+            f"expected a single value from psql, got {len(rows)} row(s) of an unexpected shape"
+        )
+    return rows[0][0].strip()
+
+
+def run_pg_dump(extra_args, config: PostgresConfig) -> str:
+    """Run pg_dump with the given arguments and return its stdout."""
+    argv = [config.pg_dump_path, *PG_DUMP_ARGS, *extra_args]
+    return run_command(argv, config, "pg_dump")
+
+
+def probe_server_version(config: PostgresConfig) -> int:
+    """Read server_version_num from the source and enforce the supported major."""
+    raw = run_psql_scalar(SQL_SERVER_VERSION, config)
+    try:
+        version_num = int(raw)
+    except ValueError:
+        raise CommandError("the source server did not report a usable server_version_num") from None
+    require_supported_version(version_num)
+    return version_num
 
 
 # ---------------------------------------------------------------------------

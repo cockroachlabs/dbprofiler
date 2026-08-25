@@ -8,5 +8,7 @@ select = ["E", "F", "W", "I", "UP", "B", "S"]
 ignore = ["S404", "S603"]
 
 [lint.per-file-ignores]
-"test_dbprofiler.py" = ["S101", "S105", "S106"]
-"integration_test.py" = ["S101", "S105", "S106"]
+# S608: the safety tests plant deliberately unsafe SQL to prove --check-safety
+# rejects it. The "injection" is the point.
+"test_dbprofiler.py" = ["S101", "S105", "S106", "S608"]
+"integration_test.py" = ["S101", "S105", "S106", "S608"]
