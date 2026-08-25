@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import hashlib
 import io
 import os
 import re
@@ -102,6 +103,10 @@ class ConfigError(DbprofilerError):
 
 class UnsupportedServerVersion(DbprofilerError):
     """The source server is not a PostgreSQL major this release supports."""
+
+
+class UnsupportedClientVersion(DbprofilerError):
+    """The local psql or pg_dump is too old for the source server."""
 
 
 class CommandError(DbprofilerError):
@@ -318,6 +323,17 @@ def check_safety() -> int:
 # A query built inline is a query the audit cannot see.
 
 SQL_SERVER_VERSION = "SELECT current_setting('server_version_num')::int"
+
+# One row per user relation, for the catalog fingerprint. Reads names and kinds
+# only -- no column contents, no statistics, nothing from inside a table. The
+# left() test excludes pg_catalog, pg_toast, pg_temp_N and pg_toast_temp_N in one
+# comparison, and avoids the backslash escaping a LIKE pattern would need.
+SQL_SCHEMA_FINGERPRINT = """
+SELECT n.nspname, c.relname, c.relkind
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +586,33 @@ def _dedupe(values) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values or ()))
 
 
+# PostgreSQL reserves the pg_ prefix for system schemas, which covers pg_catalog,
+# pg_toast, and the per-session pg_temp_N and pg_toast_temp_N.
+RESERVED_SCHEMA_PREFIX = "pg_"
+RESERVED_SCHEMAS = ("information_schema",)
+
+
+def require_user_schema(name: str) -> None:
+    """Reject a system schema given to --schema-include.
+
+    Dumping one is never what the operator meant, and a pg_temp_N schema would
+    make the bundle depend on a live session.
+    """
+    lowered = name.lower()
+    if lowered.startswith(RESERVED_SCHEMA_PREFIX) or lowered in RESERVED_SCHEMAS:
+        raise ConfigError(
+            f"--schema-include {name}: system schemas cannot be profiled; PostgreSQL "
+            f"reserves the {RESERVED_SCHEMA_PREFIX} prefix and information_schema"
+        )
+
+
+def schema_is_selected(name: str, config: PostgresConfig) -> bool:
+    """Report whether a schema is in scope for this run."""
+    if config.schema_include:
+        return name in config.schema_include
+    return name not in config.schema_exclude
+
+
 def build_postgres_config(
     args: argparse.Namespace, env: dict[str, str] | None = None
 ) -> PostgresConfig:
@@ -586,6 +629,8 @@ def build_postgres_config(
 
     schema_include = _dedupe(args.schema_include)
     schema_exclude = _dedupe(args.schema_exclude)
+    for name in schema_include:
+        require_user_schema(name)
     if schema_include and schema_exclude:
         raise ConfigError("--schema-include and --schema-exclude cannot be combined")
 
@@ -769,10 +814,93 @@ def probe_server_version(config: PostgresConfig) -> int:
     return version_num
 
 
+# The first run of digits in "pg_dump (PostgreSQL) 16.2" and its packaged
+# variants. Only the major matters here.
+PG_DUMP_VERSION = re.compile(r"(\d+)")
+
+
+def probe_pg_dump_major(config: PostgresConfig) -> int:
+    """Read the local pg_dump major version. Makes no connection."""
+    output = run_command([config.pg_dump_path, *PG_DUMP_ARGS, "--version"], config, "pg_dump")
+    match = PG_DUMP_VERSION.search(output)
+    if not match:
+        raise CommandError("pg_dump did not report a usable version")
+    return int(match.group(1))
+
+
+def require_compatible_pg_dump(pg_dump_major: int, server_version_num: int) -> None:
+    """Raise unless the local pg_dump is at least as new as the source server.
+
+    An older pg_dump does not refuse a newer server outright in every case; it
+    can emit a dump that is quietly wrong. Checking first is cheaper than
+    discovering that during a migration.
+    """
+    server_major = server_version_num // 10000
+    if pg_dump_major < server_major:
+        raise UnsupportedClientVersion(
+            f"local pg_dump is version {pg_dump_major} but the source server is "
+            f"PostgreSQL {server_major}; use a pg_dump of {server_major} or newer"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Collectors
 # ---------------------------------------------------------------------------
-# (tasks 4-6) collect_schema(), collect_catalog(), collect_workload(), fingerprint().
+# (tasks 5-6) collect_catalog(), collect_workload().
+
+# --no-owner and --no-privileges drop role names and grants: they are the
+# customer's access control, not schema shape a migration needs.
+PG_DUMP_SCHEMA_ARGS = ("--schema-only", "--no-owner", "--no-privileges")
+
+# Field and record separators for the fingerprint's canonical form. ASCII unit
+# and record separators cannot occur in a PostgreSQL identifier, so no relation
+# name can forge a boundary and collide with a different set of relations.
+FIELD_SEPARATOR = "\x1f"
+RECORD_SEPARATOR = "\x1e"
+
+
+def build_pg_dump_args(config: PostgresConfig) -> list[str]:
+    """Build the pg_dump arguments for this run. Never includes a credential."""
+    args = list(PG_DUMP_SCHEMA_ARGS)
+    for name in config.schema_include:
+        args += ["-n", name]
+    for name in config.schema_exclude:
+        args += ["-N", name]
+    return args
+
+
+def schema_fingerprint(config: PostgresConfig) -> str:
+    """Fingerprint the catalog objects in scope, for drift detection.
+
+    Each psql invocation is its own transaction, so the collection as a whole is
+    not isolated. Comparing this fingerprint before and after collection turns
+    concurrent DDL into a detected, fatal condition rather than a bundle that
+    silently mixes two versions of a schema.
+
+    Scope filtering happens here rather than in SQL: the query stays a fixed
+    module constant that --check-safety can audit, and a schema the operator
+    excluded cannot abort the run by changing underneath it.
+    """
+    rows = [
+        tuple(row)
+        for row in run_psql(SQL_SCHEMA_FINGERPRINT, config)
+        if len(row) == 3 and schema_is_selected(row[0], config)
+    ]
+    canonical = "".join(FIELD_SEPARATOR.join(row) + RECORD_SEPARATOR for row in sorted(rows))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def collect_schema(config: PostgresConfig, server_version_num: int) -> tuple[str, str]:
+    """Return (schema DDL, catalog fingerprint taken before the dump).
+
+    The client check runs first so a too-old pg_dump fails before it produces
+    anything. The fingerprint is taken before the dump so that the
+    after-collection recheck also covers drift during the dump itself.
+    """
+    require_compatible_pg_dump(probe_pg_dump_major(config), server_version_num)
+    digest = schema_fingerprint(config)
+    schema_sql = run_pg_dump(build_pg_dump_args(config), config)
+    return schema_sql, digest
 
 
 # ---------------------------------------------------------------------------

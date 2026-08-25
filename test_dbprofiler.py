@@ -666,6 +666,245 @@ class TestProbeServerVersion(unittest.TestCase):
                 dbprofiler.probe_server_version(a_config())
 
 
+class TestPgDumpVersion(unittest.TestCase):
+    def test_version_is_probed_without_connecting(self):
+        with mock.patch(
+            "subprocess.run", return_value=completed(stdout="pg_dump (PostgreSQL) 16.2\n")
+        ) as run:
+            self.assertEqual(dbprofiler.probe_pg_dump_major(a_config()), 16)
+        self.assertEqual(run.call_args.args[0], ["pg_dump", "-w", "--version"])
+
+    def test_version_parsing_tolerates_packager_suffixes(self):
+        for text, expected in (
+            ("pg_dump (PostgreSQL) 16.2\n", 16),
+            ("pg_dump (PostgreSQL) 16.2 (Ubuntu 16.2-1.pgdg22.04+1)\n", 16),
+            ("pg_dump (PostgreSQL) 17.0\n", 17),
+            ("pg_dump (PostgreSQL) 16beta1\n", 16),
+        ):
+            with self.subTest(text=text):
+                with mock.patch("subprocess.run", return_value=completed(stdout=text)):
+                    self.assertEqual(dbprofiler.probe_pg_dump_major(a_config()), expected)
+
+    def test_unparseable_version_is_an_error(self):
+        with mock.patch("subprocess.run", return_value=completed(stdout="not a version\n")):
+            with self.assertRaises(dbprofiler.CommandError):
+                dbprofiler.probe_pg_dump_major(a_config())
+
+    def test_a_pg_dump_older_than_the_server_is_rejected(self):
+        """An older pg_dump cannot represent newer server syntax, and says so only
+        by emitting a subtly wrong dump."""
+        with self.assertRaises(dbprofiler.UnsupportedClientVersion):
+            dbprofiler.require_compatible_pg_dump(15, 160002)
+
+    def test_a_matching_or_newer_pg_dump_is_accepted(self):
+        for major in (16, 17):
+            with self.subTest(major=major):
+                dbprofiler.require_compatible_pg_dump(major, 160002)
+
+    def test_the_rejection_names_both_versions(self):
+        with self.assertRaises(dbprofiler.UnsupportedClientVersion) as raised:
+            dbprofiler.require_compatible_pg_dump(15, 160002)
+        message = str(raised.exception)
+        self.assertIn("15", message)
+        self.assertIn("16", message)
+
+
+class TestPgDumpArgs(unittest.TestCase):
+    def test_the_required_flags_are_present(self):
+        args = dbprofiler.build_pg_dump_args(a_config())
+        for flag in ("--schema-only", "--no-owner", "--no-privileges"):
+            self.assertIn(flag, args)
+
+    def test_schema_include_becomes_dash_n(self):
+        args = dbprofiler.build_pg_dump_args(a_config(schema_include=["public", "sales"]))
+        self.assertEqual(args.count("-n"), 2)
+        self.assertIn("public", args)
+        self.assertIn("sales", args)
+
+    def test_schema_exclude_becomes_dash_capital_n(self):
+        args = dbprofiler.build_pg_dump_args(a_config(schema_exclude=["archive"]))
+        self.assertIn("-N", args)
+        self.assertIn("archive", args)
+        self.assertNotIn("-n", args)
+
+    def test_no_credential_reaches_the_command_line(self):
+        config = a_config(schema_include=["public"])
+        argv = [
+            config.pg_dump_path,
+            *dbprofiler.PG_DUMP_ARGS,
+            *dbprofiler.build_pg_dump_args(config),
+        ]
+        joined = " ".join(argv)
+        for secret in (URL, HOST, USER, PASSWORD, DATABASE):
+            self.assertNotIn(secret, joined)
+
+    def test_the_pg_dump_path_override_is_honoured(self):
+        config = a_config(pg_dump_path="/opt/pg16/bin/pg_dump")
+        with mock.patch("subprocess.run", return_value=completed(stdout="-- dump\n")) as run:
+            dbprofiler.run_pg_dump(dbprofiler.build_pg_dump_args(config), config)
+        self.assertEqual(run.call_args.args[0][0], "/opt/pg16/bin/pg_dump")
+
+
+class TestSchemaFilterValidation(unittest.TestCase):
+    def test_system_schemas_are_rejected_in_schema_include(self):
+        # Dumping a system schema is never what the operator meant, and
+        # pg_temp_* would make the bundle depend on a live session.
+        for name in ("pg_catalog", "information_schema", "pg_toast", "pg_temp_1"):
+            with self.subTest(name=name), self.assertRaises(dbprofiler.ConfigError):
+                dbprofiler.build_postgres_config(
+                    postgres_args(schema_include=[name]), {"DBPROFILER_POSTGRES_URL": URL}
+                )
+
+    def test_the_rejection_names_the_offending_schema(self):
+        with self.assertRaises(dbprofiler.ConfigError) as raised:
+            dbprofiler.build_postgres_config(
+                postgres_args(schema_include=["pg_catalog"]), {"DBPROFILER_POSTGRES_URL": URL}
+            )
+        self.assertIn("pg_catalog", str(raised.exception))
+
+    def test_a_user_schema_named_like_a_system_one_is_still_rejected(self):
+        # PostgreSQL reserves the pg_ prefix, so this cannot be a real user schema.
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.build_postgres_config(
+                postgres_args(schema_include=["pg_myschema"]), {"DBPROFILER_POSTGRES_URL": URL}
+            )
+
+    def test_ordinary_schemas_are_accepted(self):
+        config = dbprofiler.build_postgres_config(
+            postgres_args(schema_include=["public", "sales"]),
+            {"DBPROFILER_POSTGRES_URL": URL},
+        )
+        self.assertEqual(config.schema_include, ("public", "sales"))
+
+
+class TestSchemaFingerprint(unittest.TestCase):
+    ROWS = "public,users,r\npublic,orders,r\nsales,invoices,v\n"
+
+    def fingerprint(self, rows):
+        with mock.patch("subprocess.run", return_value=completed(stdout=rows)):
+            return dbprofiler.schema_fingerprint(a_config())
+
+    def test_the_fingerprint_query_is_a_declared_constant(self):
+        with mock.patch("subprocess.run", return_value=completed(stdout=self.ROWS)) as run:
+            dbprofiler.schema_fingerprint(a_config())
+        self.assertIn(dbprofiler.SQL_SCHEMA_FINGERPRINT, run.call_args.args[0])
+
+    def test_the_fingerprint_is_hex_sha256(self):
+        digest = self.fingerprint(self.ROWS)
+        self.assertEqual(len(digest), 64)
+        int(digest, 16)  # raises if it is not hex
+
+    def test_the_fingerprint_is_deterministic(self):
+        self.assertEqual(self.fingerprint(self.ROWS), self.fingerprint(self.ROWS))
+
+    def test_row_order_does_not_change_the_fingerprint(self):
+        """psql makes no ordering promise, so drift detection must not depend on it."""
+        shuffled = "sales,invoices,v\npublic,users,r\npublic,orders,r\n"
+        self.assertEqual(self.fingerprint(self.ROWS), self.fingerprint(shuffled))
+
+    def test_a_changed_relkind_changes_the_fingerprint(self):
+        changed = "public,users,r\npublic,orders,v\nsales,invoices,v\n"
+        self.assertNotEqual(self.fingerprint(self.ROWS), self.fingerprint(changed))
+
+    def test_a_dropped_relation_changes_the_fingerprint(self):
+        dropped = "public,users,r\nsales,invoices,v\n"
+        self.assertNotEqual(self.fingerprint(self.ROWS), self.fingerprint(dropped))
+
+    def test_a_field_boundary_cannot_be_forged(self):
+        """Concatenating fields without a delimiter would make these two collide."""
+        a = "public,ab,r\n"
+        b = "publica,b,r\n"
+        self.assertNotEqual(self.fingerprint(a), self.fingerprint(b))
+
+    def test_an_empty_schema_still_fingerprints(self):
+        self.assertEqual(len(self.fingerprint("")), 64)
+
+    def test_the_fingerprint_query_passes_the_safety_audit(self):
+        self.assertEqual(dbprofiler.audit_sql(dbprofiler.SQL_SCHEMA_FINGERPRINT), [])
+
+    def test_out_of_scope_schemas_do_not_affect_the_fingerprint(self):
+        """A schema the operator excluded must not be able to abort the run by
+        changing underneath it."""
+        with mock.patch("subprocess.run", return_value=completed(stdout=self.ROWS)):
+            included = dbprofiler.schema_fingerprint(a_config(schema_include=["public"]))
+        churned = self.ROWS.replace("sales,invoices,v", "sales,invoices,r")
+        with mock.patch("subprocess.run", return_value=completed(stdout=churned)):
+            after = dbprofiler.schema_fingerprint(a_config(schema_include=["public"]))
+        self.assertEqual(included, after)
+
+    def test_an_excluded_schema_is_dropped_from_the_fingerprint(self):
+        with mock.patch("subprocess.run", return_value=completed(stdout=self.ROWS)):
+            excluded = dbprofiler.schema_fingerprint(a_config(schema_exclude=["sales"]))
+        self.assertNotEqual(excluded, self.fingerprint(self.ROWS))
+
+    def test_in_scope_change_is_still_detected_under_a_filter(self):
+        with mock.patch("subprocess.run", return_value=completed(stdout=self.ROWS)):
+            before = dbprofiler.schema_fingerprint(a_config(schema_include=["public"]))
+        churned = self.ROWS.replace("public,orders,r", "public,orders,v")
+        with mock.patch("subprocess.run", return_value=completed(stdout=churned)):
+            after = dbprofiler.schema_fingerprint(a_config(schema_include=["public"]))
+        self.assertNotEqual(before, after)
+
+
+class TestCollectSchema(unittest.TestCase):
+    VERSION = "pg_dump (PostgreSQL) 16.2\n"
+    ROWS = "public,users,r\n"
+    DUMP = "--\n-- PostgreSQL database dump\n--\nCREATE TABLE public.users (id bigint);\n"
+
+    def calls(self, **overrides):
+        return [
+            completed(stdout=overrides.get("version", self.VERSION)),
+            completed(stdout=overrides.get("rows", self.ROWS)),
+            completed(stdout=overrides.get("dump", self.DUMP)),
+        ]
+
+    def test_returns_the_ddl_and_a_fingerprint(self):
+        with mock.patch("subprocess.run", side_effect=self.calls()):
+            schema_sql, digest = dbprofiler.collect_schema(a_config(), 160002)
+        self.assertIn("CREATE TABLE", schema_sql)
+        self.assertEqual(len(digest), 64)
+
+    def test_the_client_is_checked_before_anything_is_dumped(self):
+        """A too-old pg_dump must fail before it writes a subtly wrong dump."""
+        calls = self.calls(version="pg_dump (PostgreSQL) 15.6\n")
+        with mock.patch("subprocess.run", side_effect=calls) as run:
+            with self.assertRaises(dbprofiler.UnsupportedClientVersion):
+                dbprofiler.collect_schema(a_config(), 160002)
+        self.assertEqual(run.call_count, 1)
+
+    def test_the_fingerprint_is_taken_before_the_dump(self):
+        # The after-collection recheck then covers drift during the dump itself.
+        with mock.patch("subprocess.run", side_effect=self.calls()) as run:
+            dbprofiler.collect_schema(a_config(), 160002)
+        argvs = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(argvs[0], ["pg_dump", "-w", "--version"])
+        self.assertIn(dbprofiler.SQL_SCHEMA_FINGERPRINT, argvs[1])
+        self.assertIn("--schema-only", argvs[2])
+
+    def test_the_dump_is_returned_as_a_string_not_written_to_disk(self):
+        with mock.patch("subprocess.run", side_effect=self.calls()):
+            schema_sql, _ = dbprofiler.collect_schema(a_config(), 160002)
+        self.assertIsInstance(schema_sql, str)
+
+    def test_a_failing_dump_raises_with_redacted_stderr(self):
+        calls = [
+            completed(stdout=self.VERSION),
+            completed(stdout=self.ROWS),
+            completed(returncode=1, stderr=f'pg_dump: error: connection to "{HOST}" failed'),
+        ]
+        with mock.patch("subprocess.run", side_effect=calls):
+            with self.assertRaises(dbprofiler.CommandError) as raised:
+                dbprofiler.collect_schema(a_config(), 160002)
+        self.assertNotIn(HOST, str(raised.exception))
+
+    def test_schema_filters_reach_the_dump_command(self):
+        with mock.patch("subprocess.run", side_effect=self.calls()) as run:
+            dbprofiler.collect_schema(a_config(schema_include=["sales"]), 160002)
+        dump_argv = run.call_args_list[2].args[0]
+        self.assertIn("-n", dump_argv)
+        self.assertIn("sales", dump_argv)
+
+
 class TestCLI(unittest.TestCase):
     def test_no_subcommand_prints_help_and_returns_two(self):
         stderr = io.StringIO()
