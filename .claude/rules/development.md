@@ -25,8 +25,16 @@ that property true.
 - Every SQL statement must be a module-level constant named `SQL_*`. This is not style:
   `--check-safety` enumerates them by reflection, and a query built inline is a query the
   audit cannot see.
-- Never issue `COUNT(*)`, `ANALYZE`, or `CREATE STATISTICS` against customer data.
-  `ANALYZE` is permitted only against disposable fixtures created by the integration test.
+- Never issue `COUNT(*)`, `ANALYZE`, or `CREATE STATISTICS` against customer data. None of
+  the three may appear in `dbprofiler.py` at all; `--check-safety` enforces that.
+- `ANALYZE`, `CREATE STATISTICS`, and the DDL and DML around them are permitted in
+  `integration_test.py`, and only there, against the uniquely named disposable schema that
+  test creates and drops. That is not a loophole in the boundary: the tool reads statistics
+  rather than computing them, so something has to compute them before there is anything to
+  read. `COUNT(*)` is likewise permitted there, but only to prove a fixture really holds
+  what the test planted in it. Assert the profiler's own numbers against sizes the seed
+  makes predictable, never against a count queried at assertion time: a count would agree
+  with a broken estimator that happened to be wrong in the same direction.
 - Query only allowlisted catalog and statistics relations.
 - Run `python3 dbprofiler.py --check-safety` before every commit. CI runs it too.
 - When you add a collector, add its relations to the `--check-safety` allowlist in the

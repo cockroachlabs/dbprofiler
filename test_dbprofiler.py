@@ -12,9 +12,11 @@ so that a reviewer grepping for a credential leak can tell test data apart from
 the real thing.
 """
 
+import ast
 import contextlib
 import csv
 import dataclasses
+import fnmatch
 import hashlib
 import io
 import json
@@ -3077,6 +3079,120 @@ class TestComposeSecrecy(unittest.TestCase):
     def test_the_testing_doc_holds_no_credentialed_url(self):
         for line in TESTING_DOC.read_text().splitlines():
             self.assertNotRegex(line, r"://[^/\s]*:[^/\s]*@")
+
+
+# --- the integration suite's blast radius -----------------------------------
+#
+# integration_test.py is the one file in this repository allowed to issue DDL,
+# DML, ANALYZE and CREATE STATISTICS. It runs against whatever server the
+# operator pointed it at, which will not always be the disposable container.
+# Reviewing that boundary by eye every time it changes is not a control; these
+# are. They read the file rather than run it, so they need no server.
+
+INTEGRATION_TEST = REPO / "integration_test.py"
+
+# Anything that changes the server. PERFORM and SELECT are deliberately absent:
+# a read needs no schema qualification to be harmless.
+MUTATING_SQL = re.compile(
+    r"\b(CREATE|DROP|ALTER|INSERT|UPDATE|DELETE|TRUNCATE|ANALYZE|VACUUM|REINDEX"
+    r"|GRANT|REVOKE|COPY|SET|RESET)\b"
+)
+
+
+def sql_of(call):
+    """Reconstruct the SQL text of an execute(...) call, or None.
+
+    Unannotated, like the other helpers here: this file has no
+    `from __future__ import annotations`, so on 3.9 a `str | None` in a
+    signature is evaluated at import and raises.
+
+    Interpolations become the placeholder the source wrote -- `{SCHEMA}` stays
+    `{SCHEMA}` -- so a statement can be checked for the schema qualification
+    without evaluating anything.
+    """
+    if not (isinstance(call.func, ast.Name) and call.func.id == "execute"):
+        return None
+    if not call.args:
+        return None
+    parts = []
+    for node in ast.walk(call.args[0]):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parts.append(node.value)
+        elif isinstance(node, ast.FormattedValue):
+            inner = node.value
+            parts.append("{" + (inner.id if isinstance(inner, ast.Name) else "...") + "}")
+    return "".join(parts)
+
+
+class TestIntegrationSuiteScope(unittest.TestCase):
+    def setUp(self):
+        self.text = INTEGRATION_TEST.read_text()
+        self.tree = ast.parse(self.text, filename=str(INTEGRATION_TEST))
+
+    def statements(self):
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call):
+                sql = sql_of(node)
+                if sql:
+                    yield sql
+
+    def test_the_offline_suite_does_not_discover_it(self):
+        """`python3 -m unittest` must open no sockets. Discovery's default
+        pattern is test*.py, and this file is named so it does not match --
+        which is load-bearing, not cosmetic."""
+        self.assertFalse(fnmatch.fnmatch(INTEGRATION_TEST.name, "test*.py"))
+
+    def test_every_mutating_statement_names_the_disposable_schema(self):
+        checked = 0
+        for sql in self.statements():
+            if not MUTATING_SQL.search(sql):
+                continue
+            checked += 1
+            with self.subTest(sql=" ".join(sql.split())[:70]):
+                self.assertIn("{SCHEMA}", sql)
+        self.assertGreater(checked, 0, "expected the fixture DDL to be found")
+
+    def test_the_schema_name_is_unique_per_run(self):
+        """Two people testing against one server, or one person whose previous
+        run died before its teardown, must not collide."""
+        self.assertRegex(self.text, r"SCHEMA\s*=\s*f\"dbprofiler_it_.*uuid")
+
+    def test_the_schema_is_dropped_on_every_exit(self):
+        """Including the failure path. A fixture schema left on a shared server
+        is the worst thing this suite can do."""
+        callers = set()
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "drop_fixtures"
+                ):
+                    callers.add(node.name)
+        self.assertIn("tearDownModule", callers)
+        self.assertIn("setUpModule", callers)
+
+    def test_it_holds_no_credentialed_url(self):
+        for line in self.text.splitlines():
+            self.assertNotRegex(line, r"://[^/\s]*:[^/\s]*@")
+
+    def test_it_invents_no_new_token_key(self):
+        """Only the synthetic keys the rules fix, so a reviewer grepping for a
+        leaked key can tell test data from the real thing."""
+        found = set(re.findall(r"\"(example-token-key-[0-9]+)\"", self.text))
+        self.assertEqual(found, {"example-token-key-0123456789", "example-token-key-9876543210"})
+        self.assertEqual(re.findall(r"\btoken_key\s*=\s*\"", self.text), [])
+
+    def test_it_reads_the_connection_string_only_from_the_environment(self):
+        self.assertNotIn("--url", self.text)
+        self.assertIn("os.environ[TEST_URL_ENV_VAR]", self.text)
+
+    def test_it_never_prints_a_configured_value(self):
+        """The skip reason names the variables; it must not carry their values."""
+        self.assertNotRegex(self.text, r"WHY_SKIPPED\s*=.*os\.getenv")
+        self.assertNotRegex(self.text, r"print\(")
 
 
 if __name__ == "__main__":

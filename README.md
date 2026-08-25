@@ -6,8 +6,8 @@ Data and workload profiling for migrating workloads to CockroachDB, starting wit
 data-shape profile, and writes a checksummed ZIP bundle you can share with a migration
 team — **without reading your data**.
 
-> **Status: pre-release.** The `postgres` subcommand collects and publishes a bundle;
-> it has not yet been exercised against a live server by the integration suite. See
+> **Status: pre-release.** The `postgres` subcommand collects and publishes a bundle,
+> and the integration suite exercises it end to end against a live PostgreSQL 16. See
 > `docs/superpowers/plans/` for the implementation plan.
 
 ## Safety boundary
@@ -114,6 +114,24 @@ The bundle is published atomically. It is built in a temporary file beside the
 destination, flushed to disk, and moved into place with a rename, so an interrupted run
 leaves either the previous bundle or nothing — never a truncated archive.
 
+## What this release does not do
+
+Deliberately out of scope for now, so that what is here can be reviewed as a whole:
+
+- **PostgreSQL 16 only.** Other majors are refused rather than approximated; the catalog
+  and statistics shapes this reads are version-specific.
+- **No other source types.** MySQL and Oracle would each be their own subcommand.
+- **Tier 1 workload telemetry only** — table, index, and statement counters. Per-block
+  I/O, replication, bgwriter and WAL, and function statistics are not collected.
+- **No configurable privacy policy.** Tokenization is always on and is not tunable;
+  there is no mode that emits raw values.
+- **No `--schema-file` or `--exclude-code`.** Scope is set with `--schema-include` and
+  `--schema-exclude` only.
+- **Coarse unsupported-type reporting.** A column is marked supported or not; the bundle
+  does not classify *how* an unsupported type should be migrated.
+- **No partial-collector recovery.** A statistics source that cannot be read is omitted
+  with a warning; there is no retry and no fallback query.
+
 ## Development
 
 ```bash
@@ -123,7 +141,15 @@ ruff check                        # optional
 ```
 
 Integration tests run against a local PostgreSQL 16 in Docker and are skipped unless
-configured. See `docs/TESTING.md`.
+configured — a plain `python3 -m unittest` opens no sockets. They build a uniquely named
+disposable schema, run the shipped script against it as a subprocess, check the bundle,
+and drop the schema again:
+
+```bash
+python3 -m unittest integration_test -v
+```
+
+See `docs/TESTING.md` for the server and the configuration it needs.
 
 ## License
 
