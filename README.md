@@ -94,6 +94,16 @@ source-profile.zip
     └── pg_stat_statements.csv   # omitted with a warning if the extension is absent
 ```
 
+`manifest.json` records a SHA-256 of every other entry's uncompressed bytes, so a
+recipient can verify the bundle without trusting the transport. It is written last,
+after the payloads it hashes, and it lists a warning for every section that was omitted
+— an unreadable statistics view or a missing extension degrades the bundle rather than
+failing the run.
+
+The bundle is published atomically. It is built in a temporary file beside the
+destination, flushed to disk, and moved into place with a rename, so an interrupted run
+leaves either the previous bundle or nothing — never a truncated archive.
+
 ## Development
 
 ```bash

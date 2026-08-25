@@ -13,12 +13,17 @@ the real thing.
 """
 
 import contextlib
+import csv
 import dataclasses
+import hashlib
 import io
+import json
 import os
 import subprocess
+import tempfile
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -1977,6 +1982,555 @@ class TestProfileAssembly(unittest.TestCase):
 
     def test_the_build_is_deterministic(self):
         self.assertEqual(repr(self.build()), repr(self.build()))
+
+
+# ---------------------------------------------------------------------------
+# Bundle publication
+# ---------------------------------------------------------------------------
+
+# A value that exists nowhere else in the repository. Planted into a raw
+# observation before serialization so the "no raw literal reaches disk"
+# assertions have something they would actually catch if the sanitizer broke.
+PLANTED = "planted-literal-4f2c9ae7"
+
+SCHEMA_SQL = "CREATE TABLE public.users (id bigint PRIMARY KEY);\n"
+
+FINGERPRINT = "0" * 64
+
+
+def a_source():
+    return dbprofiler.Source("postgres", 160002, "16.2", DATABASE, ("public", "sales"))
+
+
+def a_workload(**overrides):
+    """The golden workload, collected once and reused across bundle tests."""
+    with mock.patch("subprocess.run", side_effect=workload_calls(**overrides)):
+        return dbprofiler.collect_workload(a_config())
+
+
+def zip_bytes(path):
+    """Everything a reader could recover from a bundle.
+
+    Both the file as stored and every member decompressed. Searching only the
+    stored bytes would be a hollow assertion: DEFLATE would hide the very
+    literal the test is looking for.
+    """
+    raw = Path(path).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        members = b"".join(archive.read(name) for name in archive.namelist())
+    return raw + members
+
+
+def read_csv(entry):
+    return list(csv.reader(io.StringIO(entry.data.decode("utf-8"))))
+
+
+class BundleCase(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+        self.catalog = a_catalog()
+        self.workload = a_workload()
+        self.profile = dbprofiler.build_profile(
+            a_source(), self.catalog, self.workload, self.tokenizer
+        )
+        self.payloads = self.build_payloads()
+        self.by_path = {entry.path: entry for entry in self.payloads}
+        self.manifest = dbprofiler.build_manifest(
+            source=a_source(),
+            schema_fingerprint=FINGERPRINT,
+            payloads=self.payloads,
+            warnings=self.workload.warnings,
+            stats_reset=self.workload.stats_reset,
+        )
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.destination = Path(self.directory.name) / "source-profile.zip"
+
+    def build_payloads(self, **overrides):
+        return dbprofiler.build_payloads(
+            profile=overrides.get("profile", self.profile),
+            catalog=overrides.get("catalog", self.catalog),
+            workload=overrides.get("workload", self.workload),
+            tokenizer=overrides.get("tokenizer", self.tokenizer),
+            schema_sql=overrides.get("schema_sql", SCHEMA_SQL),
+        )
+
+    def publish(self, payloads=None, manifest=None, destination=None):
+        return dbprofiler.write_bundle(
+            destination or self.destination,
+            self.payloads if payloads is None else payloads,
+            manifest or self.manifest,
+        )
+
+    def leftovers(self):
+        return sorted(p.name for p in Path(self.directory.name).iterdir())
+
+
+class TestSafeEntryPaths(unittest.TestCase):
+    def test_the_documented_bundle_paths_are_accepted(self):
+        for path in dbprofiler.BUNDLE_PAYLOAD_PATHS + (dbprofiler.BUNDLE_MANIFEST,):
+            with self.subTest(path=path):
+                dbprofiler.require_safe_entry_path(path)
+
+    def test_absolute_paths_are_rejected(self):
+        for path in ("/etc/passwd", "//tmp/x.csv", "/observations/pg_class.csv"):
+            with self.subTest(path=path), self.assertRaises(dbprofiler.BundleError):
+                dbprofiler.require_safe_entry_path(path)
+
+    def test_parent_traversal_is_rejected(self):
+        for path in ("../escape.csv", "observations/../../escape.csv", ".."):
+            with self.subTest(path=path), self.assertRaises(dbprofiler.BundleError):
+                dbprofiler.require_safe_entry_path(path)
+
+    def test_windows_separators_and_drive_letters_are_rejected(self):
+        for path in ("observations\\pg_class.csv", "C:/observations/pg_class.csv"):
+            with self.subTest(path=path), self.assertRaises(dbprofiler.BundleError):
+                dbprofiler.require_safe_entry_path(path)
+
+    def test_empty_and_dot_segments_are_rejected(self):
+        for path in ("", "observations//pg_class.csv", "./profile.json", "observations/"):
+            with self.subTest(path=path), self.assertRaises(dbprofiler.BundleError):
+                dbprofiler.require_safe_entry_path(path)
+
+    def test_control_characters_and_newlines_are_rejected(self):
+        for path in ("profile\n.json", "profile\x00.json", "obs ervations/x.csv"):
+            with self.subTest(path=path), self.assertRaises(dbprofiler.BundleError):
+                dbprofiler.require_safe_entry_path(path)
+
+
+class TestJsonSerialization(unittest.TestCase):
+    def test_contract_records_serialize_to_plain_json(self):
+        source = a_source()
+        payload = json.loads(dbprofiler.json_bytes(source))
+        self.assertEqual(payload["kind"], "postgres")
+        self.assertEqual(payload["collected_schemas"], ["public", "sales"])
+
+    def test_a_collector_record_refuses_to_serialize(self):
+        """The records holding raw values are dataclasses too. Serializing by
+        structure rather than by name would put them straight onto disk."""
+        raw = dbprofiler.ColumnStatistics(
+            schema="public",
+            table="users",
+            column="email",
+            null_frac=0.0,
+            avg_width=32,
+            n_distinct=-1.0,
+            most_common_vals=(PLANTED,),
+            most_common_freqs=(1.0,),
+            histogram_bounds=(),
+        )
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.json_bytes(raw)
+
+    def test_a_mapping_refuses_to_serialize(self):
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.to_jsonable({"user_id": PLANTED})
+
+    def test_bytes_refuse_to_serialize(self):
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.to_jsonable(PLANTED.encode("utf-8"))
+
+    def test_non_finite_floats_refuse_to_serialize(self):
+        """json.dumps writes a bare NaN by default, which is not JSON."""
+        with self.assertRaises(ValueError):
+            dbprofiler.json_bytes(dbprofiler.FanOut(status="estimated", basis="composite",
+                                                    mean=float("nan")))
+
+    def test_the_serialization_is_stable(self):
+        self.assertEqual(dbprofiler.json_bytes(a_source()), dbprofiler.json_bytes(a_source()))
+
+
+class TestPayloads(BundleCase):
+    def test_the_bundle_carries_the_documented_entries(self):
+        self.assertEqual(
+            sorted(self.by_path),
+            [
+                "observations/foreign_keys.csv",
+                "observations/pg_class.csv",
+                "observations/pg_stat_indexes.csv",
+                "observations/pg_stat_statements.csv",
+                "observations/pg_stat_tables.csv",
+                "observations/pg_stats.csv",
+                "observations/pg_stats_ext.csv",
+                "profile.json",
+                "schema.sql",
+            ],
+        )
+
+    def test_payloads_arrive_sorted_by_path(self):
+        self.assertEqual([e.path for e in self.payloads], sorted(self.by_path))
+
+    def test_every_payload_path_is_allowlisted(self):
+        for entry in self.payloads:
+            with self.subTest(path=entry.path):
+                self.assertIn(entry.path, dbprofiler.BUNDLE_ALLOWED_PATHS)
+
+    def test_the_manifest_is_not_a_payload(self):
+        self.assertNotIn(dbprofiler.BUNDLE_MANIFEST, self.by_path)
+
+    def test_row_counts_match_the_csv_bodies(self):
+        for entry in self.payloads:
+            if not entry.path.endswith(".csv"):
+                continue
+            with self.subTest(path=entry.path):
+                self.assertEqual(entry.row_count, len(read_csv(entry)) - 1)
+
+    def test_the_schema_payload_is_the_dump_verbatim(self):
+        self.assertEqual(self.by_path["schema.sql"].data, SCHEMA_SQL.encode("utf-8"))
+
+    def test_pg_class_reports_estimates_and_sizes(self):
+        rows = read_csv(self.by_path["observations/pg_class.csv"])
+        header, body = rows[0], rows[1:]
+        users = next(row for row in body if row[:2] == ["public", "users"])
+        self.assertEqual(users[header.index("row_count_estimate")], "1000.0")
+        self.assertEqual(users[header.index("size_bytes")], "163840")
+
+    def test_pg_stats_carries_tokens_and_never_values(self):
+        rows = read_csv(self.by_path["observations/pg_stats.csv"])
+        header, body = rows[0], rows[1:]
+        user_id = next(row for row in body if row[:3] == ["public", "orders", "user_id"])
+        tokens = user_id[header.index("most_common_tokens")].split("|")
+        self.assertEqual(len(tokens), 3)
+        for token in tokens:
+            self.assertRegex(token, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(user_id[header.index("most_common_freqs")], "0.1|0.05|0.02")
+
+    def test_pg_stats_ext_reports_one_row_per_column_combination(self):
+        rows = read_csv(self.by_path["observations/pg_stats_ext.csv"])
+        header, body = rows[0], rows[1:]
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0][header.index("combination")], "user_id|placed_at")
+        self.assertEqual(body[0][header.index("distinct_estimate")], "4200.0")
+        self.assertEqual(body[0][header.index("has_most_common_values")], "true")
+
+    def test_foreign_keys_carry_the_fan_out_estimate(self):
+        rows = read_csv(self.by_path["observations/foreign_keys.csv"])
+        header, body = rows[0], rows[1:]
+        fk = next(row for row in body if row[0] == "orders_user_id_fkey")
+        self.assertEqual(fk[header.index("fan_out_status")], "estimated")
+        self.assertEqual(fk[header.index("fan_out_basis")], "single_column")
+        self.assertEqual(fk[header.index("on_delete")], "CASCADE")
+
+    def test_pg_stat_indexes_joins_the_catalog_for_uniqueness(self):
+        """Whether an unused index can simply be dropped depends on whether it
+        backs a constraint, and only the catalog knows that."""
+        rows = read_csv(self.by_path["observations/pg_stat_indexes.csv"])
+        header, body = rows[0], rows[1:]
+        pkey = next(row for row in body if row[2] == "users_pkey")
+        secondary = next(row for row in body if row[2] == "orders_user_id_idx")
+        self.assertEqual(pkey[header.index("is_primary")], "true")
+        self.assertEqual(secondary[header.index("is_primary")], "false")
+        self.assertEqual(secondary[header.index("size_bytes")], "901120")
+
+    def test_pg_stat_tables_keeps_the_autovacuum_signal(self):
+        rows = read_csv(self.by_path["observations/pg_stat_tables.csv"])
+        header, body = rows[0], rows[1:]
+        orders = next(row for row in body if row[:2] == ["public", "orders"])
+        self.assertEqual(orders[header.index("n_dead_tup")], "1500")
+        self.assertEqual(orders[header.index("last_vacuum")], "")
+        self.assertEqual(orders[header.index("autovacuum_count")], "9")
+
+    def test_statement_text_is_replaced_by_a_token(self):
+        rows = read_csv(self.by_path["observations/pg_stat_statements.csv"])
+        header, body = rows[0], rows[1:]
+        self.assertNotIn("query", header)
+        for row in body:
+            self.assertRegex(row[header.index("query_token")], r"\A[0-9a-f]{64}\Z")
+
+    def test_identical_statement_text_tokenizes_identically(self):
+        rows = read_csv(self.by_path["observations/pg_stat_statements.csv"])
+        header, body = rows[0], rows[1:]
+        tokens = {row[header.index("queryid")]: row[header.index("query_token")] for row in body}
+        self.assertEqual(len(tokens), len(body))
+        again = dbprofiler.build_payloads(
+            self.profile, self.catalog, self.workload, a_tokenizer(), SCHEMA_SQL
+        )
+        self.assertEqual(
+            self.by_path["observations/pg_stat_statements.csv"].data,
+            {e.path: e for e in again}["observations/pg_stat_statements.csv"].data,
+        )
+
+    def test_a_different_key_produces_different_tokens(self):
+        other = dbprofiler.Tokenizer(b"a-different-example-key-0123456789")
+        rows = dbprofiler.build_payloads(self.profile, self.catalog, self.workload, other,
+                                         SCHEMA_SQL)
+        self.assertNotEqual(
+            self.by_path["observations/pg_stat_statements.csv"].data,
+            {e.path: e for e in rows}["observations/pg_stat_statements.csv"].data,
+        )
+
+
+class TestDegradedPayloads(BundleCase):
+    def omitted(self, **overrides):
+        workload = a_workload(**overrides)
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        payloads = self.build_payloads(profile=profile, workload=workload)
+        return {entry.path for entry in payloads}, workload.warnings
+
+    def test_a_missing_extension_omits_the_statements_csv(self):
+        paths, warnings = self.omitted(statements_installed="")
+        self.assertNotIn("observations/pg_stat_statements.csv", paths)
+        self.assertIn("pg_stat_statements_missing", [w.code for w in warnings])
+
+    def test_a_permission_error_omits_the_statements_csv(self):
+        paths, _ = self.omitted(statements=denied("pg_stat_statements"))
+        self.assertNotIn("observations/pg_stat_statements.csv", paths)
+
+    def test_a_permission_error_omits_the_table_activity_csv(self):
+        paths, _ = self.omitted(table_activity=denied("pg_stat_user_tables"))
+        self.assertNotIn("observations/pg_stat_tables.csv", paths)
+        self.assertIn("observations/pg_stat_indexes.csv", paths)
+
+    def test_a_permission_error_omits_the_index_activity_csv(self):
+        paths, _ = self.omitted(index_activity=denied("pg_stat_user_indexes"))
+        self.assertNotIn("observations/pg_stat_indexes.csv", paths)
+
+    def test_omission_never_loses_the_catalog_sections(self):
+        paths, _ = self.omitted(table_activity=denied("pg_stat_user_tables"))
+        self.assertIn("profile.json", paths)
+        self.assertIn("observations/pg_class.csv", paths)
+
+    def test_a_degraded_bundle_still_publishes(self):
+        workload = a_workload(statements_installed="")
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        payloads = self.build_payloads(profile=profile, workload=workload)
+        manifest = dbprofiler.build_manifest(
+            a_source(), FINGERPRINT, payloads, warnings=workload.warnings
+        )
+        dbprofiler.write_bundle(self.destination, payloads, manifest)
+        with zipfile.ZipFile(self.destination) as archive:
+            recorded = json.loads(archive.read("manifest.json"))
+        self.assertIn("pg_stat_statements_missing", [w["code"] for w in recorded["warnings"]])
+
+
+class TestManifest(BundleCase):
+    def test_every_payload_is_hashed(self):
+        described = {o.path: o for o in self.manifest.payloads}
+        self.assertEqual(set(described), set(self.by_path))
+        for path, observation in described.items():
+            with self.subTest(path=path):
+                expected = hashlib.sha256(self.by_path[path].data).hexdigest()
+                self.assertEqual(observation.sha256, expected)
+
+    def test_the_manifest_does_not_hash_itself(self):
+        self.assertNotIn("manifest.json", [o.path for o in self.manifest.payloads])
+
+    def test_the_manifest_records_the_schema_fingerprint(self):
+        self.assertEqual(self.manifest.schema_fingerprint, FINGERPRINT)
+
+    def test_the_manifest_records_the_statistics_reset_time(self):
+        self.assertEqual(self.manifest.stats_reset, self.workload.stats_reset)
+
+    def test_created_at_is_rfc_3339_utc(self):
+        self.assertRegex(self.manifest.created_at, r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+
+    def test_the_tool_identifies_itself(self):
+        self.assertEqual(self.manifest.tool, dbprofiler.PROG)
+        self.assertEqual(self.manifest.tool_version, dbprofiler.VERSION)
+        self.assertEqual(self.manifest.contract_version, dbprofiler.CONTRACT_VERSION)
+
+
+class TestWriteBundle(BundleCase):
+    def test_the_archive_holds_the_payloads_and_the_manifest(self):
+        self.publish()
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(sorted(archive.namelist()),
+                             sorted(list(self.by_path) + ["manifest.json"]))
+
+    def test_entries_are_stored_in_sorted_order_with_the_manifest_last(self):
+        """The manifest hashes the others, so it can only be written once they
+        exist. Storing it last makes that visible in the archive itself."""
+        self.publish()
+        with zipfile.ZipFile(self.destination) as archive:
+            names = archive.namelist()
+        self.assertEqual(names[-1], "manifest.json")
+        self.assertEqual(names[:-1], sorted(names[:-1]))
+
+    def test_stored_bytes_match_the_hashes_the_manifest_recorded(self):
+        self.publish()
+        with zipfile.ZipFile(self.destination) as archive:
+            recorded = json.loads(archive.read("manifest.json"))
+            for observation in recorded["payloads"]:
+                with self.subTest(path=observation["path"]):
+                    stored = archive.read(observation["path"])
+                    self.assertEqual(hashlib.sha256(stored).hexdigest(), observation["sha256"])
+
+    def test_entries_are_regular_files(self):
+        """A ZIP entry can carry a unix mode. A symlink bit here would let an
+        extractor write outside the destination directory."""
+        self.publish()
+        with zipfile.ZipFile(self.destination) as archive:
+            for info in archive.infolist():
+                with self.subTest(name=info.filename):
+                    self.assertEqual(info.external_attr >> 16, 0o100644)
+
+    def test_timestamps_are_fixed_so_two_runs_are_byte_identical(self):
+        first = self.destination
+        second = Path(self.directory.name) / "second.zip"
+        manifest = dataclasses.replace(self.manifest, created_at="2026-08-24T00:00:00Z")
+        dbprofiler.write_bundle(first, self.payloads, manifest)
+        dbprofiler.write_bundle(second, self.payloads, manifest)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_no_temporary_file_survives_a_successful_run(self):
+        self.publish()
+        self.assertEqual(self.leftovers(), ["source-profile.zip"])
+
+    def test_publication_uses_an_atomic_rename(self):
+        with mock.patch("os.replace", wraps=os.replace) as replace:
+            self.publish()
+        self.assertEqual(replace.call_count, 1)
+        self.assertEqual(Path(replace.call_args[0][1]), self.destination)
+
+    def test_a_failed_write_leaves_no_temporary_file(self):
+        with mock.patch.object(dbprofiler, "json_bytes", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.publish()
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failed_rename_leaves_the_previous_bundle_intact(self):
+        self.destination.write_bytes(b"previous bundle")
+        with mock.patch("os.replace", side_effect=OSError("cross-device link")):
+            with self.assertRaises(OSError):
+                self.publish()
+        self.assertEqual(self.destination.read_bytes(), b"previous bundle")
+        self.assertEqual(self.leftovers(), ["source-profile.zip"])
+
+    def test_a_partial_archive_is_never_visible_at_the_destination(self):
+        seen = []
+        real = os.replace
+
+        def watch(source, target):
+            seen.append(Path(target).exists())
+            real(source, target)
+
+        with mock.patch("os.replace", side_effect=watch):
+            self.publish()
+        self.assertEqual(seen, [False])
+
+    def test_a_symlink_destination_is_refused(self):
+        target = Path(self.directory.name) / "elsewhere.zip"
+        link = Path(self.directory.name) / "link.zip"
+        link.symlink_to(target)
+        with self.assertRaises(dbprofiler.BundleError):
+            self.publish(destination=link)
+        self.assertFalse(target.exists())
+
+    def test_a_directory_destination_is_refused(self):
+        directory = Path(self.directory.name) / "a-directory.zip"
+        directory.mkdir()
+        with self.assertRaises(dbprofiler.BundleError):
+            self.publish(destination=directory)
+
+
+class TestWriteBundleRejections(BundleCase):
+    def entry(self, path, data=b"x"):
+        return dbprofiler.BundleEntry(path=path, data=data, row_count=0)
+
+    def with_payloads(self, payloads):
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.write_bundle(self.destination, payloads, manifest)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_an_unexpected_entry_is_rejected(self):
+        self.with_payloads(self.payloads + (self.entry("notes.txt"),))
+
+    def test_an_absolute_entry_is_rejected(self):
+        self.with_payloads(self.payloads + (self.entry("/etc/passwd"),))
+
+    def test_a_traversing_entry_is_rejected(self):
+        self.with_payloads(self.payloads + (self.entry("../escape.csv"),))
+
+    def test_a_duplicate_entry_is_rejected(self):
+        self.with_payloads(self.payloads + (self.by_path["profile.json"],))
+
+    def test_a_payload_named_manifest_json_is_rejected(self):
+        """The manifest is written by write_bundle. A caller-supplied one would
+        be a second file claiming to be the authority on the first."""
+        self.with_payloads(self.payloads + (self.entry("manifest.json"),))
+
+    def test_a_manifest_that_omits_a_payload_is_rejected(self):
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, self.payloads[1:])
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.write_bundle(self.destination, self.payloads, manifest)
+
+    def test_a_manifest_hash_that_does_not_match_is_rejected(self):
+        """Catches a payload mutated between hashing and writing."""
+        tampered = tuple(
+            dataclasses.replace(entry, data=entry.data + b"\n") if entry.path == "profile.json"
+            else entry
+            for entry in self.payloads
+        )
+        with self.assertRaises(dbprofiler.BundleError):
+            dbprofiler.write_bundle(self.destination, tampered, self.manifest)
+
+
+class TestNothingRawReachesDisk(BundleCase):
+    """The negative assertions. Each plants a value and proves its absence."""
+
+    def bundle_and_temp(self, payloads=None, manifest=None):
+        """Publish, capturing the temporary file's bytes before the rename."""
+        captured = {}
+        real = os.replace
+
+        def capture(source, target):
+            captured["temp"] = Path(source).read_bytes()
+            real(source, target)
+
+        with mock.patch("os.replace", side_effect=capture):
+            self.publish(payloads=payloads, manifest=manifest)
+        return zip_bytes(self.destination) + captured["temp"]
+
+    def test_an_unnormalized_query_literal_never_reaches_the_bundle(self):
+        """pg_stat_statements normalizes literals to $1 -- usually. The golden
+        fixture carries one that was not normalized."""
+        statements = golden("statements").replace("sample-region-1", PLANTED)
+        workload = a_workload(statements=statements)
+        self.assertIn(PLANTED, "".join(s.query_text for s in workload.statements))
+
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        payloads = self.build_payloads(profile=profile, workload=workload)
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
+        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
+
+    def test_a_most_common_value_never_reaches_the_bundle(self):
+        stats = golden("column_stats").replace("{1,2,3}", f"{{{PLANTED},2,3}}")
+        catalog = a_catalog(column_stats=stats)
+        self.assertIn(
+            PLANTED,
+            "".join("".join(s.most_common_vals) for s in catalog.column_stats),
+        )
+
+        profile = dbprofiler.build_profile(a_source(), catalog, self.workload, self.tokenizer)
+        payloads = self.build_payloads(profile=profile, catalog=catalog)
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
+        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
+
+    def test_a_histogram_bound_never_reaches_the_bundle(self):
+        stats = golden("column_stats").replace("{1,250,500,750,1000}", f"{{{PLANTED},250}}")
+        catalog = a_catalog(column_stats=stats)
+        profile = dbprofiler.build_profile(a_source(), catalog, self.workload, self.tokenizer)
+        payloads = self.build_payloads(profile=profile, catalog=catalog)
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
+        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
+
+    def test_the_tokenization_key_never_reaches_the_bundle(self):
+        self.assertNotIn(TOKEN_KEY.encode("utf-8"), self.bundle_and_temp())
+
+    def test_no_connection_detail_reaches_the_bundle(self):
+        published = self.bundle_and_temp()
+        for secret in (URL, PASSWORD, USER, HOST):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret.encode("utf-8"), published)
+
+    def test_the_database_name_is_recorded_but_the_credentials_are_not(self):
+        """The bundle must say which database it profiled. That is not a secret;
+        the role and password that reached it are."""
+        self.publish()
+        with zipfile.ZipFile(self.destination) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        self.assertEqual(manifest["source"]["database"], DATABASE)
 
 
 class TestCLI(unittest.TestCase):
