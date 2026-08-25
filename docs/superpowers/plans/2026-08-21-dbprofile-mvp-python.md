@@ -249,10 +249,41 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write failing tests for: `pg_dump` discovery on `PATH` + `--pg-dump-path` override; `pg_dump` major must be >= server major (both 16 in MVP); command args contain `--schema-only --no-owner --no-privileges` and schema filters but no URL, username, or password; system-schema names rejected in `--schema-include` (catalog, toast, temporary); DDL captured to in-memory string; redacted errors on failure; deterministic schema-object fingerprint (SHA-256 over sorted `(schemaname, relname, relkind)` tuples from `pg_class` join `pg_namespace`, filtered to user schemas).
-- [ ] Implement `collect_schema(cfg)` returning `(schema_sql: str, fingerprint: str)`; `collect_schema` runs `pg_dump` once and one fingerprint query.
-- [ ] Implement separate `fingerprint(cfg)` for the after-collection recheck.
-- [ ] Run tests; expect PASS.
+- [x] Write failing tests for: `pg_dump` discovery on `PATH` + `--pg-dump-path` override; `pg_dump` major must be >= server major (both 16 in MVP); command args contain `--schema-only --no-owner --no-privileges` and schema filters but no URL, username, or password; system-schema names rejected in `--schema-include` (catalog, toast, temporary); DDL captured to in-memory string; redacted errors on failure; deterministic schema-object fingerprint (SHA-256 over sorted `(schemaname, relname, relkind)` tuples from `pg_class` join `pg_namespace`, filtered to user schemas).
+- [x] Implement `collect_schema(cfg)` returning `(schema_sql: str, fingerprint: str)`; `collect_schema` runs `pg_dump` once and one fingerprint query.
+- [x] Implement separate `fingerprint(cfg)` for the after-collection recheck. → `schema_fingerprint(config)`.
+- [x] Run tests; expect PASS. → 125 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **`collect_schema` takes the server version:** `collect_schema(config,
+  server_version_num)`. It checks the client itself rather than trusting the
+  orchestrator to remember, so a too-old `pg_dump` fails before it produces anything.
+  That means three child processes per call, not two — `pg_dump --version`, the
+  fingerprint query, then the dump. The version probe opens no connection.
+- **The fingerprint is taken before the dump,** so the after-collection recheck also
+  covers DDL drift during the dump itself.
+- **Scope filtering happens in Python, not in SQL.** `SQL_SCHEMA_FINGERPRINT` stays a
+  fixed module constant that `--check-safety` can audit — building the `WHERE` clause
+  from `--schema-include` would have meant assembling SQL inline, which the house rule
+  forbids for exactly this reason. Filtering the returned rows also means a schema the
+  operator excluded cannot abort the run by changing underneath it.
+- **The canonical form uses ASCII unit and record separators** (`\x1f`, `\x1e`) between
+  fields and rows. Neither can occur in a PostgreSQL identifier, so no pair of relation
+  names can forge a field boundary and collide. There is a test for that.
+- **User schemas are selected with `left(nspname, 3) <> 'pg_'`** rather than a `LIKE`
+  pattern. One comparison covers `pg_catalog`, `pg_toast`, `pg_temp_N` and
+  `pg_toast_temp_N`, and it needs no backslash escaping inside a Python string.
+- **No `relkind` filter.** Every relation kind is fingerprinted; TOAST relations are
+  already excluded by the schema test. A narrower filter would only create blind spots.
+- **`--schema-include` validation moved to config time,** in `build_postgres_config`,
+  so the operator finds out before we connect. `pg_` prefixed names and
+  `information_schema` are rejected; the prefix is reserved by PostgreSQL, so
+  `pg_myschema` cannot be a real user schema either. `--schema-exclude` is not
+  validated: excluding something already out of scope is harmless.
+- **New error type `UnsupportedClientVersion`,** distinct from
+  `UnsupportedServerVersion`. The remedy is different — upgrade the local client, not
+  the server.
 
 ### Task 5: Catalog-only observations
 
