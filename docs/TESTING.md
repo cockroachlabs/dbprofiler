@@ -143,9 +143,18 @@ and a reused volume is how a fixture from an earlier run leaks into a later asse
 ```bash
 python3 dbprofiler.py --check-safety
 python3 -m unittest -v
-ruff check          # optional, development-only
-git diff --staged   # read it for credentials, URLs, and debug prints
+python3.9 -m unittest        # the oldest supported version
+ruff check                   # optional, development-only
+git diff --staged            # read it for credentials, URLs, and debug prints
 ```
+
+Run the suite on a real 3.9 interpreter, not just a 3.9 grammar check. `ast.parse` with
+`feature_version=(3, 9)` catches syntax and nothing else, and this does not break as
+syntax: `dbprofiler.py` and `integration_test.py` have `from __future__ import
+annotations`, so their annotations are never evaluated, but `test_dbprofiler.py` does
+not — a `str | None` in a signature there parses on every version and raises `TypeError`
+at import time on 3.9. The CI matrix covers 3.9 through 3.14; this is how you find out
+before the push rather than after.
 
 Nothing about the tool needs `ruff` or `mypy` at runtime; they are development aids and
 must never become dependencies.

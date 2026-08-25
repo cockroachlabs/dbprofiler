@@ -3099,8 +3099,12 @@ MUTATING_SQL = re.compile(
 )
 
 
-def sql_of(call: ast.Call) -> str | None:
+def sql_of(call):
     """Reconstruct the SQL text of an execute(...) call, or None.
+
+    Unannotated, like the other helpers here: this file has no
+    `from __future__ import annotations`, so on 3.9 a `str | None` in a
+    signature is evaluated at import and raises.
 
     Interpolations become the placeholder the source wrote -- `{SCHEMA}` stays
     `{SCHEMA}` -- so a statement can be checked for the schema qualification

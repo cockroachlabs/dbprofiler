@@ -790,6 +790,12 @@ satisfied while still testing the parser.
 - **`README.md` gained a "What this release does not do" section** listing the deferred
   scope from line 32 of this plan, so a reader can tell an absent feature from an
   oversight.
+- **The local 3.9 check was wrong, and CI caught it.** `ast.parse(feature_version=(3, 9))`
+  validates syntax and nothing else. `test_dbprofiler.py` has no
+  `from __future__ import annotations`, so a `str | None` on a helper there parses on
+  every version and raises `TypeError` at import on 3.9 — green locally, red on the
+  matrix's oldest leg. Fixed by dropping the annotation, and `docs/TESTING.md` now says to
+  run `python3.9 -m unittest` rather than to trust the grammar check.
 
 ### Task 13: Release plumbing
 
