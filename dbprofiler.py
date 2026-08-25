@@ -54,6 +54,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -1872,7 +1873,316 @@ def shape_as_uuid(digest: str) -> str:
 # ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
-# (task 8) normalize_columns(), normalize_fk_fanout().
+# Turns collected catalog rows into the contract. Two rules govern this section.
+#
+# PostgreSQL-native names stay out of the contract and live in `provenance`
+# instead. A consumer reading profile.json should not have to know that
+# reltuples is an estimate, or that n_distinct is negative when it means a
+# fraction. The native encodings are recorded rather than discarded, because a
+# number without its derivation is not auditable.
+#
+# Nothing is invented. Where PostgreSQL has no estimate, the contract carries
+# None and a fan-out says insufficient_statistics. A plausible number is worse
+# than a gap: a gap gets investigated.
+
+# pg_stats.most_common_freqs are fractions of all rows in the table, nulls
+# included -- not fractions of the non-null rows, and not of the distinct values.
+FREQ_BASIS = "all rows, nulls included"
+
+FAN_OUT_ESTIMATED = "estimated"
+FAN_OUT_INSUFFICIENT = "insufficient_statistics"
+BASIS_SINGLE_COLUMN = "single_column"
+BASIS_EXTENDED_STATISTICS = "extended_statistics"
+BASIS_COMPOSITE = "composite"
+
+# The percentile reported alongside the mean. The mean alone hides skew, and
+# skew is the thing that breaks a migration: a table whose average parent has
+# ten children can still have one parent with half a million.
+FAN_OUT_PERCENTILE = 0.99
+
+
+def resolve_distinct(n_distinct: float, row_count: float) -> float | None:
+    """Resolve pg_stats.n_distinct into an absolute count.
+
+    PostgreSQL stores a positive value as a count and a negative one as a
+    fraction of the table's rows -- the second form is how it expresses "this
+    column stays unique as the table grows". Zero means it has no estimate.
+    """
+    if n_distinct == 0:
+        return None
+    if n_distinct < 0:
+        return abs(n_distinct) * row_count
+    return n_distinct
+
+
+def describe_distinct(n_distinct: float, row_count: float) -> str:
+    """Record the native encoding behind a resolved distinct estimate."""
+    if n_distinct == 0:
+        return "pg_stats.n_distinct=0: PostgreSQL has no distinct estimate for this column"
+    if n_distinct < 0:
+        return (
+            f"pg_stats.n_distinct={format_number(n_distinct)} is a fraction of rows, "
+            f"resolved against pg_class.reltuples={format_number(row_count)}"
+        )
+    return f"pg_stats.n_distinct={format_number(n_distinct)} is an absolute count"
+
+
+def format_number(value: float) -> str:
+    """Render a float without a trailing .0, so provenance reads like the catalog."""
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def build_token_domains(columns, foreign_keys) -> dict:
+    """Map every column to the (domain, type) its values tokenize under.
+
+    A foreign key is only visible in the profile if the same value tokenizes
+    identically on the child and the parent, so a child column borrows its
+    parent's domain. Chains are followed to their root: with A.x -> B.y and
+    B.y -> C.z, A.x tokenizing under B.y while B.y tokenizes under C.z would
+    make the A-to-B join invisible, which is the exact failure this prevents.
+
+    The root column's type also wins, so a text column referencing a uuid one
+    canonicalizes and shapes the same way on both sides.
+    """
+    parent_of: dict = {}
+    for fk in foreign_keys:
+        for child, parent in zip(fk.child_columns, fk.parent_columns):
+            key = (fk.child_schema, fk.child_table, child)
+            parent_of.setdefault(key, (fk.parent_schema, fk.parent_table, parent))
+
+    types = {(c.schema, c.table, c.name): c.type_name for c in columns}
+    domains = {}
+    for column in columns:
+        key = (column.schema, column.table, column.name)
+        root = resolve_domain_root(key, parent_of)
+        domains[key] = (token_domain(*root), types.get(root, column.type_name))
+    return domains
+
+
+def resolve_domain_root(key, parent_of):
+    """Follow a foreign-key chain to its root, stopping on a cycle.
+
+    Self-referential and mutually referential keys are legal in PostgreSQL, so
+    this cannot assume termination.
+    """
+    seen = {key}
+    while key in parent_of:
+        key = parent_of[key]
+        if key in seen:
+            break
+        seen.add(key)
+    return key
+
+
+def normalize_columns(catalog: CatalogObservations, tokenizer: Tokenizer) -> dict:
+    """Return (schema, table) -> ordered tuple of contract Columns."""
+    row_counts = {(t.schema, t.name): t.reltuples for t in catalog.tables}
+    stats = {(s.schema, s.table, s.column): s for s in catalog.column_stats}
+    domains = build_token_domains(catalog.columns, catalog.foreign_keys)
+
+    by_table: dict = {}
+    for column in sorted(catalog.columns, key=lambda c: (c.schema, c.table, c.ordinal)):
+        key = (column.schema, column.table, column.name)
+        domain, type_name = domains[key]
+        by_table.setdefault((column.schema, column.table), []).append(
+            normalize_column(
+                column,
+                stats.get(key),
+                row_counts.get((column.schema, column.table), 0.0),
+                tokenizer,
+                domain,
+                type_name,
+            )
+        )
+    return {table: tuple(columns) for table, columns in by_table.items()}
+
+
+def normalize_column(column, statistic, row_count, tokenizer, domain, type_name) -> Column:
+    """Build one contract Column, tokenizing every value it carries."""
+    if statistic is None:
+        return Column(
+            schema=column.schema,
+            table=column.table,
+            name=column.name,
+            ordinal=column.ordinal,
+            data_type=column.data_type,
+            is_nullable=column.is_nullable,
+            is_supported=column.is_supported,
+            provenance=(
+                "no pg_stats row: the column has never been analyzed, so PostgreSQL "
+                "has no distribution for it"
+            ),
+        )
+
+    return Column(
+        schema=column.schema,
+        table=column.table,
+        name=column.name,
+        ordinal=column.ordinal,
+        data_type=column.data_type,
+        is_nullable=column.is_nullable,
+        is_supported=column.is_supported,
+        null_fraction=statistic.null_frac,
+        avg_width_bytes=statistic.avg_width,
+        distinct_estimate=resolve_distinct(statistic.n_distinct, row_count),
+        most_common_tokens=tokenizer.tokens(statistic.most_common_vals, domain, type_name),
+        most_common_freqs=statistic.most_common_freqs,
+        histogram_token_bounds=tokenizer.tokens(statistic.histogram_bounds, domain, type_name),
+        provenance=(
+            f"{describe_distinct(statistic.n_distinct, row_count)}; "
+            f"pg_stats.most_common_freqs are fractions of {FREQ_BASIS}; "
+            "values are HMAC tokens, equal within a foreign-key domain"
+        ),
+    )
+
+
+def normalize_tables(catalog: CatalogObservations, tokenizer: Tokenizer) -> tuple[Table, ...]:
+    """Return the contract Tables, sorted, each with its columns in ordinal order."""
+    columns = normalize_columns(catalog, tokenizer)
+    return tuple(
+        Table(
+            schema=table.schema,
+            name=table.name,
+            row_count_estimate=table.reltuples,
+            size_bytes=table.size_bytes,
+            columns=columns.get((table.schema, table.name), ()),
+            provenance=(
+                "row_count_estimate is pg_class.reltuples, an estimate maintained by "
+                "the autovacuum daemon and never a row count; size_bytes is "
+                "pg_total_relation_size, including indexes and TOAST"
+            ),
+        )
+        for table in sorted(catalog.tables, key=lambda t: (t.schema, t.name))
+    )
+
+
+def normalize_relationships(catalog: CatalogObservations) -> tuple[Relationship, ...]:
+    """Return the contract Relationships, each with a fan-out estimate."""
+    row_counts = {(t.schema, t.name): t.reltuples for t in catalog.tables}
+    stats = {(s.schema, s.table, s.column): s for s in catalog.column_stats}
+    extended: dict = {}
+    for entry in catalog.extended_stats:
+        for columns, value in entry.n_distinct.items():
+            extended[(entry.schema, entry.table, frozenset(columns))] = value
+
+    return tuple(
+        Relationship(
+            constraint_name=fk.constraint_name,
+            child_schema=fk.child_schema,
+            child_table=fk.child_table,
+            child_columns=fk.child_columns,
+            parent_schema=fk.parent_schema,
+            parent_table=fk.parent_table,
+            parent_columns=fk.parent_columns,
+            on_update=fk.on_update,
+            on_delete=fk.on_delete,
+            fan_out=estimate_fan_out(fk, row_counts, stats, extended),
+        )
+        for fk in sorted(
+            catalog.foreign_keys,
+            key=lambda fk: (fk.child_schema, fk.child_table, fk.constraint_name),
+        )
+    )
+
+
+def estimate_fan_out(fk, row_counts, stats, extended) -> FanOut:
+    """Estimate children per parent across one foreign key.
+
+    Children per parent is the number of child rows that actually reference a
+    parent, divided by how many distinct parents they reference.
+    """
+    child_rows = row_counts.get((fk.child_schema, fk.child_table), 0.0)
+    if len(fk.child_columns) > 1:
+        return composite_fan_out(fk, child_rows, stats, extended)
+    return single_column_fan_out(fk, child_rows, stats)
+
+
+def single_column_fan_out(fk, child_rows, stats) -> FanOut:
+    statistic = stats.get((fk.child_schema, fk.child_table, fk.child_columns[0]))
+    if statistic is None:
+        return FanOut(status=FAN_OUT_INSUFFICIENT, basis=BASIS_SINGLE_COLUMN)
+
+    distinct = resolve_distinct(statistic.n_distinct, child_rows)
+    if not distinct:
+        return FanOut(status=FAN_OUT_INSUFFICIENT, basis=BASIS_SINGLE_COLUMN)
+
+    # A null foreign key references no parent, so those rows are not children to
+    # distribute. Counting them would inflate every estimate on a nullable key.
+    referencing = child_rows * (1.0 - statistic.null_frac)
+    return FanOut(
+        status=FAN_OUT_ESTIMATED,
+        basis=BASIS_SINGLE_COLUMN,
+        mean=referencing / distinct,
+        p99=estimate_p99(statistic.most_common_freqs, child_rows, distinct),
+    )
+
+
+def composite_fan_out(fk, child_rows, stats, extended) -> FanOut:
+    """Estimate a multi-column key, or decline to.
+
+    The distinct count of a column pair is not the product of the columns'
+    distinct counts unless the columns are independent, and foreign-key columns
+    almost never are. Multiplying would understate fan-out by orders of
+    magnitude and size a migration against a workload that does not exist, so
+    this reports insufficient_statistics unless PostgreSQL has extended
+    statistics covering exactly this column set. The remedy is in the operator's
+    hands -- declare extended statistics on the source, re-analyze, re-run -- and
+    is theirs to take, because this tool does not write to the source.
+    """
+    key = (fk.child_schema, fk.child_table, frozenset(fk.child_columns))
+    if key not in extended:
+        return FanOut(status=FAN_OUT_INSUFFICIENT, basis=BASIS_COMPOSITE)
+
+    distinct = resolve_distinct(extended[key], child_rows)
+    if not distinct:
+        return FanOut(status=FAN_OUT_INSUFFICIENT, basis=BASIS_COMPOSITE)
+
+    # A composite key references a parent only when every column is non-null, and
+    # PostgreSQL has no joint null fraction. The most-null column is the tightest
+    # bound available, so the estimate errs high rather than low.
+    null_fracs = [
+        stats[(fk.child_schema, fk.child_table, name)].null_frac
+        for name in fk.child_columns
+        if (fk.child_schema, fk.child_table, name) in stats
+    ]
+    referencing = child_rows * (1.0 - max(null_fracs, default=0.0))
+    return FanOut(
+        status=FAN_OUT_ESTIMATED,
+        basis=BASIS_EXTENDED_STATISTICS,
+        mean=referencing / distinct,
+    )
+
+
+def estimate_p99(most_common_freqs, child_rows, distinct) -> float | None:
+    """Estimate children per parent at the 99th percentile of parents.
+
+    Only the most common values are known individually, so this ranks those and
+    reads off the percentile. When the MCV list is shorter than the percentile's
+    rank -- the usual case, since PostgreSQL keeps at most a few hundred -- every
+    parent past the list has no more children than the last MCV, so the last
+    MCV's count is returned as an upper bound. Erring high is the right
+    direction: an under-reported hot parent is discovered during the migration.
+    """
+    if not most_common_freqs or not distinct:
+        return None
+    counts = sorted((freq * child_rows for freq in most_common_freqs), reverse=True)
+    rank = max(1, math.ceil((1.0 - FAN_OUT_PERCENTILE) * distinct))
+    return counts[rank - 1] if rank <= len(counts) else counts[-1]
+
+
+def build_profile(
+    source: Source,
+    catalog: CatalogObservations,
+    workload: WorkloadObservations,
+    tokenizer: Tokenizer,
+) -> Profile:
+    """Assemble the normalized contract from everything collected."""
+    return Profile(
+        source=source,
+        tables=normalize_tables(catalog, tokenizer),
+        relationships=normalize_relationships(catalog),
+        warnings=workload.warnings,
+    )
 
 
 # ---------------------------------------------------------------------------
