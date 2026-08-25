@@ -15,8 +15,10 @@ the real thing.
 import contextlib
 import dataclasses
 import io
+import os
 import subprocess
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -1421,6 +1423,242 @@ class TestWorkloadDegradation(unittest.TestCase):
         message = workload.warnings[0].message
         self.assertNotIn(PASSWORD, message)
         self.assertIn("***", message)
+
+
+# Synthetic, and long enough to satisfy the minimum-length check. Never a real
+# key: a reviewer grepping this repository has to be able to tell at a glance.
+TOKEN_KEY = "example-token-key-0123456789"
+
+
+def a_tokenizer(key=TOKEN_KEY):
+    return dbprofiler.Tokenizer(key.encode("utf-8"))
+
+
+class TestLoadTokenKey(unittest.TestCase):
+    def test_the_key_comes_from_the_environment(self):
+        key = dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY})
+        self.assertEqual(key, TOKEN_KEY.encode("utf-8"))
+
+    def test_a_missing_key_is_a_configuration_error(self):
+        with self.assertRaises(dbprofiler.ConfigError) as raised:
+            dbprofiler.load_token_key({})
+        self.assertIn(dbprofiler.TOKEN_KEY_ENV_VAR, str(raised.exception))
+
+    def test_a_short_key_is_rejected(self):
+        # A guessable key makes every token reversible by brute force.
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: "short"})
+
+    def test_no_rejection_message_echoes_the_key(self):
+        for value in ("zq7wv", " " * 40):
+            with self.subTest(value=value), self.assertRaises(dbprofiler.ConfigError) as raised:
+                dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: value})
+            self.assertNotIn(value, str(raised.exception))
+
+    def test_a_whitespace_only_key_is_not_a_key(self):
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: "                    "})
+
+    def test_there_is_no_default_key(self):
+        """A default key would tokenize every deployment identically, which is
+        the same as not tokenizing at all."""
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.load_token_key({"PGPASSWORD": PASSWORD})
+
+    def test_an_explicit_environment_is_not_topped_up_from_the_process(self):
+        # Otherwise a test -- or a caller passing a deliberately restricted
+        # environment -- would silently pick up the ambient key.
+        with mock.patch.dict(os.environ, {dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY}):
+            with self.assertRaises(dbprofiler.ConfigError):
+                dbprofiler.load_token_key({})
+            self.assertEqual(dbprofiler.load_token_key(), TOKEN_KEY.encode("utf-8"))
+
+
+class TestTokenizerSecrecy(unittest.TestCase):
+    def test_the_tokenizer_never_reprs_its_key(self):
+        tokenizer = a_tokenizer()
+        self.assertNotIn(TOKEN_KEY, repr(tokenizer))
+        self.assertNotIn(TOKEN_KEY, str(tokenizer))
+        self.assertNotIn(TOKEN_KEY, f"{tokenizer}")
+        self.assertIn(dbprofiler.REDACTED, repr(tokenizer))
+
+    def test_the_key_never_reaches_a_child_process(self):
+        env = dbprofiler.safe_env(a_config())
+        self.assertNotIn(dbprofiler.TOKEN_KEY_ENV_VAR, env)
+        self.assertNotIn(TOKEN_KEY, env.values())
+
+    def test_a_token_does_not_contain_its_input(self):
+        tokenizer = a_tokenizer()
+        for value in ("user@example.invalid", "sample-region-1", "42"):
+            with self.subTest(value=value):
+                token = tokenizer.token(value, "public.users.email")
+                self.assertNotIn(value, token)
+                self.assertNotIn(TOKEN_KEY, token)
+
+    def test_a_token_is_hex(self):
+        token = a_tokenizer().token("x", "d")
+        self.assertEqual(len(token), 64)
+        int(token, 16)  # raises if it is not
+
+
+class TestTokenizeDeterminism(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+
+    def test_equal_values_in_one_domain_tokenize_equally(self):
+        # This is the property the whole design rests on: a join key on both
+        # sides of a foreign key has to survive tokenization as a join key.
+        left = self.tokenizer.token("4200", "public.users.id")
+        right = self.tokenizer.token("4200", "public.users.id")
+        self.assertEqual(left, right)
+
+    def test_different_domains_do_not_collide(self):
+        left = self.tokenizer.token("4200", "public.users.id")
+        right = self.tokenizer.token("4200", "public.orders.id")
+        self.assertNotEqual(left, right)
+
+    def test_a_domain_boundary_cannot_be_forged(self):
+        """Concatenating domain and value without a separator would make
+        ("ab", "c") and ("a", "bc") the same token."""
+        self.assertNotEqual(
+            self.tokenizer.token("c", "ab"),
+            self.tokenizer.token("bc", "a"),
+        )
+
+    def test_a_different_key_gives_a_different_token(self):
+        other = a_tokenizer("example-token-key-9876543210")
+        self.assertNotEqual(
+            self.tokenizer.token("4200", "public.users.id"),
+            other.token("4200", "public.users.id"),
+        )
+
+    def test_null_is_distinguishable_from_the_empty_string(self):
+        self.assertNotEqual(
+            self.tokenizer.token(None, "public.users.email"),
+            self.tokenizer.token("", "public.users.email"),
+        )
+
+
+class TestTokenDomain(unittest.TestCase):
+    def test_a_domain_names_the_schema_table_and_column(self):
+        domain = dbprofiler.token_domain("public", "users", "id")
+        self.assertEqual(domain.split(dbprofiler.DOMAIN_SEPARATOR), ["public", "users", "id"])
+
+    def test_identifiers_containing_a_dot_cannot_forge_a_domain(self):
+        # PostgreSQL permits a dot inside a quoted identifier, so a dotted join
+        # would let one column's values impersonate another's.
+        self.assertNotEqual(
+            dbprofiler.token_domain("public", "users.id", "x"),
+            dbprofiler.token_domain("public", "users", "id.x"),
+        )
+
+
+class TestTypedRepresentation(unittest.TestCase):
+    """Numeric canonicalization, so a foreign key across int4 and int8 -- which
+    PostgreSQL permits -- still tokenizes to the same value on both sides."""
+
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+
+    def test_numeric_types_are_canonicalized(self):
+        domain = "public.orders.total"
+        self.assertEqual(
+            self.tokenizer.token("42", domain, "int8"),
+            self.tokenizer.token("42.0", domain, "numeric"),
+        )
+        self.assertEqual(
+            self.tokenizer.token("42", domain, "int4"),
+            self.tokenizer.token("4.2e1", domain, "float8"),
+        )
+
+    def test_text_is_never_canonicalized_as_a_number(self):
+        """"0001" and "1" are different strings. Collapsing them would merge two
+        most-common values into one token and corrupt the frequency it carries."""
+        domain = "public.users.code"
+        self.assertNotEqual(
+            self.tokenizer.token("0001", domain, "text"),
+            self.tokenizer.token("1", domain, "text"),
+        )
+
+    def test_significant_whitespace_in_text_is_preserved(self):
+        domain = "public.users.name"
+        self.assertNotEqual(
+            self.tokenizer.token("ada ", domain, "text"),
+            self.tokenizer.token("ada", domain, "text"),
+        )
+
+    def test_an_unparseable_numeric_falls_back_to_its_text(self):
+        # "NaN" and "Infinity" are legal float8 values and must not crash.
+        domain = "public.readings.value"
+        for value in ("NaN", "Infinity", "-Infinity", ""):
+            with self.subTest(value=value):
+                self.assertEqual(len(self.tokenizer.token(value, domain, "float8")), 64)
+
+    def test_the_type_name_is_not_part_of_the_hashed_material(self):
+        """A foreign key may cross int4 and int8. Hashing the type name would
+        break exactly the equality the tokens exist to preserve."""
+        domain = "public.users.id"
+        self.assertEqual(
+            self.tokenizer.token("7", domain, "int4"),
+            self.tokenizer.token("7", domain, "int8"),
+        )
+
+
+class TestTypeShapedTokens(unittest.TestCase):
+    """A tokenized UUID stays loadable as a UUID.
+
+    The profile is meant to be replayed into a CockroachDB schema for sizing. A
+    64-character hex string in a uuid column would not load, so the migration
+    team would have to retype the column and the shape they were testing would
+    no longer be the shape being migrated.
+    """
+
+    def setUp(self):
+        self.tokenizer = a_tokenizer()
+
+    def test_a_uuid_tokenizes_to_a_uuid(self):
+        token = self.tokenizer.token(
+            "6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", "public.users.id", "uuid"
+        )
+        self.assertEqual(str(uuid.UUID(token)), token)
+
+    def test_uuid_tokens_stay_deterministic_and_distinct(self):
+        domain = "public.users.id"
+        one = self.tokenizer.token("6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", domain, "uuid")
+        again = self.tokenizer.token("6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", domain, "uuid")
+        other = self.tokenizer.token("11111111-2222-3333-4444-555555555555", domain, "uuid")
+        self.assertEqual(one, again)
+        self.assertNotEqual(one, other)
+
+    def test_a_uuid_is_case_and_hyphen_canonical_before_hashing(self):
+        # PostgreSQL renders uuid lowercase and hyphenated, but a text column
+        # holding a uuid may not be. Both sides of a foreign key must agree.
+        domain = "public.users.id"
+        self.assertEqual(
+            self.tokenizer.token("6B3A8F2E-1D4C-4A5B-9E7F-0C1D2E3F4A5B", domain, "uuid"),
+            self.tokenizer.token("6b3a8f2e1d4c4a5b9e7f0c1d2e3f4a5b", domain, "uuid"),
+        )
+
+    def test_an_unparseable_uuid_does_not_crash(self):
+        token = self.tokenizer.token("not-a-uuid", "public.users.id", "uuid")
+        self.assertEqual(str(uuid.UUID(token)), token)
+
+    def test_every_other_type_gets_a_plain_hex_token(self):
+        for type_name in ("text", "int8", "jsonb", ""):
+            with self.subTest(type_name=type_name):
+                self.assertEqual(len(self.tokenizer.token("x", "d", type_name)), 64)
+
+
+class TestTokenizeSequences(unittest.TestCase):
+    def test_a_sequence_tokenizes_elementwise_and_in_order(self):
+        tokenizer = a_tokenizer()
+        tokens = tokenizer.tokens(("a", "b", "a"), "public.users.email", "text")
+        self.assertEqual(len(tokens), 3)
+        self.assertEqual(tokens[0], tokens[2])
+        self.assertNotEqual(tokens[0], tokens[1])
+
+    def test_an_empty_sequence_tokenizes_to_an_empty_tuple(self):
+        self.assertEqual(a_tokenizer().tokens((), "d", "text"), ())
 
 
 class TestCLI(unittest.TestCase):

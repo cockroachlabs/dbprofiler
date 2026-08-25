@@ -41,7 +41,12 @@ that property true.
   host `db.invalid` (`.invalid` is reserved by RFC 2606 and can never resolve), user
   `example-user`, password `example-password`, database `example-db`. Do not invent
   new ones.
+- Tests that need a tokenization key use `example-token-key-0123456789`, for the same
+  reason. Do not invent new ones.
 - Credentials reach child processes only through `env=`, never through `argv`.
+- The tokenization key is read only from `DBPROFILER_TOKEN_KEY`, never from `argv` and
+  never with a default. It is held by `Tokenizer`, whose `repr` redacts it, and it is
+  stripped from every child environment along with the rest of `DBPROFILER_*`.
 - Redact subprocess stderr before it is surfaced. Assume every error path is printed.
 - `.env.test.local` holds local test configuration, is gitignored, and is never
   displayed, echoed, or committed.
