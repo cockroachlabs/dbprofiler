@@ -58,6 +58,22 @@ curl -LO https://github.com/cockroachlabs/dbprofiler/releases/latest/download/db
 sha256sum -c dbprofiler.py.sha256
 ```
 
+On macOS, `shasum -a 256 -c dbprofiler.py.sha256` does the same thing.
+
+The checksum proves the file survived the transfer. To prove it came from this
+repository's release workflow and not from someone who could write to the release page,
+verify the provenance attestation as well:
+
+```bash
+gh attestation verify dbprofiler.py --repo cockroachlabs/dbprofiler
+```
+
+That checks a signature made by GitHub's own OIDC identity for this repository, recording
+which workflow built the artifact and from which commit. The release workflow publishes
+the tagged file unmodified — no version stamping, no rewriting — so the bytes you verify
+are the bytes in the tag, and `git show <tag>:dbprofiler.py | diff - dbprofiler.py` is
+empty.
+
 It is a single file with no dependencies, so you can read all of it before you run it.
 
 ## Usage
@@ -150,6 +166,25 @@ python3 -m unittest integration_test -v
 ```
 
 See `docs/TESTING.md` for the server and the configuration it needs.
+
+## Releasing
+
+```bash
+# 1. Bump VERSION in dbprofiler.py, commit, merge to main.
+# 2. Tag the merged commit.
+git tag -a v1.2.3 -m 'v1.2.3'
+git push origin v1.2.3
+```
+
+`.github/workflows/release.yaml` takes it from there: it runs the safety audit and the
+unit suite on Python 3.9, refuses to continue if the tag disagrees with `VERSION`,
+computes and re-verifies the checksum, attests build provenance, and creates the release
+with `dbprofiler.py` and `dbprofiler.py.sha256` attached. It never edits the script, so
+the asset is byte-identical to the tag.
+
+`test_dbprofiler.py` holds guard tests over that workflow — trigger, step order,
+permissions scope, action pinning, and the absence of any step that could rewrite the
+script — so the release path is covered by the same suite as the tool.
 
 ## License
 

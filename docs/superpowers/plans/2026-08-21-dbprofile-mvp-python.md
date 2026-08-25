@@ -801,11 +801,51 @@ satisfied while still testing the parser.
 
 **Files:** `.github/workflows/release.yaml`.
 
-- [ ] Trigger on `v*` tags.
-- [ ] Compute `sha256sum dbprofiler.py > dbprofiler.py.sha256`.
-- [ ] Upload `dbprofiler.py` + `dbprofiler.py.sha256` to the GitHub Release for that tag.
-- [ ] README documents the download-and-verify flow: `curl -O <url>/dbprofiler.py`, `curl -O <url>/dbprofiler.py.sha256`, `sha256sum -c dbprofiler.py.sha256`.
-- [ ] Optional: also publish a signed provenance attestation via GitHub's built-in `actions/attest-build-provenance` — cheap to add, meaningful for security reviewers.
+- [x] Trigger on `v*` tags.
+- [x] Compute `sha256sum dbprofiler.py > dbprofiler.py.sha256`.
+- [x] Upload `dbprofiler.py` + `dbprofiler.py.sha256` to the GitHub Release for that tag.
+- [x] README documents the download-and-verify flow: `curl -O <url>/dbprofiler.py`, `curl -O <url>/dbprofiler.py.sha256`, `sha256sum -c dbprofiler.py.sha256`.
+- [x] Optional: also publish a signed provenance attestation via GitHub's built-in `actions/attest-build-provenance` — cheap to add, meaningful for security reviewers.
+
+**Deviations and additions beyond the checklist**
+
+- **The download is byte-identical to the tag.** The obvious thing to do at release time
+  is stamp the version into `dbprofiler.py`, and that is exactly what this must not do:
+  the tool's value is that a reviewer reads the file before running it, which only holds
+  if the file they read and the file they ran are the same bytes. `VERSION` is committed
+  before the tag instead, and the workflow refuses to publish when
+  `v$(python dbprofiler.py --version)` disagrees with `GITHUB_REF_NAME`. A guard test
+  fails if any step could rewrite the script — `sed -i`, `tee`, `patch`, or a redirect
+  onto it, with a lookahead sparing the `> dbprofiler.py.sha256` that writes the checksum.
+- **The safety audit gates the release, not just CI.** A tag is the one moment the
+  boundary stops being reviewable by reading the repository, so `--check-safety` and the
+  unit suite run again before anything is uploaded, on Python 3.9 — the oldest version the
+  tool claims to support. A guard test asserts the ordering by line index, so moving the
+  publish step above the audit turns the unit suite red.
+- **11 guard tests over the workflow, written first and mutation-tested.** Trigger shape
+  (`v*` tags only, no `branches:`, no `workflow_dispatch:` back door), step ordering,
+  the tag/version gate, checksum generation and re-verification, both assets attached,
+  no rewriting step, provenance attested with the token permissions it needs,
+  `contents: read` by default and `contents: write` only on the publishing job, no
+  `secrets.` reference beyond `github.token`, every action pinned to a major version, and
+  the README documenting the filenames the workflow actually produces. Six mutations
+  tried — a `workflow_dispatch` back door, a version-stamping `sed -i`, dropping the
+  tag/version gate, unpinning the attest action to `@main`, publishing before the audit,
+  and widening the top-level permission to `contents: write` — each caught by the test
+  written for it and by no other.
+- **`--verify-tag` on `gh release create`.** Without it, `gh` will happily create the tag
+  it was asked to release, so a typo becomes a release pointing at whatever `main` was.
+- **`actions/attest-build-provenance@v4`.** v4 is a thin wrapper over `actions/attest`,
+  which upstream now recommends directly, but the wrapper remains the documented path for
+  build provenance and needs no predicate wiring.
+- **Two additions to the README.** `gh attestation verify` alongside the checksum — the
+  checksum proves the file survived the transfer, the attestation proves it came from this
+  repository's workflow — plus `shasum -a 256` for macOS, and a note that
+  `git show <tag>:dbprofiler.py | diff - dbprofiler.py` is empty. A `## Releasing` section
+  records the bump-then-tag ritual the version gate requires.
+- **Both workflow files were parsed before commit.** `ruff` and the unit suite do not read
+  YAML, and a syntax error in a workflow does not fail CI — it silently means the workflow
+  never runs, which for a release path would only be discovered at the tag.
 
 ### Task 14: Verification and uncommitted handoff
 

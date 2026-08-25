@@ -3195,5 +3195,99 @@ class TestIntegrationSuiteScope(unittest.TestCase):
         self.assertNotRegex(self.text, r"print\(")
 
 
+# --- release plumbing -------------------------------------------------------
+#
+# What a customer downloads is what a reviewer read. These tests exist to keep
+# that sentence true: the release workflow publishes the tagged file unmodified,
+# refuses to publish one that has not passed the safety audit, and refuses to
+# publish under a tag the file does not claim.
+
+RELEASE_WORKFLOW = REPO / ".github" / "workflows" / "release.yaml"
+SCRIPT_NAME = "dbprofiler.py"
+CHECKSUM_NAME = "dbprofiler.py.sha256"
+
+
+class TestReleaseWorkflow(unittest.TestCase):
+    def setUp(self):
+        self.text = RELEASE_WORKFLOW.read_text()
+        self.lines = self.text.splitlines()
+
+    def index_of(self, needle):
+        for number, line in enumerate(self.lines):
+            if needle in line:
+                return number
+        raise AssertionError(f"{needle!r} not found in {RELEASE_WORKFLOW.name}")
+
+    def test_it_triggers_on_version_tags_only(self):
+        self.assertRegex(self.text, r"tags:\s*\[\s*[\"']v\*[\"']\s*\]")
+        self.assertNotIn("branches:", self.text)
+        self.assertNotIn("workflow_dispatch", self.text)
+
+    def test_nothing_ships_before_the_safety_audit(self):
+        """A release is the one moment the boundary stops being reviewable by
+        reading the repository, so the audit gates it."""
+        self.assertLess(self.index_of("--check-safety"), self.index_of("gh release create"))
+        self.assertLess(self.index_of("unittest"), self.index_of("gh release create"))
+
+    def test_the_tag_must_agree_with_the_version_in_the_script(self):
+        """Publishing v1.2.0 from a file that reports 1.1.0 would put the wrong
+        tool_version in every manifest produced by that download."""
+        self.assertIn("--version", self.text)
+        self.assertIn("GITHUB_REF_NAME", self.text)
+        self.assertLess(
+            self.index_of("GITHUB_REF_NAME"), self.index_of("gh release create")
+        )
+
+    def test_the_checksum_is_taken_over_the_script_and_verified(self):
+        self.assertIn(f"sha256sum {SCRIPT_NAME} > {CHECKSUM_NAME}", self.text)
+        self.assertIn(f"sha256sum -c {CHECKSUM_NAME}", self.text)
+
+    def test_both_assets_are_uploaded(self):
+        publish = self.lines[self.index_of("gh release create"):]
+        uploaded = "\n".join(publish)
+        self.assertIn(SCRIPT_NAME, uploaded)
+        self.assertIn(CHECKSUM_NAME, uploaded)
+
+    def test_the_published_file_is_the_tagged_file(self):
+        """No step may rewrite the script on its way out. The download has to be
+        byte-identical to what is in the tag, or reading the repository tells a
+        reviewer nothing about what they ran."""
+        for rewrite in (r"sed\s+-i", r"tee\s+dbprofiler\.py", r"\bpatch\b", r"\bapply\b"):
+            self.assertNotRegex(self.text, rewrite)
+        # A redirect onto the script itself. The negative lookahead spares
+        # `> dbprofiler.py.sha256`, which is the checksum, not the script.
+        self.assertNotRegex(self.text, r">>?\s*dbprofiler\.py(?!\.)")
+
+    def test_provenance_is_attested(self):
+        self.assertIn("actions/attest-build-provenance@", self.text)
+        self.assertIn("id-token: write", self.text)
+        self.assertIn("attestations: write", self.text)
+
+    def test_write_permission_is_scoped_to_the_publishing_job(self):
+        """Default read-only at the top of the file, widened only where the
+        release is actually created."""
+        jobs = self.index_of("jobs:")
+        self.assertIn("contents: read", "\n".join(self.lines[:jobs]))
+        self.assertNotIn("contents: write", "\n".join(self.lines[:jobs]))
+        self.assertIn("contents: write", "\n".join(self.lines[jobs:]))
+
+    def test_it_uses_no_secret_beyond_the_workflow_token(self):
+        """A single-file tool needs no signing key and no registry credential.
+        Anything referencing secrets. here would be a new thing to trust."""
+        self.assertNotIn("secrets.", self.text)
+        self.assertIn("github.token", self.text)
+
+    def test_every_action_is_pinned_to_a_major_version(self):
+        for match in re.finditer(r"uses:\s*(\S+)", self.text):
+            with self.subTest(action=match.group(1)):
+                self.assertRegex(match.group(1), r"@v\d+$")
+
+    def test_the_readme_documents_the_flow_it_actually_publishes(self):
+        readme = (REPO / "README.md").read_text()
+        self.assertIn(f"releases/latest/download/{SCRIPT_NAME}", readme)
+        self.assertIn(f"releases/latest/download/{CHECKSUM_NAME}", readme)
+        self.assertIn(f"sha256sum -c {CHECKSUM_NAME}", readme)
+
+
 if __name__ == "__main__":
     unittest.main()
