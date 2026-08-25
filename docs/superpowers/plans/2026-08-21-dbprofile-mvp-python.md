@@ -518,10 +518,74 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write failing tests for: required entries present, sanitized CSVs (no raw literals), sorted safe entry paths, per-payload SHA-256 (excluding `manifest.json`) written into manifest, cleanup of temp ZIP on failure, atomic publication via `os.replace`, rejection of absolute paths / `..` / duplicates / symlinks / unexpected entries.
-- [ ] Put a unique raw secret into an in-memory observation before serialization; assert it appears in neither the temp file nor the final ZIP bytes.
-- [ ] Serialize only sanitized types. Hash uncompressed payload bytes. Serialize `manifest.json` last. Write to a temporary `.zip.tmp` file adjacent to destination; `close()`, `os.fsync()`, then `os.replace()`.
-- [ ] Run tests; expect PASS.
+- [x] Write failing tests for: required entries present, sanitized CSVs (no raw literals), sorted safe entry paths, per-payload SHA-256 (excluding `manifest.json`) written into manifest, cleanup of temp ZIP on failure, atomic publication via `os.replace`, rejection of absolute paths / `..` / duplicates / symlinks / unexpected entries.
+- [x] Put a unique raw secret into an in-memory observation before serialization; assert it appears in neither the temp file nor the final ZIP bytes.
+- [x] Serialize only sanitized types. Hash uncompressed payload bytes. Serialize `manifest.json` last. Write to a temporary `.zip.tmp` file adjacent to destination; `close()`, `os.fsync()`, then `os.replace()`.
+- [x] Run tests; expect PASS. → 317 tests, `--check-safety` OK, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **Serialization is by allowlist of contract types, not by structure.** The obvious
+  implementation is `dataclasses.asdict()`, and it would have been a hole: the collector
+  records holding raw most-common values (`ColumnStatistics`) and raw query text
+  (`StatementActivity`) are dataclasses too, so a structural walker serializes them
+  happily. `to_jsonable()` checks membership in `CONTRACT_TYPES` and raises otherwise, so
+  making a record serializable is a visible edit in one place. Mappings and `bytes` are
+  refused for the same reason. `allow_nan=False`, because `json.dumps` writes a bare
+  `NaN` by default and that is not JSON.
+- **Omission is keyed off the warning, not off an empty record set.** `pg_stat_tables.csv`
+  is dropped when `pg_stat_user_tables_unavailable` is present, not when the tuple is
+  empty. Otherwise a database that genuinely has no user tables is indistinguishable from
+  one whose role could not read the view — the first should ship an empty CSV, the second
+  should ship nothing and say why.
+- **The negative assertions search decompressed members, not just the stored bytes.** The
+  archive is DEFLATE-compressed, so `assertNotIn(planted, zip_bytes)` over the raw file
+  would pass while the literal sat inside the archive. `zip_bytes()` in the test file
+  returns the stored bytes *plus* every member decompressed, and the temporary file's
+  bytes are captured by wrapping `os.replace` so the pre-rename artifact is searched too.
+  Three literals are planted — an unnormalized query literal, a most-common value, and a
+  histogram bound — plus the tokenization key and every connection detail.
+- **The safety properties were mutation-tested.** Publishing raw query text, replacing the
+  type allowlist with a structural dataclass check, replacing `os.replace` with a
+  non-atomic copy, and dropping the temp-file cleanup were each applied in turn; every one
+  is caught by the suite. A negative assertion that cannot fail is decoration.
+- **`pg_stat_indexes.csv` gains `is_unique` and `is_primary`** from `CatalogIndex`, which
+  task 5 collected and nothing had consumed. `idx_scan == 0` marks a drop candidate, but
+  whether it *can* be dropped depends on whether it backs a constraint. Both facts were
+  already in hand; splitting them across two files would make every reader re-join them.
+- **`wal_bytes` is not in `pg_stat_statements.csv`.** The plan's column list named it, but
+  `SQL_STATEMENTS` does not select it, so it was never collected. The CSV carries what was
+  collected — including `stddev_exec_time`, `temp_blks_read` and `temp_blks_written`,
+  which the plan's list omitted.
+- **Query text is tokenized whole,** which costs the text's analytical value and leaves
+  `queryid` as the correlation handle. `pg_stat_statements` normalizes literals to `$1`
+  for most statements but not for utility statements or parser-folded constants, so there
+  is no subset of the text that is safe by construction, and a partial redaction would be
+  a guess dressed up as a guarantee.
+- **Entry paths are validated against one regex that rejects by construction.** Lowercase
+  ASCII segments, each starting with a letter or digit, slash-separated. That excludes
+  absolute paths, `..` and `.` segments, empty segments, backslashes, drive letters,
+  whitespace and control characters without a chain of special cases — and the allowlist
+  of the nine legal payload paths is checked on top of it.
+- **Symlink defence is applied at both ends.** Every `ZipInfo` gets an explicit
+  `S_IFREG | 0644` external attribute, since zipfile's default mode is zero and some
+  extractors then fall back to the umask; and `write_bundle` refuses a destination that is
+  a symlink or a non-regular file, rather than letting `os.replace` resolve it somewhere
+  unexpected.
+- **Archives are byte-reproducible.** Entry timestamps are fixed at the ZIP epoch and
+  entries are stored in sorted order with `manifest.json` last, so two runs over the same
+  input produce identical bytes and a bundle can be diffed.
+- **`except BaseException` around the write, not `except Exception`.** A `KeyboardInterrupt`
+  mid-archive otherwise leaves a half-written `.zip.tmp` beside the destination that looks
+  like a bundle.
+- **The containing directory is fsynced after the rename,** best-effort: opening a
+  directory is not portable, and failing a publication because a durability flush failed
+  would be worse than the durability gap.
+- **CSV formula injection is noted and not addressed.** A schema or table name beginning
+  with `=`, `+`, `-` or `@` is a live cell when a spreadsheet opens the CSV. Prefixing such
+  cells would desynchronize the CSVs from `profile.json`, which carries the same
+  identifiers unquoted, so the fix belongs to a decision about the whole contract rather
+  than to this task.
 
 ### Task 10: Orchestration and `postgres` subcommand
 

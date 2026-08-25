@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import datetime
 import decimal
 import hashlib
 import hmac
@@ -59,9 +60,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import uuid
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 VERSION = "dev"
@@ -120,6 +123,16 @@ class UnsupportedObject(DbprofilerError):
 
 class CommandError(DbprofilerError):
     """A psql or pg_dump invocation failed. Any stderr here is already redacted."""
+
+
+class BundleError(DbprofilerError):
+    """The bundle about to be written violates its own rules.
+
+    Raised for entry paths a ZIP extractor could resolve outside its target,
+    for values whose type is not part of the serialized contract, and for a
+    manifest that does not describe exactly the payloads beside it. Every one
+    of these is an internal invariant: if a user can trigger it, that is a bug.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -2188,7 +2201,487 @@ def build_profile(
 # ---------------------------------------------------------------------------
 # Bundle publication
 # ---------------------------------------------------------------------------
-# (task 9) write_bundle().
+# The only code in this file that writes to disk. Two properties matter, and
+# both are enforced here rather than trusted:
+#
+#   Nothing raw escapes. Serialization is by allowlist -- only the contract
+#   dataclasses become JSON, and every CSV is shaped from already-tokenized
+#   records. The collector records holding raw statistics values and raw query
+#   text are dataclasses too, so a structural serializer would have written
+#   them out; to_jsonable() refuses them by name.
+#
+#   Publication is all-or-nothing. The archive is built in a temporary file
+#   beside the destination, fsynced, and moved into place with os.replace().
+#   A crash or an error leaves either the previous bundle or nothing at all --
+#   never a truncated archive that looks complete.
+
+BUNDLE_MANIFEST = "manifest.json"
+BUNDLE_SCHEMA = "schema.sql"
+BUNDLE_PROFILE = "profile.json"
+
+OBSERVATION_TABLES = "observations/pg_class.csv"
+OBSERVATION_COLUMNS = "observations/pg_stats.csv"
+OBSERVATION_EXTENDED = "observations/pg_stats_ext.csv"
+OBSERVATION_FOREIGN_KEYS = "observations/foreign_keys.csv"
+OBSERVATION_INDEX_ACTIVITY = "observations/pg_stat_indexes.csv"
+OBSERVATION_TABLE_ACTIVITY = "observations/pg_stat_tables.csv"
+OBSERVATION_STATEMENTS = "observations/pg_stat_statements.csv"
+
+# Every path the bundle may contain, besides the manifest. An entry outside
+# this set is rejected rather than written: the bundle's contents are part of
+# the contract, and a reviewer should be able to read the whole list here.
+BUNDLE_PAYLOAD_PATHS = (
+    BUNDLE_PROFILE,
+    BUNDLE_SCHEMA,
+    OBSERVATION_FOREIGN_KEYS,
+    OBSERVATION_TABLES,
+    OBSERVATION_COLUMNS,
+    OBSERVATION_EXTENDED,
+    OBSERVATION_INDEX_ACTIVITY,
+    OBSERVATION_TABLE_ACTIVITY,
+    OBSERVATION_STATEMENTS,
+)
+
+BUNDLE_ALLOWED_PATHS = frozenset(BUNDLE_PAYLOAD_PATHS)
+
+# A section is omitted when the collector that feeds it degraded, and the
+# manifest warning says why. Omission is keyed off the warning rather than off
+# an empty record set so that "the role could not read this view" stays
+# distinguishable from "this database has no user tables".
+OMITTED_BY_WARNING = {
+    OBSERVATION_TABLE_ACTIVITY: ("pg_stat_user_tables_unavailable",),
+    OBSERVATION_INDEX_ACTIVITY: ("pg_stat_user_indexes_unavailable",),
+    OBSERVATION_STATEMENTS: (
+        "pg_stat_statements_missing",
+        "pg_stat_statements_unavailable",
+    ),
+}
+
+# Lowercase, slash-separated, each segment starting with a letter or digit.
+# This rejects, by construction: absolute paths, `..` and `.` segments, empty
+# segments, backslashes, drive letters, whitespace, control characters, and
+# anything non-ASCII. A ZIP extractor honours what the entry name says, so the
+# entry name is not allowed to say anything but "a file under here".
+SAFE_ENTRY_PATH = re.compile(r"[a-z0-9][a-z0-9_.-]*(?:/[a-z0-9][a-z0-9_.-]*)*\Z")
+
+# Fixed so two runs over the same input produce byte-identical archives, which
+# makes a bundle diffable and a hash reproducible. 1980-01-01 is the earliest
+# timestamp the ZIP format can represent.
+BUNDLE_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+
+# S_IFREG | 0644, set on every entry. Left to zipfile's default the mode is
+# zero, and some extractors then fall back to the umask; set explicitly, no
+# entry can carry a symlink, setuid, or executable bit for an extractor to act
+# on.
+BUNDLE_FILE_MODE = 0o100644
+BUNDLE_CREATE_SYSTEM = 3  # Unix, so the mode above is read as a unix mode.
+
+TEMP_SUFFIX = ".zip.tmp"
+
+# Tokens are hex and identifiers cannot contain it, so a pipe separates the
+# repeated values inside one CSV cell without needing an escape.
+CELL_SEPARATOR = "|"
+
+# pg_stat_statements is cluster-wide and its text is not attributable to one
+# column, so query text gets its own domain rather than a column's.
+STATEMENT_DOMAIN = token_domain("pg_stat_statements", "", "query")
+
+# The dataclasses that may be serialized. Everything else -- including the
+# collector records that hold raw most-common values and raw query text -- is
+# refused. See the section note above.
+CONTRACT_TYPES = (
+    Column,
+    FanOut,
+    Manifest,
+    Observation,
+    Profile,
+    ProfileWarning,
+    Relationship,
+    Source,
+    Table,
+)
+
+
+@dataclass(frozen=True)
+class BundleEntry:
+    """One payload file, fully serialized, before it is written."""
+
+    path: str
+    data: bytes
+    row_count: int = 0
+
+
+def require_safe_entry_path(path: str) -> None:
+    """Reject any entry name an extractor could resolve outside its target."""
+    if not SAFE_ENTRY_PATH.match(path):
+        raise BundleError(f"unsafe bundle entry path: {path!r}")
+
+
+# --- serialization ---------------------------------------------------------
+
+
+def to_jsonable(value):
+    """Convert a contract record to JSON-native types, refusing anything else.
+
+    Deliberately not dataclasses.asdict(): that walks any dataclass, and the
+    records holding raw values are dataclasses. Membership in CONTRACT_TYPES is
+    the check, so adding a serializable record is a visible edit here.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, CONTRACT_TYPES):
+        return {field.name: to_jsonable(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, (tuple, list)):
+        return [to_jsonable(item) for item in value]
+    raise BundleError(
+        f"refusing to serialize {type(value).__name__}: "
+        "only the contract types are written to the bundle"
+    )
+
+
+def json_bytes(record) -> bytes:
+    """Serialize a contract record. allow_nan is off: NaN is not JSON."""
+    text = json.dumps(to_jsonable(record), indent=2, ensure_ascii=False, allow_nan=False)
+    return (text + "\n").encode("utf-8")
+
+
+def cell(value) -> str:
+    """Render one CSV field. None is an absent measurement, not the string None."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def joined(values) -> str:
+    return CELL_SEPARATOR.join(cell(value) for value in values)
+
+
+def csv_entry(path: str, header, rows) -> BundleEntry:
+    """Shape one observation CSV. row_count excludes the header."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    count = 0
+    for row in rows:
+        writer.writerow([cell(value) for value in row])
+        count += 1
+    return BundleEntry(path=path, data=buffer.getvalue().encode("utf-8"), row_count=count)
+
+
+# --- observation shaping ---------------------------------------------------
+
+
+def observation_tables(profile: Profile) -> BundleEntry:
+    return csv_entry(
+        OBSERVATION_TABLES,
+        ("schema", "table", "row_count_estimate", "size_bytes", "column_count", "provenance"),
+        (
+            (table.schema, table.name, table.row_count_estimate, table.size_bytes,
+             len(table.columns), table.provenance)
+            for table in profile.tables
+        ),
+    )
+
+
+def observation_columns(profile: Profile) -> BundleEntry:
+    return csv_entry(
+        OBSERVATION_COLUMNS,
+        ("schema", "table", "column", "ordinal", "data_type", "is_nullable", "is_supported",
+         "null_fraction", "avg_width_bytes", "distinct_estimate", "most_common_tokens",
+         "most_common_freqs", "histogram_token_bounds", "provenance"),
+        (
+            (column.schema, column.table, column.name, column.ordinal, column.data_type,
+             column.is_nullable, column.is_supported, column.null_fraction,
+             column.avg_width_bytes, column.distinct_estimate,
+             joined(column.most_common_tokens), joined(column.most_common_freqs),
+             joined(column.histogram_token_bounds), column.provenance)
+            for table in profile.tables
+            for column in table.columns
+        ),
+    )
+
+
+def observation_extended_stats(catalog: CatalogObservations) -> BundleEntry:
+    """One row per column combination the source has a distinct estimate for.
+
+    Only the estimates are published. The extended most-common-value lists hold
+    literals, so the bundle records that they exist and nothing more.
+    """
+    return csv_entry(
+        OBSERVATION_EXTENDED,
+        ("schema", "table", "statistics_name", "declared_columns", "combination",
+         "distinct_estimate", "has_most_common_values"),
+        (
+            (statistic.schema, statistic.table, statistic.name, joined(statistic.columns),
+             joined(combination), estimate, statistic.has_most_common_values)
+            for statistic in catalog.extended_stats
+            for combination, estimate in sorted(statistic.n_distinct.items())
+        ),
+    )
+
+
+def observation_foreign_keys(profile: Profile) -> BundleEntry:
+    return csv_entry(
+        OBSERVATION_FOREIGN_KEYS,
+        ("constraint_name", "child_schema", "child_table", "child_columns", "parent_schema",
+         "parent_table", "parent_columns", "on_update", "on_delete", "fan_out_status",
+         "fan_out_basis", "fan_out_mean", "fan_out_p99"),
+        (
+            (rel.constraint_name, rel.child_schema, rel.child_table, joined(rel.child_columns),
+             rel.parent_schema, rel.parent_table, joined(rel.parent_columns),
+             rel.on_update, rel.on_delete,
+             rel.fan_out.status if rel.fan_out else None,
+             rel.fan_out.basis if rel.fan_out else None,
+             rel.fan_out.mean if rel.fan_out else None,
+             rel.fan_out.p99 if rel.fan_out else None)
+            for rel in profile.relationships
+        ),
+    )
+
+
+def observation_table_activity(workload: WorkloadObservations) -> BundleEntry:
+    return csv_entry(
+        OBSERVATION_TABLE_ACTIVITY,
+        tuple(field.name for field in fields(TableActivity)),
+        (
+            tuple(getattr(activity, field.name) for field in fields(TableActivity))
+            for activity in workload.table_activity
+        ),
+    )
+
+
+def observation_index_activity(
+    workload: WorkloadObservations, catalog: CatalogObservations
+) -> BundleEntry:
+    """Index usage, joined with the catalog for uniqueness.
+
+    idx_scan == 0 marks an index as a drop candidate, but whether it can be
+    dropped depends on whether it backs a constraint, and only the catalog
+    knows that. Both facts are already collected; separating them across two
+    files would make every reader join them again.
+    """
+    described = {(index.schema, index.table, index.name): index for index in catalog.indexes}
+    rows = []
+    for activity in workload.index_activity:
+        index = described.get((activity.schema, activity.table, activity.index))
+        rows.append(
+            (activity.schema, activity.table, activity.index, activity.idx_scan,
+             activity.idx_tup_read, activity.idx_tup_fetch, activity.size_bytes,
+             index.is_unique if index else None,
+             index.is_primary if index else None)
+        )
+    return csv_entry(
+        OBSERVATION_INDEX_ACTIVITY,
+        ("schema", "table", "index", "idx_scan", "idx_tup_read", "idx_tup_fetch", "size_bytes",
+         "is_unique", "is_primary"),
+        rows,
+    )
+
+
+def observation_statements(
+    workload: WorkloadObservations, tokenizer: Tokenizer
+) -> BundleEntry:
+    """Statement counters, with the query text replaced by a token.
+
+    pg_stat_statements normally normalizes literals to $1 placeholders, but not
+    for utility statements and not for constants the parser folds, so the text
+    cannot be published. The token still separates one statement's counters
+    from another's, and queryid remains for correlating with the source server.
+    """
+    return csv_entry(
+        OBSERVATION_STATEMENTS,
+        ("queryid", "query_token", "calls", "rows", "total_exec_time", "mean_exec_time",
+         "stddev_exec_time", "shared_blks_hit", "shared_blks_read", "shared_blks_dirtied",
+         "shared_blks_written", "temp_blks_read", "temp_blks_written"),
+        (
+            (statement.queryid,
+             tokenizer.token(statement.query_text, STATEMENT_DOMAIN),
+             statement.calls, statement.rows, statement.total_exec_time,
+             statement.mean_exec_time, statement.stddev_exec_time, statement.shared_blks_hit,
+             statement.shared_blks_read, statement.shared_blks_dirtied,
+             statement.shared_blks_written, statement.temp_blks_read,
+             statement.temp_blks_written)
+            for statement in workload.statements
+        ),
+    )
+
+
+def build_payloads(
+    profile: Profile,
+    catalog: CatalogObservations,
+    workload: WorkloadObservations,
+    tokenizer: Tokenizer,
+    schema_sql: str,
+) -> tuple[BundleEntry, ...]:
+    """Serialize everything collected, dropping the sections that degraded."""
+    entries = [
+        BundleEntry(BUNDLE_SCHEMA, schema_sql.encode("utf-8"), schema_sql.count("\n")),
+        BundleEntry(BUNDLE_PROFILE, json_bytes(profile), len(profile.tables)),
+        observation_tables(profile),
+        observation_columns(profile),
+        observation_extended_stats(catalog),
+        observation_foreign_keys(profile),
+        observation_table_activity(workload),
+        observation_index_activity(workload, catalog),
+        observation_statements(workload, tokenizer),
+    ]
+    reported = {warning.code for warning in workload.warnings}
+    kept = [
+        entry
+        for entry in entries
+        if not reported.intersection(OMITTED_BY_WARNING.get(entry.path, ()))
+    ]
+    return tuple(sorted(kept, key=lambda entry: entry.path))
+
+
+# --- manifest --------------------------------------------------------------
+
+
+def utc_now() -> str:
+    """Now, as RFC 3339 in UTC. Whole seconds: nothing here needs finer."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    return stamp.isoformat().replace("+00:00", "Z")
+
+
+def describe_payloads(payloads) -> tuple[Observation, ...]:
+    """Hash the uncompressed payload bytes -- what a reader gets after extraction."""
+    return tuple(
+        Observation(
+            path=entry.path,
+            sha256=hashlib.sha256(entry.data).hexdigest(),
+            row_count=entry.row_count,
+        )
+        for entry in sorted(payloads, key=lambda entry: entry.path)
+    )
+
+
+def build_manifest(
+    source: Source,
+    schema_fingerprint: str,
+    payloads,
+    warnings=(),
+    stats_reset: str | None = None,
+    created_at: str | None = None,
+) -> Manifest:
+    return Manifest(
+        tool=PROG,
+        tool_version=VERSION,
+        contract_version=CONTRACT_VERSION,
+        created_at=created_at or utc_now(),
+        source=source,
+        schema_fingerprint=schema_fingerprint,
+        payloads=describe_payloads(payloads),
+        warnings=tuple(warnings),
+        stats_reset=stats_reset,
+    )
+
+
+# --- publication -----------------------------------------------------------
+
+
+def validate_payloads(payloads, manifest: Manifest) -> tuple[BundleEntry, ...]:
+    """Check every rule the archive must satisfy before a byte is written."""
+    entries = tuple(sorted(payloads, key=lambda entry: entry.path))
+    seen: set[str] = set()
+    for entry in entries:
+        require_safe_entry_path(entry.path)
+        if entry.path == BUNDLE_MANIFEST:
+            raise BundleError(
+                "manifest.json is written by write_bundle, not supplied as a payload"
+            )
+        if entry.path not in BUNDLE_ALLOWED_PATHS:
+            raise BundleError(f"unexpected bundle entry: {entry.path!r}")
+        if entry.path in seen:
+            raise BundleError(f"duplicate bundle entry: {entry.path!r}")
+        seen.add(entry.path)
+
+    described = {observation.path: observation for observation in manifest.payloads}
+    if set(described) != seen:
+        raise BundleError("the manifest does not describe exactly the payloads being written")
+    for entry in entries:
+        if described[entry.path].sha256 != hashlib.sha256(entry.data).hexdigest():
+            raise BundleError(f"manifest hash does not match payload {entry.path!r}")
+    return entries
+
+
+def require_publishable_destination(destination: Path) -> None:
+    """Refuse to publish anywhere os.replace would surprise the operator."""
+    if destination.is_symlink():
+        raise BundleError(f"refusing to publish through a symlink: {destination}")
+    if destination.exists() and not destination.is_file():
+        raise BundleError(f"destination exists and is not a regular file: {destination}")
+
+
+def write_entry(archive: zipfile.ZipFile, path: str, data: bytes) -> None:
+    info = zipfile.ZipInfo(filename=path, date_time=BUNDLE_TIMESTAMP)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = BUNDLE_CREATE_SYSTEM
+    info.external_attr = BUNDLE_FILE_MODE << 16
+    archive.writestr(info, data)
+
+
+def sync_directory(path: Path) -> None:
+    """Flush the rename itself, so a crash cannot lose a bundle we reported.
+
+    Best effort: not every platform or filesystem allows opening a directory,
+    and failing to publish because the durability flush failed would be worse
+    than the durability gap.
+    """
+    try:
+        handle = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
+
+
+def write_bundle(destination, payloads, manifest: Manifest) -> Path:
+    """Publish the bundle atomically. Returns the destination.
+
+    The manifest is serialized and stored last, after the payloads it hashes.
+    Nothing appears at the destination until the whole archive is on disk and
+    fsynced; any failure removes the temporary file and leaves whatever was
+    there before untouched.
+    """
+    entries = validate_payloads(payloads, manifest)
+    destination = Path(destination)
+    require_publishable_destination(destination)
+
+    parent = destination.parent if str(destination.parent) else Path(".")
+    parent.mkdir(parents=True, exist_ok=True)
+    # delete=False because the file is closed before os.replace moves it; the
+    # except below is what removes it if anything goes wrong. A unique name
+    # rather than a fixed one so two concurrent runs cannot clobber each other.
+    handle = tempfile.NamedTemporaryFile(
+        dir=str(parent), prefix=destination.name + ".", suffix=TEMP_SUFFIX, delete=False
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
+                for entry in entries:
+                    write_entry(archive, entry.path, entry.data)
+                write_entry(archive, BUNDLE_MANIFEST, json_bytes(manifest))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(destination))
+    except BaseException:
+        # Including KeyboardInterrupt: a half-written archive beside the
+        # destination is litter that looks like a bundle.
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+    sync_directory(parent)
+    return destination
 
 
 # ---------------------------------------------------------------------------
