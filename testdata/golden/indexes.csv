@@ -1,0 +1,4 @@
+public,users,users_pkey,t,t
+public,orders,orders_pkey,t,t
+public,orders,orders_user_id_idx,f,f
+sales,invoices,invoices_pkey,t,t

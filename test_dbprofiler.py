@@ -905,6 +905,271 @@ class TestCollectSchema(unittest.TestCase):
         self.assertIn("sales", dump_argv)
 
 
+GOLDEN = Path(__file__).parent / "testdata" / "golden"
+
+
+def golden(name):
+    """Read a recorded psql --csv -t fixture."""
+    return (GOLDEN / f"{name}.csv").read_text(encoding="utf-8")
+
+
+# The order collect_catalog issues its queries in. Tables and inheritance come
+# first so an unsupported layout fails before anything else is read.
+CATALOG_FIXTURES = (
+    "tables",
+    "inherited",
+    "columns",
+    "column_stats",
+    "extended_stats",
+    "foreign_keys",
+    "indexes",
+)
+
+
+def catalog_calls(**overrides):
+    """A subprocess.run side_effect list covering one collect_catalog() run."""
+    return [
+        completed(stdout=overrides.get(name, golden(name))) for name in CATALOG_FIXTURES
+    ]
+
+
+class TestCatalogSql(unittest.TestCase):
+    def test_every_catalog_query_passes_the_safety_audit(self):
+        for name, sql in dbprofiler.iter_sql_constants():
+            with self.subTest(name=name):
+                self.assertEqual(dbprofiler.audit_sql(sql), [])
+
+    def test_the_collectors_declare_their_sql_as_constants(self):
+        for name in (
+            "SQL_TABLES",
+            "SQL_COLUMNS",
+            "SQL_COLUMN_STATS",
+            "SQL_EXTENDED_STATS",
+            "SQL_FOREIGN_KEYS",
+            "SQL_INDEXES",
+            "SQL_INHERITED",
+        ):
+            with self.subTest(name=name):
+                self.assertIsInstance(getattr(dbprofiler, name), str)
+
+    def test_pg_inherits_is_on_the_allowlist(self):
+        # Added in the same change as the collector that reads it.
+        self.assertIn("pg_inherits", dbprofiler.ALLOWED_RELATIONS)
+
+    def test_no_catalog_query_counts_rows(self):
+        for name, sql in dbprofiler.iter_sql_constants():
+            with self.subTest(name=name):
+                self.assertNotIn("count(", sql.lower())
+
+
+class TestCollectCatalog(unittest.TestCase):
+    def collect(self, **overrides):
+        with mock.patch("subprocess.run", side_effect=catalog_calls(**overrides)):
+            return dbprofiler.collect_catalog(a_config())
+
+    def test_tables_carry_estimates_never_counts(self):
+        catalog = self.collect()
+        users = next(t for t in catalog.tables if t.name == "users")
+        self.assertEqual(users.schema, "public")
+        self.assertEqual(users.reltuples, 1000.0)
+        self.assertEqual(users.size_bytes, 163840)
+
+    def test_all_three_tables_are_collected(self):
+        catalog = self.collect()
+        self.assertEqual(
+            sorted((t.schema, t.name) for t in catalog.tables),
+            [("public", "orders"), ("public", "users"), ("sales", "invoices")],
+        )
+
+    def test_columns_carry_ordinal_type_and_nullability(self):
+        catalog = self.collect()
+        email = next(c for c in catalog.columns if c.name == "email")
+        self.assertEqual(email.ordinal, 2)
+        self.assertEqual(email.data_type, "text")
+        self.assertTrue(email.is_nullable)
+        ident = next(c for c in catalog.columns if c.table == "users" and c.name == "id")
+        self.assertFalse(ident.is_nullable)
+
+    def test_supported_and_unsupported_types_are_classified(self):
+        catalog = self.collect()
+        by_name = {(c.table, c.name): c for c in catalog.columns}
+        self.assertTrue(by_name[("users", "id")].is_supported)
+        self.assertTrue(by_name[("users", "profile")].is_supported)  # jsonb
+        self.assertTrue(by_name[("users", "tags")].is_supported)  # text[]
+        self.assertTrue(by_name[("invoices", "region")].is_supported)  # enum
+        self.assertFalse(by_name[("users", "legacy_balance")].is_supported)  # money
+
+    def test_column_statistics_are_kept_separate_from_columns(self):
+        """Statistics carry raw values. They stay in their own records so the
+        tokenization step in task 7 has one place to look."""
+        catalog = self.collect()
+        stat = next(
+            s for s in catalog.column_stats if s.table == "orders" and s.column == "user_id"
+        )
+        self.assertEqual(stat.null_frac, 0.0)
+        self.assertEqual(stat.avg_width, 8)
+        self.assertEqual(stat.n_distinct, 500.0)
+        self.assertEqual(stat.most_common_vals, ("1", "2", "3"))
+        self.assertEqual(stat.most_common_freqs, (0.1, 0.05, 0.02))
+
+    def test_a_negative_n_distinct_is_carried_through_unresolved(self):
+        # PostgreSQL encodes "fraction of rows" as a negative. Resolving it needs
+        # the row count, which is normalization's job, not collection's.
+        catalog = self.collect()
+        stat = next(s for s in catalog.column_stats if s.table == "users" and s.column == "id")
+        self.assertEqual(stat.n_distinct, -1.0)
+
+    def test_histogram_bounds_are_parsed_into_a_tuple(self):
+        catalog = self.collect()
+        stat = next(s for s in catalog.column_stats if s.table == "users" and s.column == "id")
+        self.assertEqual(stat.histogram_bounds, ("1", "250", "500", "750", "1000"))
+
+    def test_absent_statistics_are_empty_not_none(self):
+        catalog = self.collect()
+        stat = next(s for s in catalog.column_stats if s.table == "users" and s.column == "id")
+        self.assertEqual(stat.most_common_vals, ())
+        self.assertEqual(stat.most_common_freqs, ())
+
+    def test_foreign_key_columns_keep_declaration_order(self):
+        catalog = self.collect()
+        fk = next(f for f in catalog.foreign_keys if f.constraint_name == "orders_user_id_fkey")
+        self.assertEqual(fk.child_schema, "public")
+        self.assertEqual(fk.child_table, "orders")
+        self.assertEqual(fk.child_columns, ("user_id",))
+        self.assertEqual(fk.parent_table, "users")
+        self.assertEqual(fk.parent_columns, ("id",))
+
+    def test_referential_actions_are_decoded_from_their_catalog_codes(self):
+        catalog = self.collect()
+        fk = next(f for f in catalog.foreign_keys if f.constraint_name == "orders_user_id_fkey")
+        self.assertEqual(fk.on_update, "NO ACTION")
+        self.assertEqual(fk.on_delete, "CASCADE")
+
+    def test_a_composite_foreign_key_is_assembled_from_its_rows(self):
+        rows = (
+            "orders_composite_fkey,public,orders,public,users,tenant_id,tenant_id,1,a,a\n"
+            "orders_composite_fkey,public,orders,public,users,user_id,id,2,a,a\n"
+        )
+        catalog = self.collect(foreign_keys=rows)
+        fk = catalog.foreign_keys[0]
+        self.assertEqual(fk.child_columns, ("tenant_id", "user_id"))
+        self.assertEqual(fk.parent_columns, ("tenant_id", "id"))
+
+    def test_composite_key_column_order_follows_the_ordinal_not_the_row_order(self):
+        rows = (
+            "orders_composite_fkey,public,orders,public,users,user_id,id,2,a,a\n"
+            "orders_composite_fkey,public,orders,public,users,tenant_id,tenant_id,1,a,a\n"
+        )
+        catalog = self.collect(foreign_keys=rows)
+        self.assertEqual(catalog.foreign_keys[0].child_columns, ("tenant_id", "user_id"))
+
+    def test_extended_statistics_are_collected_with_their_column_set(self):
+        catalog = self.collect()
+        ext = catalog.extended_stats[0]
+        self.assertEqual(ext.table, "orders")
+        self.assertEqual(ext.columns, ("user_id", "placed_at"))
+        self.assertEqual(ext.n_distinct, {("user_id", "placed_at"): 4200.0})
+
+    def test_extended_mcv_presence_is_recorded_but_values_are_not(self):
+        """Extended MCV values are raw customer data. Only their existence is
+        useful for planning, so only their existence is read."""
+        catalog = self.collect()
+        self.assertTrue(catalog.extended_stats[0].has_most_common_values)
+        self.assertNotIn("most_common_vals", dbprofiler.SQL_EXTENDED_STATS.split("FROM")[0])
+
+    def test_indexes_are_collected_with_uniqueness_and_primary_flags(self):
+        catalog = self.collect()
+        pkey = next(i for i in catalog.indexes if i.name == "users_pkey")
+        self.assertTrue(pkey.is_unique)
+        self.assertTrue(pkey.is_primary)
+        plain = next(i for i in catalog.indexes if i.name == "orders_user_id_idx")
+        self.assertFalse(plain.is_unique)
+
+    def test_the_query_order_puts_the_layout_check_first(self):
+        with mock.patch("subprocess.run", side_effect=catalog_calls()) as run:
+            dbprofiler.collect_catalog(a_config())
+        issued = [call.args[0][-1] for call in run.call_args_list]
+        self.assertEqual(issued[0], dbprofiler.SQL_TABLES)
+        self.assertEqual(issued[1], dbprofiler.SQL_INHERITED)
+
+    def test_scope_filters_apply_to_every_collected_relation(self):
+        with mock.patch("subprocess.run", side_effect=catalog_calls()):
+            catalog = dbprofiler.collect_catalog(a_config(schema_include=["public"]))
+        self.assertNotIn("sales", {t.schema for t in catalog.tables})
+        self.assertNotIn("sales", {c.schema for c in catalog.columns})
+        self.assertNotIn("sales", {f.child_schema for f in catalog.foreign_keys})
+        self.assertNotIn("sales", {i.schema for i in catalog.indexes})
+
+
+class TestUnsupportedLayouts(unittest.TestCase):
+    """Partitioning and inheritance change row-count and fan-out arithmetic in
+    ways the MVP does not model. Failing loudly beats publishing a wrong number."""
+
+    def test_a_partitioned_table_is_rejected(self):
+        rows = "public,events,p,0,0\n"
+        with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
+            with self.assertRaises(dbprofiler.UnsupportedObject) as raised:
+                dbprofiler.collect_catalog(a_config())
+        self.assertIn("events", str(raised.exception))
+
+    def test_a_partitioned_index_relkind_is_rejected(self):
+        rows = "public,events,I,0,0\n"
+        with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
+            with self.assertRaises(dbprofiler.UnsupportedObject):
+                dbprofiler.collect_catalog(a_config())
+
+    def test_an_inheritance_child_is_rejected(self):
+        with mock.patch(
+            "subprocess.run", side_effect=catalog_calls(inherited="public,users_2026,\n")
+        ):
+            with self.assertRaises(dbprofiler.UnsupportedObject) as raised:
+                dbprofiler.collect_catalog(a_config())
+        self.assertIn("users_2026", str(raised.exception))
+
+    def test_the_check_happens_before_the_remaining_queries_run(self):
+        rows = "public,events,p,0,0\n"
+        calls = catalog_calls(tables=rows)
+        with mock.patch("subprocess.run", side_effect=calls) as run:
+            with self.assertRaises(dbprofiler.UnsupportedObject):
+                dbprofiler.collect_catalog(a_config())
+        self.assertEqual(run.call_count, 2)
+
+    def test_an_out_of_scope_partitioned_table_does_not_fail_the_run(self):
+        rows = golden("tables") + "archive,events,p,0,0\n"
+        with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
+            catalog = dbprofiler.collect_catalog(a_config(schema_exclude=["archive"]))
+        self.assertEqual(len(catalog.tables), 3)
+
+
+class TestSupportedTypes(unittest.TestCase):
+    def test_core_scalar_types_are_supported(self):
+        for typname in ("int8", "text", "numeric", "timestamptz", "uuid", "bool", "jsonb"):
+            with self.subTest(typname=typname):
+                self.assertTrue(dbprofiler.is_supported_type(typname, "b", "N"))
+
+    def test_types_without_a_cockroachdb_equivalent_are_not(self):
+        for typname in ("money", "xml", "tsvector", "macaddr", "cidr", "point"):
+            with self.subTest(typname=typname):
+                self.assertFalse(dbprofiler.is_supported_type(typname, "b", "N"))
+
+    def test_an_array_is_supported_when_its_element_type_is(self):
+        self.assertTrue(dbprofiler.is_supported_type("_text", "b", "A"))
+        self.assertFalse(dbprofiler.is_supported_type("_money", "b", "A"))
+
+    def test_enums_are_supported(self):
+        self.assertTrue(dbprofiler.is_supported_type("region_code", "e", "E"))
+
+    def test_composite_domain_and_range_types_are_not(self):
+        for typtype in ("c", "d", "r", "m"):
+            with self.subTest(typtype=typtype):
+                self.assertFalse(dbprofiler.is_supported_type("custom", typtype, "U"))
+
+    def test_an_unknown_type_defaults_to_unsupported(self):
+        """A migration planner is better served by a false negative than by a
+        silent claim of compatibility."""
+        self.assertFalse(dbprofiler.is_supported_type("some_extension_type", "b", "U"))
+
+
 class TestCLI(unittest.TestCase):
     def test_no_subcommand_prints_help_and_returns_two(self):
         stderr = io.StringIO()
