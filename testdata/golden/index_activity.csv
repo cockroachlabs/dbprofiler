@@ -1,0 +1,4 @@
+public,users,users_pkey,4500,4500,4500,32768
+public,orders,orders_pkey,60000,60000,60000,1130496
+public,orders,orders_user_id_idx,38000,410000,405000,901120
+sales,invoices,invoices_pkey,120,120,120,16384
