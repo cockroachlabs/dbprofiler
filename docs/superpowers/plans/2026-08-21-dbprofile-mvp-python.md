@@ -849,14 +849,60 @@ satisfied while still testing the parser.
 
 ### Task 14: Verification and uncommitted handoff
 
-- [ ] Run `python -m unittest -v` (unit tests).
-- [ ] Run `python3 dbprofiler.py --check-safety`; expect exit 0.
-- [ ] Run `python3 dbprofiler.py --version`.
-- [ ] Bring up Docker PG 16; run `python -m unittest -v integration_test` against it; expect PASS.
-- [ ] Optional: `ruff check` / `mypy --strict dbprofiler.py` if adopted.
-- [ ] Run `git diff --check`, inspect status, and search tracked changes for credentials, URLs, debug prints, forbidden SQL tokens, and stray `print(env)` calls.
-- [ ] Confirm `.env.test.local` is ignored and absent from diffs, logs, ZIPs, and reports.
-- [ ] Report exact results, bundle contents, PostgreSQL 16 target, deferred features, and uncommitted files. Do not claim success if a required check fails.
+- [x] Run `python -m unittest -v` (unit tests).
+- [x] Run `python3 dbprofiler.py --check-safety`; expect exit 0.
+- [x] Run `python3 dbprofiler.py --version`.
+- [x] Bring up Docker PG 16; run `python -m unittest -v integration_test` against it; expect PASS.
+- [x] Optional: `ruff check` / `mypy --strict dbprofiler.py` if adopted.
+- [x] Run `git diff --check`, inspect status, and search tracked changes for credentials, URLs, debug prints, forbidden SQL tokens, and stray `print(env)` calls.
+- [x] Confirm `.env.test.local` is ignored and absent from diffs, logs, ZIPs, and reports.
+- [x] Report exact results, bundle contents, PostgreSQL 16 target, deferred features, and uncommitted files. Do not claim success if a required check fails.
+
+**Results**
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest` | 382 tests, OK |
+| `python3.9 -m unittest` | 382 tests, OK — oldest supported interpreter |
+| `python3 dbprofiler.py --check-safety` | OK, 14 SQL constants checked, exit 0 |
+| `python3 dbprofiler.py --version` | `dev` |
+| `python3 -m unittest integration_test` | 50 tests, OK, against PostgreSQL 16.15 in Docker |
+| `ruff check` | All checks passed |
+| `git diff --check` | clean, exit 0 |
+| working tree | clean; nothing uncommitted, nothing untracked |
+
+An end-to-end run against the live server published a bundle with all ten members —
+`manifest.json` last, nine payloads hashed in it, zero warnings, `stats_reset` recorded.
+
+**Deviations and additions beyond the checklist**
+
+- **`mypy --strict` is not clean, and mypy is not adopted.** The checklist gates it on
+  "if adopted", and it is not: it appears in no CI workflow, no config file, and no
+  pre-commit list. Run anyway for the record, it reports 51 errors — 27 `no-untyped-def`
+  and 10 `no-untyped-call` on internal helpers, 8 `type-arg`, and six others. All six were
+  read; none is a defect. `violations = []` needs an annotation mypy cannot infer;
+  `sum(1 for _ in ...)` trips mypy's `bool` overload of `sum`; and
+  `env = os.environ if env is None else env` widens to `_Environ[str]`, which
+  `Mapping[str, str]` would have described better than `dict[str, str] | None`. Annotating
+  the file to satisfy `--strict` is a real improvement and a real diff across a file whose
+  reviewability is the product, so it is left for a change that is about that and nothing
+  else.
+- **The credential sweep was run against the bundle bytes, not just the source.** Every
+  assignment in `.env.test.local` was searched for in the published ZIP's stored bytes,
+  in each member decompressed, and in captured stderr. Host, port, user, password, the
+  connection URL, and the token key are all absent from all three. `source.database` in
+  `manifest.json` and `profile.json` does hold the database name — that is the bundle
+  identifying what it profiled, alongside `schema.sql`, and is not a credential.
+- **`--version` reports `dev`.** Deliberate: the release workflow refuses to publish
+  unless the tag equals `v$(dbprofiler.py --version)`, so `dev` means no tag can ship
+  until someone bumps `VERSION` on purpose. The first real release is a `VERSION` commit
+  followed by a tag, not a tag alone.
+- **The handoff bundle was taken from an empty database.** The integration fixtures are
+  created and dropped inside `integration_test.py`, so the standalone run profiled a
+  server with no user tables: it proves bundle structure, manifest hashing, atomic
+  publication, and the absence of credentials, while the 50 integration tests are what
+  prove content — table shape, FK fan-out, extended statistics, tokenization, and Tier 1
+  telemetry against a seeded schema.
 
 ## Completion criteria
 
