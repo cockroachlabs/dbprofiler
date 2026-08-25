@@ -651,12 +651,65 @@ satisfied while still testing the parser.
 
 **Files:** `docker-compose.postgres-test.yml`, local `.env.test.local`, `docs/TESTING.md`.
 
-- [ ] Ignore `.env.test.local` before creating it; verify `git check-ignore .env.test.local` exits 0.
-- [ ] Define `postgres:16` service with named volume, localhost-only configured port, health check, `shared_preload_libraries=pg_stat_statements`. User/database/password/port fields must be `${...}` substitutions from `.env.test.local`; Compose contains no literal credentials or URL.
-- [ ] Create local `.env.test.local` with Compose variables, `DBPROFILER_POSTGRES_URL`, `DBPROFILER_POSTGRES_TEST_URL`, and `DBPROFILER_TOKEN_KEY`. Never display or commit it.
-- [ ] Start with `docker compose --env-file .env.test.local -f docker-compose.postgres-test.yml up -d --wait`; verify health without echoing env values.
-- [ ] Post-start SQL: `CREATE EXTENSION pg_stat_statements;` in the target database.
-- [ ] Document safe start, stop, reset, and test commands. Do not add a committed example env file containing a URL.
+- [x] Ignore `.env.test.local` before creating it; verify `git check-ignore .env.test.local` exits 0.
+- [x] Define `postgres:16` service with named volume, localhost-only configured port, health check, `shared_preload_libraries=pg_stat_statements`. User/database/password/port fields must be `${...}` substitutions from `.env.test.local`; Compose contains no literal credentials or URL.
+- [x] Create local `.env.test.local` with Compose variables, `DBPROFILER_POSTGRES_URL`, `DBPROFILER_POSTGRES_TEST_URL`, and `DBPROFILER_TOKEN_KEY`. Never display or commit it.
+- [x] Start with `docker compose --env-file .env.test.local -f docker-compose.postgres-test.yml up -d --wait`; verify health without echoing env values.
+- [x] Post-start SQL: `CREATE EXTENSION pg_stat_statements;` in the target database.
+- [x] Document safe start, stop, reset, and test commands. Do not add a committed example env file containing a URL.
+
+**Deviations and additions beyond the checklist**
+
+- **The environment file is checked by the unit suite, not just by hand.** A committed
+  Compose file that quietly grew a default password would be the kind of thing nobody
+  notices in review, so `TestComposeSecrecy` asserts the properties directly: no `://`
+  anywhere in the Compose file, no `DBPROFILER_TOKEN_KEY`, every credential field a bare
+  `${...}`, every published port prefixed `127.0.0.1:`, `shared_preload_libraries`
+  present, `.env.test.local` gitignored, no tracked file whose name starts with `.env`,
+  and no credentialed URL in `docs/TESTING.md`. Each of those was mutation-tested:
+  rebinding to `0.0.0.0`, hardcoding a password, dropping the preload, and pasting a URL
+  into a comment all turn the suite red.
+- **Substitutions use `${VAR:?message}`, never `${VAR:-default}`,** and a test enforces
+  it. A default value means a typo in the env file starts a server with credentials
+  nobody chose, and the failure then surfaces somewhere less obvious than the point of
+  the mistake.
+- **`CREATE EXTENSION` moved into `testdata/postgres-test-init.sql`,** mounted read-only
+  at `/docker-entrypoint-initdb.d/`, rather than being a documented manual step after
+  start. A manual post-start step is one a tired person skips, and the resulting failure
+  looks like a profiler bug — the tool degrades gracefully when `pg_stat_statements` is
+  absent, so the integration test would silently exercise the degraded path instead of
+  the one it means to cover. The tradeoff is that the script only runs against an empty
+  volume, which is why `docs/TESTING.md` gives `down -v` its own section.
+- **Found and fixed a real bug in `probe_pg_dump_major`.** The first run against the live
+  container failed at `pg_dump exited with status 1`. `PG_DUMP_ARGS` was being spliced in
+  ahead of `--version`, producing `pg_dump -w --version` — and pg_dump handles
+  `--version` by comparing `argv[1]` before getopt runs, with no entry for it in the
+  long-option table. Anything ahead of it, even a harmless `-w`, makes it an unrecognized
+  option and pg_dump exits 1 with nothing but a "try --help" hint. The unit test had
+  asserted the wrong argv and the fake matched on `"--version" in argv`, so neither
+  noticed. Now `[pg_dump, "--version"]` exactly, with both tests corrected. This is the
+  bug the Docker environment exists to catch, arriving before the integration suite that
+  was meant to catch it.
+- **Every Compose subcommand needs `--env-file`, not just `up`.** Interpolation runs for
+  `ps`, `exec`, and `down` too, and `${VAR:?}` turns a missing one into an error rather
+  than a silent empty value. `docs/TESTING.md` defines a `pgtest` alias so it is not
+  something the reader has to remember five times.
+- **Health verified without echoing a value.** `pgtest exec` runs `psql -U "$POSTGRES_USER"`
+  with the expansion performed by the shell inside the container, against the environment
+  the server already has, so no credential enters shell history or a host process's
+  command line. The documented check is the one that was actually run.
+- **Verified end to end by hand before writing the integration suite.** Against the live
+  container the tool produced a bundle with all nine entries, no warnings, `server_version_num`
+  160015, and a captured `stats_reset`. Confirmed the host listener is `127.0.0.1.55432`
+  only — a connection to the machine's LAN address is refused. Runtime was Podman 5.8.1
+  behind a `docker` CLI shim with `podman-compose`; the Compose file uses no
+  Docker-specific extension, and `docs/TESTING.md` says so rather than assuming Docker
+  Desktop.
+- **Considered and rejected: a committed `.env.test.example`.** It is the conventional
+  thing to add, and it is where a real connection string eventually gets pasted — at
+  which point no reviewer reading the diff can tell that the value in it was supposed to
+  be fake. `docs/TESTING.md` lists the variable names in a table instead, and a test
+  fails if any `.env*` file becomes tracked.
 
 ### Task 12: End-to-end integration test
 
