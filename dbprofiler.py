@@ -49,7 +49,9 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import decimal
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -57,6 +59,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1707,7 +1710,163 @@ def dedupe_statements(rows) -> tuple[StatementActivity, ...]:
 # ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
-# (task 7) tokenize(value, domain).
+# Catalog statistics embed literal customer values: pg_stats most-common values
+# and histogram bounds are actual rows. Every one of them is replaced by an
+# HMAC-SHA-256 token before anything is written.
+#
+# The property that has to survive is equality within a domain. A foreign key is
+# only visible in the profile if the same value on the child and the parent
+# tokenizes identically, and skew is only visible if a hot value stays a single
+# distinct token. Everything below exists to preserve that equality and nothing
+# more: no ordering, no length, no prefix.
+
+# Shorter than this and the tokens are reversible by brute force over a small
+# value space -- a hundred-row lookup table falls in seconds. There is
+# deliberately no default: one would tokenize every deployment identically,
+# which is the same as not tokenizing at all.
+MIN_TOKEN_KEY_LENGTH = 16
+
+# Separates domain from value in the hashed material. Without it, domain "ab"
+# with value "c" and domain "a" with value "bc" would produce the same token,
+# and a value could be made to impersonate one from another column.
+DOMAIN_SEPARATOR = "\x00"
+
+# Distinguishes SQL NULL from the empty string, which are different values that
+# would otherwise hash identically.
+NULL_SENTINEL = "\x00NULL"
+
+# Types whose tokens are reshaped to stay loadable as that type. The profile is
+# meant to be replayed into a CockroachDB schema for sizing; a 64-character hex
+# string in a uuid column would force the migration team to retype it, at which
+# point the shape under test is no longer the shape being migrated.
+UUID_TYPE_NAMES = frozenset({"uuid"})
+
+# Types whose text form is canonicalized numerically before hashing. PostgreSQL
+# permits a foreign key across int4 and int8, and renders 42 and 42.0 for the
+# same number; both sides have to hash alike. Text is deliberately excluded:
+# "0001" and "1" are different strings, and collapsing them would merge two
+# most-common values into one token and corrupt the frequency it carries.
+NUMERIC_TYPE_NAMES = frozenset(
+    {"float4", "float8", "int2", "int4", "int8", "numeric", "oid"}
+)
+
+
+def load_token_key(env: dict[str, str] | None = None) -> bytes:
+    """Read the tokenization key from the environment, once, at startup.
+
+    Read from the environment rather than an argument so it never appears in a
+    process listing. No error below echoes the value.
+    """
+    raw = (env if env is not None else os.environ).get(TOKEN_KEY_ENV_VAR, "")
+    if not raw.strip():
+        raise ConfigError(
+            f"{TOKEN_KEY_ENV_VAR} is not set; it is the key that tokenizes statistic "
+            "values, and there is no default because a default would tokenize every "
+            "deployment identically"
+        )
+    if len(raw) < MIN_TOKEN_KEY_LENGTH:
+        raise ConfigError(
+            f"{TOKEN_KEY_ENV_VAR} is shorter than {MIN_TOKEN_KEY_LENGTH} characters; a "
+            "short key makes the tokens reversible by brute force"
+        )
+    return raw.encode("utf-8")
+
+
+def token_domain(schema: str, table: str, column: str) -> str:
+    """The tokenization domain for one column.
+
+    Separated by the same NUL as the value, because PostgreSQL permits a dot
+    inside a quoted identifier and a dotted join would let one column's values
+    impersonate another's.
+    """
+    return DOMAIN_SEPARATOR.join((schema, table, column))
+
+
+def canonical_number(text: str) -> str | None:
+    """Return the canonical decimal form of text, or None if it is not one."""
+    try:
+        number = decimal.Decimal(text)
+    except (decimal.InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():  # NaN and Infinity are legal float8 values.
+        return None
+    return format(number.normalize(), "f")
+
+
+def canonical_uuid(text: str) -> str | None:
+    """Return the canonical uuid form of text, or None if it is not one."""
+    try:
+        return str(uuid.UUID(text))
+    except (ValueError, AttributeError):
+        return None
+
+
+def repr_typed(value: str | None, type_name: str = "") -> str:
+    """Canonical text of a source value, for hashing.
+
+    The type name steers canonicalization but is never itself hashed: a foreign
+    key may cross int4 and int8, and folding the type into the material would
+    break exactly the equality these tokens exist to preserve.
+    """
+    if value is None:
+        return NULL_SENTINEL
+
+    lowered = type_name.lower()
+    if lowered in NUMERIC_TYPE_NAMES:
+        canonical = canonical_number(value.strip())
+        if canonical is not None:
+            return canonical
+    elif lowered in UUID_TYPE_NAMES:
+        canonical = canonical_uuid(value.strip())
+        if canonical is not None:
+            return canonical
+
+    # Not canonicalizable, or a type where the text is the value. Returned
+    # unstripped: trailing whitespace in a text column is part of the value.
+    return value
+
+
+@dataclass(frozen=True, repr=False)
+class Tokenizer:
+    """Replaces source values with HMAC tokens.
+
+    Holds the key, so the key lives in one object with a repr that cannot leak
+    it. A module-level key would end up in a traceback the first time an
+    unrelated function was called with one in scope.
+    """
+
+    key: bytes
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(key={REDACTED})"
+
+    def token(self, value: str | None, domain: str, type_name: str = "") -> str:
+        """Return the token for one value in one domain."""
+        material = domain + DOMAIN_SEPARATOR + repr_typed(value, type_name)
+        digest = hmac.new(self.key, material.encode("utf-8"), hashlib.sha256).hexdigest()
+        if type_name.lower() in UUID_TYPE_NAMES:
+            return shape_as_uuid(digest)
+        return digest
+
+    def tokens(self, values, domain: str, type_name: str = "") -> tuple[str, ...]:
+        """Tokenize a sequence elementwise, preserving order.
+
+        Order is preserved because the caller's parallel array of frequencies is
+        positional; the tokens themselves carry no ordering information.
+        """
+        return tuple(self.token(value, domain, type_name) for value in values)
+
+
+def shape_as_uuid(digest: str) -> str:
+    """Format the first 128 bits of a digest as a uuid.
+
+    Not a version-4 uuid: the version and variant bits are left as digest bits
+    rather than overwritten, because a token that advertised itself as random
+    would be a lie about where it came from. Any 128-bit value is a valid uuid
+    to both PostgreSQL and CockroachDB.
+    """
+    head = digest[:32]
+    return "-".join((head[:8], head[8:12], head[12:16], head[16:20], head[20:32]))
 
 
 # ---------------------------------------------------------------------------

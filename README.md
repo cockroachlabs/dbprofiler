@@ -72,6 +72,11 @@ The connection string may also be passed with `--url`. Either way it is parsed i
 libpq environment variables for the child processes and never placed on their command
 lines.
 
+`DBPROFILER_TOKEN_KEY` is read from the environment only — never from an argument, so it
+cannot appear in a process listing — and there is no default, because a default would
+tokenize every deployment identically. Keep it: re-running with the same key produces
+comparable tokens, and a different key makes two bundles impossible to correlate.
+
 ## Bundle contents
 
 ```text

@@ -405,9 +405,56 @@ satisfied while still testing the parser.
 
 **Files:** extend `dbprofiler.py`, `test_dbprofiler.py`.
 
-- [ ] Write failing tests proving equal typed source values in one FK domain produce equal tokens, different domains do not collide, UUIDs remain UUID-typed after tokenization (retain type provenance), and originals never serialize. Key read only from `DBPROFILER_TOKEN_KEY`; test asserts key is never present in captured stderr, stdout, exceptions, or bundle bytes.
-- [ ] Implement `tokenize(value, domain)` using `hmac.new(key, f"{domain}\x00{repr_typed(value)}".encode(), hashlib.sha256).hexdigest()`. Key loaded once at process start; never logged, never written.
-- [ ] Run tests; expect PASS.
+- [x] Write failing tests proving equal typed source values in one FK domain produce equal tokens, different domains do not collide, UUIDs remain UUID-typed after tokenization (retain type provenance), and originals never serialize. Key read only from `DBPROFILER_TOKEN_KEY`; test asserts key is never present in captured stderr, stdout, exceptions, or bundle bytes.
+- [x] Implement `tokenize(value, domain)` using `hmac.new(key, f"{domain}\x00{repr_typed(value)}".encode(), hashlib.sha256).hexdigest()`. Key loaded once at process start; never logged, never written.
+- [x] Run tests; expect PASS. → 215 tests, `ruff check` clean, 3.9 grammar verified.
+
+**Deviations and additions beyond the checklist**
+
+- **`tokenize` is a method on a `Tokenizer` object, not a free function.** The key lives
+  in one object whose `repr` redacts it. A module-level key would end up in a traceback
+  the first time any unrelated function was called with one in scope — and every error
+  path in this tool is assumed to be printed.
+- **The domain separator is also used inside the domain.** `token_domain` joins schema,
+  table and column with the same NUL rather than dots, because PostgreSQL permits a dot
+  inside a quoted identifier: with a dotted join, `("public", "users.id", "x")` and
+  `("public", "users", "id.x")` would be the same domain and one column's values could
+  impersonate another's. There is a test for that, and one for the analogous
+  domain/value boundary.
+- **`repr_typed` takes the type name but never hashes it.** The type steers
+  canonicalization only. Folding it into the material would break the equality the tokens
+  exist to preserve, because PostgreSQL permits a foreign key across `int4` and `int8`.
+  There is a test asserting `int4 7` and `int8 7` tokenize identically.
+- **Canonicalization is opt-in by type, not applied to everything.** Numeric types go
+  through `Decimal.normalize()` so `42`, `42.0` and `4.2e1` agree; `uuid` goes through
+  `uuid.UUID` so case and hyphenation agree. Text is deliberately excluded: `"0001"` and
+  `"1"` are different strings, and collapsing them would merge two most-common values
+  into one token and corrupt the frequency it carries. Trailing whitespace in text is
+  preserved for the same reason.
+- **`NaN` and `Infinity` fall back to their text form.** Both are legal `float8` values
+  and neither has a canonical decimal; the fallback is tested rather than left to chance.
+- **"UUIDs remain UUID-typed" is implemented as output shaping.** A uuid value's token is
+  the first 128 bits of the digest, formatted `8-4-4-4-12`. The profile is meant to be
+  replayed into a CockroachDB schema for sizing, and a 64-character hex string in a uuid
+  column would force the migration team to retype it — at which point the shape under
+  test is no longer the shape being migrated. The version and variant bits are left as
+  digest bits rather than overwritten to fake a v4: any 128-bit value is a valid uuid to
+  both PostgreSQL and CockroachDB, and a token advertising itself as random would be a
+  lie about where it came from.
+- **`load_token_key` enforces a 16-character minimum.** Below that the tokens are
+  reversible by brute force over a small value space. Neither rejection message echoes
+  the value.
+- **An explicitly passed environment is never topped up from `os.environ`,** so a caller
+  handing in a deliberately restricted environment cannot silently pick up the ambient
+  key. Tested in both directions.
+- **`Tokenizer.tokens()` for sequences,** since most-common values and histogram bounds
+  arrive as parallel arrays and the frequencies beside them are positional.
+- **`.claude/rules/development.md` gained the token-key test convention**
+  (`example-token-key-0123456789`) and a short statement of the key-handling rules, so a
+  future contributor does not invent a second synthetic key.
+- **README documents why there is no default key** and why the key is worth keeping:
+  re-running with the same key produces comparable tokens, and a different key makes two
+  bundles impossible to correlate.
 
 ### Task 8: Normalization
 
