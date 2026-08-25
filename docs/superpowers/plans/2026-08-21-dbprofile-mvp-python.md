@@ -715,11 +715,81 @@ satisfied while still testing the parser.
 
 **Files:** `integration_test.py`, `README.md`.
 
-- [ ] Skip the test unless `DBPROFILER_POSTGRES_TEST_URL` and `DBPROFILER_TOKEN_KEY` are both set (use `unittest.skipUnless`). Read only via `os.getenv`; never print their values.
-- [ ] Create a uniquely named disposable schema (e.g. `dbprofiler_it_<epoch>`) with synthetic ordinary tables, scalar types, unsupported JSON/array columns, indexes, single/composite FKs, and multicolumn statistics. `ANALYZE` allowed only on these disposable fixtures.
-- [ ] Seed enough activity (a few `SELECT`s repeated) to make `pg_stat_statements` non-empty for assertions.
-- [ ] Run the profiler and validate: entries present, JSON well-formed, checksums verify, row/column shape correct, deterministic tokens present, no raw source values present, single/composite fan-out present, Tier 1 CSVs populated, `stats_reset` captured. Drop only the disposable schema in cleanup (`try/finally`).
-- [ ] Update `README.md` with environment-only usage, PostgreSQL 16 / `pg_dump` prerequisites, safety boundary, `--check-safety` mode, bundle contents, and deferred features — without a literal URL.
+- [x] Skip the test unless `DBPROFILER_POSTGRES_TEST_URL` and `DBPROFILER_TOKEN_KEY` are both set (use `unittest.skipUnless`). Read only via `os.getenv`; never print their values.
+- [x] Create a uniquely named disposable schema (e.g. `dbprofiler_it_<epoch>`) with synthetic ordinary tables, scalar types, unsupported JSON/array columns, indexes, single/composite FKs, and multicolumn statistics. `ANALYZE` allowed only on these disposable fixtures.
+- [x] Seed enough activity (a few `SELECT`s repeated) to make `pg_stat_statements` non-empty for assertions.
+- [x] Run the profiler and validate: entries present, JSON well-formed, checksums verify, row/column shape correct, deterministic tokens present, no raw source values present, single/composite fan-out present, Tier 1 CSVs populated, `stats_reset` captured. Drop only the disposable schema in cleanup (`try/finally`).
+- [x] Update `README.md` with environment-only usage, PostgreSQL 16 / `pg_dump` prerequisites, safety boundary, `--check-safety` mode, bundle contents, and deferred features — without a literal URL.
+
+**Deviations and additions beyond the checklist**
+
+- **50 integration tests, all green against PostgreSQL 16.15, and 8 new unit guards** —
+  371 unit tests total. Three assertions in the first draft were wrong about the tool
+  rather than the tool being wrong, and each correction is a fact worth recording:
+  `data_type` is `format_type` output (`timestamp with time zone`, `numeric(12,2)`), not
+  the internal type name; fan-out is children per *referenced* parent, so it divides by
+  the child column's distinct count and not by the parent's row count; and p99 is read at
+  the rank the distinct count implies, so a single hot parent among 376 sits past the
+  99th percentile and does not lift it.
+- **The seed was rebuilt so the right answer is computable, not guessed.** Hot orders go
+  to five ids disjoint from the evenly spread range, and `HOT_EVERY` is coprime with the
+  uniform range so carving them out knocks no id out of the spread — the referenced
+  parent count is exactly 405 by construction. Likewise `org_id` and `site_id` are now
+  genuinely correlated (five pairs, from two orgs and five sites), so reading the
+  extended statistics gives 5 where assuming independence would give 10. Before that
+  change the composite test would have passed either way.
+- **The checklist's "unsupported JSON/array columns" is wrong.** `jsonb` and `text[]` are
+  both supported — `jsonb` by name, arrays by their element type — so a fixture built
+  from them would have asserted nothing. The genuinely unsupported kinds are ranges,
+  domains, composites and multiranges; the `exotic` table carries an `int4range` and a
+  `CREATE DOMAIN` column, and the suite asserts both directions.
+- **Module-level setup, not `setUpClass`.** A shared base class's `setUpClass` runs once
+  per subclass, which would have meant six `CREATE SCHEMA` attempts and eighteen profiler
+  runs. `setUpModule` builds the fixtures once and runs the profiler three times: twice
+  under one key to prove tokens reproduce, once under another to prove two bundles cannot
+  be correlated.
+- **Cleanup catches `BaseException`, and `drop_fixtures` re-checks the name.** This is the
+  only statement in the repository that destroys anything and it runs against whatever
+  server the operator configured, so it does not trust a constant twenty lines away to
+  still say what it said. Leaving a schema behind on a shared server is worse than a slow
+  Ctrl-C, so the interrupt path drops it too.
+- **Guard tests over the integration suite itself** (`TestIntegrationSuiteScope`). It
+  parses `integration_test.py` with `ast` and fails if any mutating statement does not
+  name `{SCHEMA}`, if the schema name stops being unique per run, if `drop_fixtures` stops
+  being called from both `setUpModule` and `tearDownModule`, if a credentialed URL or a
+  new token key appears, or if the file ever becomes discoverable by `python3 -m unittest`.
+  Mutation-tested: pointing one `DROP SCHEMA` at `public` turns the unit suite red without
+  a server present.
+- **Mutation testing of the integration suite.** Making the tokenizer return raw values
+  fails 14 tests including every negative assertion; making a child column tokenize under
+  its own domain instead of its parent's fails exactly the two tests written for that
+  property and nothing else; making composite fan-out assume independence fails exactly
+  the composite test.
+- **A second token test that guards the first.** Asserting an overlap between the parent's
+  and the child's token lists would also pass if both sides were tokenized under a domain
+  that merely happened to match. The suite instead computes the expected token from the
+  key and asserts it is present, then asserts the token the child's *own* domain would
+  produce is absent.
+- **Four plants, four routes, plus liveness guards.** The planted values reach a
+  most-common value, a histogram bound, a most-common value on a composite parent, and a
+  utility statement's verbatim text in `pg_stat_statements`. Two further tests prove each
+  plant really is in the source, so a fixture that silently failed to insert cannot make
+  every assertion of absence pass for the wrong reason. Absence is checked over the
+  archive as stored *and* every member decompressed.
+- **`.claude/rules/development.md` extended in the same change.** The rule exempted only
+  `ANALYZE` for disposable fixtures, but the checklist requires multicolumn statistics,
+  which needs `CREATE STATISTICS`. The exemption now names the DDL, DML, `ANALYZE`,
+  `CREATE STATISTICS`, and `COUNT(*)` this file needs, scopes it to `integration_test.py`
+  and the disposable schema, and says why — with the standing prohibition on comparing the
+  profiler's estimates against a count queried at assertion time, since such a count would
+  agree with an estimator that was broken in the same direction.
+- **A real bug in the test fixtures, caught before it ran.** A mutation-testing step left
+  `DROP SCHEMA IF EXISTS public CASCADE` in the file. The new guard test caught it from a
+  static parse, with no server involved; the `public` schema of the test database was
+  verified intact afterwards. That is the argument for the guard.
+- **`README.md` gained a "What this release does not do" section** listing the deferred
+  scope from line 32 of this plan, so a reader can tell an absent feature from an
+  oversight.
 
 ### Task 13: Release plumbing
 
