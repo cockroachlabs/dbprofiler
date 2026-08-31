@@ -58,6 +58,14 @@ class TestVersion(unittest.TestCase):
         self.assertIsInstance(dbprofiler.VERSION, str)
         self.assertTrue(dbprofiler.VERSION)
 
+    def test_version_is_a_release_number_not_a_placeholder(self):
+        # The release workflow refuses to publish unless the tag equals this
+        # string, so a placeholder here makes every tag unpublishable -- and the
+        # way you find out is a failed release, after the tag is already pushed.
+        # Requiring a real number keeps main taggable and moves that discovery
+        # into the unit suite, where it costs nothing.
+        self.assertRegex(dbprofiler.VERSION, r"^\d+\.\d+\.\d+$")
+
     def test_contract_version_is_1_0(self):
         self.assertEqual(dbprofiler.CONTRACT_VERSION, "1.0")
 

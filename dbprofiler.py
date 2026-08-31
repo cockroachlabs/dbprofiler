@@ -67,7 +67,7 @@ import zipfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-VERSION = "dev"
+VERSION = "0.1.0"
 
 # Version of the normalized profile contract written to profile.json. Any change
 # to field names or semantics in the contract dataclasses must bump this.
