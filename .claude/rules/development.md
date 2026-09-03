@@ -10,8 +10,8 @@ that property true.
   bottom before running it against production.
 - Tests live outside it: `test_dbprofiler.py` (unit) and `integration_test.py` (Docker).
 - Keep the section order in `dbprofiler.py` intact — safety block, `SQL_*` constants,
-  contract dataclasses, subprocess helpers, collectors, tokenization, normalization,
-  bundle publication, orchestration, entry point. Reviewers read in that order.
+  contract dataclasses, subprocess helpers, collectors, normalization, bundle
+  publication, orchestration, entry point. Reviewers read in that order.
 
 ## No dependencies
 
@@ -21,6 +21,12 @@ that property true.
   syntax that only parses on newer versions.
 
 ## Safety boundary
+
+The boundary is about how the tool reads, not about what the statistics contain. Values
+from `pg_stats`, `pg_stats_ext`, and `pg_stat_statements` are published as PostgreSQL
+computed them, because ordering, skew, and clustering are what downstream data generation
+and statistics injection need. Do not add redaction, hashing, or masking: it was removed
+deliberately. A bundle carries a sample of the source data, and the README says so.
 
 - Every SQL statement must be a module-level constant named `SQL_*`. This is not style:
   `--check-safety` enumerates them by reflection, and a query built inline is a query the
@@ -49,12 +55,9 @@ that property true.
   host `db.invalid` (`.invalid` is reserved by RFC 2606 and can never resolve), user
   `example-user`, password `example-password`, database `example-db`. Do not invent
   new ones.
-- Tests that need a tokenization key use `example-token-key-0123456789`, for the same
-  reason. Do not invent new ones.
 - Credentials reach child processes only through `env=`, never through `argv`.
-- The tokenization key is read only from `DBPROFILER_TOKEN_KEY`, never from `argv` and
-  never with a default. It is held by `Tokenizer`, whose `repr` redacts it, and it is
-  stripped from every child environment along with the rest of `DBPROFILER_*`.
+- Every `DBPROFILER_*` variable is stripped from every child environment. The tool's own
+  configuration is the tool's; a child gets libpq variables and nothing else.
 - Redact subprocess stderr before it is surfaced. Assume every error path is printed.
 - `.env.test.local` holds local test configuration, is gitignored, and is never
   displayed, echoed, or committed.
@@ -63,12 +66,15 @@ that property true.
 
 - Test-driven: write the failing test first, then the implementation.
 - `python3 -m unittest -v` must pass before any commit.
-- Integration tests are opt-in and skip unless `DBPROFILER_POSTGRES_TEST_URL` and
-  `DBPROFILER_TOKEN_KEY` are both set.
+- Integration tests are opt-in and skip unless `DBPROFILER_POSTGRES_TEST_URL` is set.
 - Collector tests use recorded, sanitized `psql --csv` fixtures in `testdata/golden/`.
   No real customer identifiers in fixtures.
-- For anything that writes a bundle, assert the negative: plant a unique value and prove
-  it does not appear in the output bytes.
+- For anything that writes a bundle, plant a unique value and assert on the exact output
+  bytes. Which way the assertion runs depends on what was planted: statistics are
+  published deliberately, so a planted statistic value must be proven *present and
+  intact* — that catches a dropped column or a mangled separator, which absence would
+  not. A credential has no route into a bundle, so for credentials the assertion stays
+  negative.
 
 ## Committing
 

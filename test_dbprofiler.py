@@ -66,8 +66,8 @@ class TestVersion(unittest.TestCase):
         # into the unit suite, where it costs nothing.
         self.assertRegex(dbprofiler.VERSION, r"^\d+\.\d+\.\d+$")
 
-    def test_contract_version_is_1_0(self):
-        self.assertEqual(dbprofiler.CONTRACT_VERSION, "1.0")
+    def test_contract_version_is_2_0(self):
+        self.assertEqual(dbprofiler.CONTRACT_VERSION, "2.0")
 
     def test_version_flag_prints_version_and_exits_zero(self):
         stdout = io.StringIO()
@@ -406,16 +406,16 @@ class TestSafeEnv(unittest.TestCase):
         self.assertEqual(env["PGHOST"], HOST)
 
     def test_our_own_secrets_are_stripped_from_the_child(self):
-        """The child has no use for the tokenization key, and a child's
-        environment is readable by anything that can see the process."""
+        """The connection URL carries a password, and a child's environment is
+        readable by anything that can see the process."""
         with mock.patch.dict(
             "os.environ",
-            {"DBPROFILER_TOKEN_KEY": "example-token-key", "DBPROFILER_POSTGRES_URL": URL},
+            {"DBPROFILER_POSTGRES_URL": URL, "DBPROFILER_ANYTHING": "example-value"},
             clear=True,
         ):
             env = dbprofiler.safe_env(a_config())
-        self.assertNotIn("DBPROFILER_TOKEN_KEY", env)
         self.assertNotIn("DBPROFILER_POSTGRES_URL", env)
+        self.assertNotIn("DBPROFILER_ANYTHING", env)
 
     def test_inherited_pg_settings_survive_unless_the_url_overrides_them(self):
         with mock.patch.dict("os.environ", {"PGSSLMODE": "verify-full"}, clear=True):
@@ -973,6 +973,9 @@ CATALOG_FIXTURES = (
     "extended_stats",
     "foreign_keys",
     "indexes",
+    "index_columns",
+    "sequences",
+    "database_collation",
 )
 
 
@@ -994,10 +997,13 @@ class TestCatalogSql(unittest.TestCase):
             "SQL_TABLES",
             "SQL_COLUMNS",
             "SQL_COLUMN_STATS",
+            "SQL_DATABASE_COLLATION",
             "SQL_EXTENDED_STATS",
             "SQL_FOREIGN_KEYS",
             "SQL_INDEXES",
+            "SQL_INDEX_COLUMNS",
             "SQL_INHERITED",
+            "SQL_SEQUENCES",
         ):
             with self.subTest(name=name):
                 self.assertIsInstance(getattr(dbprofiler, name), str)
@@ -1005,6 +1011,33 @@ class TestCatalogSql(unittest.TestCase):
     def test_pg_inherits_is_on_the_allowlist(self):
         # Added in the same change as the collector that reads it.
         self.assertIn("pg_inherits", dbprofiler.ALLOWED_RELATIONS)
+
+    def test_the_ordering_collectors_relations_are_on_the_allowlist(self):
+        """Each of these earns its place with the collector added beside it:
+        pg_index for key order, pg_opclass for the operator class, pg_collation
+        for the collation the order is taken under, pg_sequence for the key
+        stream, pg_attrdef for the DEFAULT expression that drives it."""
+        for relation in (
+            "pg_attrdef",
+            "pg_collation",
+            "pg_index",
+            "pg_opclass",
+            "pg_sequence",
+        ):
+            with self.subTest(relation=relation):
+                self.assertIn(relation, dbprofiler.ALLOWED_RELATIONS)
+
+    def test_the_ordering_collectors_actually_read_what_they_allowlisted(self):
+        """The allowlist grants a permission; a grant with no collector behind it
+        is a permission nobody reviewed the use of."""
+        read = set()
+        for _, sql in dbprofiler.iter_sql_constants():
+            for match in dbprofiler.RELATION_REFERENCE.finditer(sql):
+                if not match.group(2):
+                    read.add(match.group(1).lower().split(".")[-1])
+        for relation in ("pg_attrdef", "pg_collation", "pg_opclass", "pg_sequence"):
+            with self.subTest(relation=relation):
+                self.assertIn(relation, read)
 
     def test_no_catalog_query_counts_rows(self):
         for name, sql in dbprofiler.iter_sql_constants():
@@ -1023,6 +1056,15 @@ class TestCollectCatalog(unittest.TestCase):
         self.assertEqual(users.schema, "public")
         self.assertEqual(users.reltuples, 1000.0)
         self.assertEqual(users.size_bytes, 163840)
+
+    def test_tables_carry_the_page_count_and_whether_they_toast(self):
+        """size_bytes is the total including indexes and TOAST, so it cannot say
+        how densely the heap itself is packed. relpages can."""
+        catalog = self.collect()
+        by_name = {t.name: t for t in catalog.tables}
+        self.assertEqual(by_name["users"].relpages, 20)
+        self.assertTrue(by_name["users"].has_toast)
+        self.assertFalse(by_name["orders"].has_toast)
 
     def test_all_three_tables_are_collected(self):
         catalog = self.collect()
@@ -1049,9 +1091,43 @@ class TestCollectCatalog(unittest.TestCase):
         self.assertTrue(by_name[("invoices", "region")].is_supported)  # enum
         self.assertFalse(by_name[("users", "legacy_balance")].is_supported)  # money
 
+    def test_columns_carry_their_collation(self):
+        """Two text columns with identical histogram bounds sort differently
+        under 'C' and under 'en_US.UTF-8'. The bounds do not say which."""
+        catalog = self.collect()
+        by_name = {(c.table, c.name): c for c in catalog.columns}
+        self.assertEqual(by_name[("users", "email")].collation, "default")
+        self.assertIsNone(by_name[("users", "id")].collation)
+
+    def test_columns_carry_their_default_and_identity(self):
+        """A sequential default is what makes a key monotonically increasing,
+        and an identity column's default is not in pg_attrdef at all."""
+        catalog = self.collect()
+        by_name = {(c.table, c.name): c for c in catalog.columns}
+        self.assertIn("nextval", by_name[("orders", "id")].default_expression)
+        self.assertIsNone(by_name[("orders", "id")].identity)
+        self.assertEqual(by_name[("users", "id")].identity, "always")
+        self.assertEqual(by_name[("invoices", "id")].identity, "by default")
+        self.assertIsNone(by_name[("users", "email")].default_expression)
+
+    def test_a_lowered_statistics_target_is_recorded(self):
+        """A column analyzed at a lower target has a coarser histogram than the
+        rest of the profile, and nothing else in the bundle would say so."""
+        catalog = self.collect()
+        by_name = {(c.table, c.name): c for c in catalog.columns}
+        self.assertEqual(by_name[("orders", "placed_at")].stats_target, 250)
+        self.assertEqual(
+            by_name[("orders", "user_id")].stats_target, dbprofiler.DEFAULT_STATS_TARGET
+        )
+
+    def test_the_database_collation_is_collected(self):
+        catalog = self.collect()
+        self.assertEqual(catalog.collate, "en_US.UTF-8")
+        self.assertEqual(catalog.ctype, "en_US.UTF-8")
+
     def test_column_statistics_are_kept_separate_from_columns(self):
-        """Statistics carry raw values. They stay in their own records so the
-        tokenization step in task 7 has one place to look."""
+        """Statistics hold the source's own values and its own encodings. They
+        stay in their own records so normalization has one place to look."""
         catalog = self.collect()
         stat = next(
             s for s in catalog.column_stats if s.table == "orders" and s.column == "user_id"
@@ -1079,6 +1155,22 @@ class TestCollectCatalog(unittest.TestCase):
         stat = next(s for s in catalog.column_stats if s.table == "users" and s.column == "id")
         self.assertEqual(stat.most_common_vals, ())
         self.assertEqual(stat.most_common_freqs, ())
+
+    def test_correlation_is_collected(self):
+        """Correlation is what says whether an index scan over this column reads
+        sequentially or jumps, and it is not derivable from anything else here."""
+        catalog = self.collect()
+        stats = {(s.table, s.column): s for s in catalog.column_stats}
+        self.assertEqual(stats[("orders", "placed_at")].correlation, 0.99)
+        self.assertEqual(stats[("users", "email")].correlation, 0.02)
+        self.assertEqual(stats[("users", "legacy_balance")].correlation, -0.1)
+
+    def test_an_absent_correlation_is_none_and_not_zero(self):
+        # Zero is a real correlation, meaning no physical ordering at all. It is
+        # not the same claim as "PostgreSQL did not compute one".
+        catalog = self.collect()
+        stat = next(s for s in catalog.column_stats if s.table == "invoices")
+        self.assertIsNone(stat.correlation)
 
     def test_foreign_key_columns_keep_declaration_order(self):
         catalog = self.collect()
@@ -1120,12 +1212,17 @@ class TestCollectCatalog(unittest.TestCase):
         self.assertEqual(ext.columns, ("user_id", "placed_at"))
         self.assertEqual(ext.n_distinct, {("user_id", "placed_at"): 4200.0})
 
-    def test_extended_mcv_presence_is_recorded_but_values_are_not(self):
-        """Extended MCV values are raw customer data. Only their existence is
-        useful for planning, so only their existence is read."""
+    def test_extended_mcv_combinations_are_collected_with_both_frequencies(self):
+        """Which combinations are hot is what single-column statistics cannot
+        express, and the base frequency beside it is the independence assumption
+        the extended statistics object exists to correct."""
         catalog = self.collect()
-        self.assertTrue(catalog.extended_stats[0].has_most_common_values)
-        self.assertNotIn("most_common_vals", dbprofiler.SQL_EXTENDED_STATS.split("FROM")[0])
+        extended = catalog.extended_stats[0]
+        self.assertEqual(
+            extended.most_common_vals, ("{1,2026-01-01}", "{2,2026-06-01}")
+        )
+        self.assertEqual(extended.most_common_freqs, (0.08, 0.03))
+        self.assertEqual(extended.most_common_base_freqs, (0.02, 0.01))
 
     def test_indexes_are_collected_with_uniqueness_and_primary_flags(self):
         catalog = self.collect()
@@ -1134,6 +1231,66 @@ class TestCollectCatalog(unittest.TestCase):
         self.assertTrue(pkey.is_primary)
         plain = next(i for i in catalog.indexes if i.name == "orders_user_id_idx")
         self.assertFalse(plain.is_unique)
+
+    def test_index_shape_flags_are_collected(self):
+        """Partial, expression-based, invalid and clustered are all visible in
+        schema.sql only as DDL a consumer would have to parse."""
+        catalog = self.collect()
+        by_name = {i.name: i for i in catalog.indexes}
+        self.assertTrue(by_name["users_pkey"].is_clustered)
+        self.assertTrue(by_name["orders_lower_ref_idx"].is_partial)
+        self.assertTrue(by_name["orders_lower_ref_idx"].has_expressions)
+        self.assertFalse(by_name["orders_pkey"].is_partial)
+        self.assertTrue(by_name["orders_pkey"].is_valid)
+
+    def test_an_include_column_is_counted_but_is_not_a_key(self):
+        catalog = self.collect()
+        index = next(i for i in catalog.indexes if i.name == "orders_user_id_idx")
+        self.assertEqual(index.key_attribute_count, 2)
+        self.assertEqual(index.attribute_count, 3)
+
+    def test_index_key_columns_keep_their_declared_order(self):
+        catalog = self.collect()
+        keys = [
+            entry
+            for entry in catalog.index_columns
+            if entry.index == "orders_user_id_idx"
+        ]
+        self.assertEqual([k.position for k in keys], [1, 2, 3])
+        self.assertEqual([k.name for k in keys], ["user_id", "placed_at", "id"])
+
+    def test_an_include_column_has_no_sort_direction(self):
+        """indoption holds only indnkeyatts entries, so the subscript runs off
+        the end for a payload column and PostgreSQL yields NULL. Absent, not
+        ascending."""
+        catalog = self.collect()
+        payload = next(
+            entry
+            for entry in catalog.index_columns
+            if entry.index == "orders_user_id_idx" and entry.position == 3
+        )
+        self.assertIsNone(payload.option_bits)
+        self.assertFalse(payload.is_key)
+
+    def test_an_expression_key_has_a_position_but_no_column_name(self):
+        catalog = self.collect()
+        key = next(
+            entry for entry in catalog.index_columns if entry.index == "orders_lower_ref_idx"
+        )
+        self.assertEqual(key.position, 1)
+        self.assertIsNone(key.name)
+        self.assertEqual(key.collation, "C")
+
+    def test_sequences_are_collected_with_their_parameters(self):
+        """A sequence-backed key is the classic monotonically increasing index
+        key; start and increment are what reproduce the same key stream."""
+        catalog = self.collect()
+        sequence = catalog.sequences[0]
+        self.assertEqual((sequence.schema, sequence.name), ("public", "orders_id_seq"))
+        self.assertEqual(sequence.start, 1)
+        self.assertEqual(sequence.increment, 1)
+        self.assertEqual(sequence.maximum, 9223372036854775807)
+        self.assertFalse(sequence.cycles)
 
     def test_the_query_order_puts_the_layout_check_first(self):
         with mock.patch("subprocess.run", side_effect=catalog_calls()) as run:
@@ -1149,6 +1306,7 @@ class TestCollectCatalog(unittest.TestCase):
         self.assertNotIn("sales", {c.schema for c in catalog.columns})
         self.assertNotIn("sales", {f.child_schema for f in catalog.foreign_keys})
         self.assertNotIn("sales", {i.schema for i in catalog.indexes})
+        self.assertNotIn("sales", {i.schema for i in catalog.index_columns})
 
 
 class TestUnsupportedLayouts(unittest.TestCase):
@@ -1156,14 +1314,14 @@ class TestUnsupportedLayouts(unittest.TestCase):
     ways the MVP does not model. Failing loudly beats publishing a wrong number."""
 
     def test_a_partitioned_table_is_rejected(self):
-        rows = "public,events,p,0,0\n"
+        rows = "public,events,p,0,0,0,f\n"
         with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
             with self.assertRaises(dbprofiler.UnsupportedObject) as raised:
                 dbprofiler.collect_catalog(a_config())
         self.assertIn("events", str(raised.exception))
 
     def test_a_partitioned_index_relkind_is_rejected(self):
-        rows = "public,events,I,0,0\n"
+        rows = "public,events,I,0,0,0,f\n"
         with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
             with self.assertRaises(dbprofiler.UnsupportedObject):
                 dbprofiler.collect_catalog(a_config())
@@ -1177,7 +1335,7 @@ class TestUnsupportedLayouts(unittest.TestCase):
         self.assertIn("users_2026", str(raised.exception))
 
     def test_the_check_happens_before_the_remaining_queries_run(self):
-        rows = "public,events,p,0,0\n"
+        rows = "public,events,p,0,0,0,f\n"
         calls = catalog_calls(tables=rows)
         with mock.patch("subprocess.run", side_effect=calls) as run:
             with self.assertRaises(dbprofiler.UnsupportedObject):
@@ -1185,7 +1343,7 @@ class TestUnsupportedLayouts(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
 
     def test_an_out_of_scope_partitioned_table_does_not_fail_the_run(self):
-        rows = golden("tables") + "archive,events,p,0,0\n"
+        rows = golden("tables") + "archive,events,p,0,0,0,f\n"
         with mock.patch("subprocess.run", side_effect=catalog_calls(tables=rows)):
             catalog = dbprofiler.collect_catalog(a_config(schema_exclude=["archive"]))
         self.assertEqual(len(catalog.tables), 3)
@@ -1473,242 +1631,6 @@ class TestWorkloadDegradation(unittest.TestCase):
         self.assertIn("***", message)
 
 
-# Synthetic, and long enough to satisfy the minimum-length check. Never a real
-# key: a reviewer grepping this repository has to be able to tell at a glance.
-TOKEN_KEY = "example-token-key-0123456789"
-
-
-def a_tokenizer(key=TOKEN_KEY):
-    return dbprofiler.Tokenizer(key.encode("utf-8"))
-
-
-class TestLoadTokenKey(unittest.TestCase):
-    def test_the_key_comes_from_the_environment(self):
-        key = dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY})
-        self.assertEqual(key, TOKEN_KEY.encode("utf-8"))
-
-    def test_a_missing_key_is_a_configuration_error(self):
-        with self.assertRaises(dbprofiler.ConfigError) as raised:
-            dbprofiler.load_token_key({})
-        self.assertIn(dbprofiler.TOKEN_KEY_ENV_VAR, str(raised.exception))
-
-    def test_a_short_key_is_rejected(self):
-        # A guessable key makes every token reversible by brute force.
-        with self.assertRaises(dbprofiler.ConfigError):
-            dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: "short"})
-
-    def test_no_rejection_message_echoes_the_key(self):
-        for value in ("zq7wv", " " * 40):
-            with self.subTest(value=value), self.assertRaises(dbprofiler.ConfigError) as raised:
-                dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: value})
-            self.assertNotIn(value, str(raised.exception))
-
-    def test_a_whitespace_only_key_is_not_a_key(self):
-        with self.assertRaises(dbprofiler.ConfigError):
-            dbprofiler.load_token_key({dbprofiler.TOKEN_KEY_ENV_VAR: "                    "})
-
-    def test_there_is_no_default_key(self):
-        """A default key would tokenize every deployment identically, which is
-        the same as not tokenizing at all."""
-        with self.assertRaises(dbprofiler.ConfigError):
-            dbprofiler.load_token_key({"PGPASSWORD": PASSWORD})
-
-    def test_an_explicit_environment_is_not_topped_up_from_the_process(self):
-        # Otherwise a test -- or a caller passing a deliberately restricted
-        # environment -- would silently pick up the ambient key.
-        with mock.patch.dict(os.environ, {dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY}):
-            with self.assertRaises(dbprofiler.ConfigError):
-                dbprofiler.load_token_key({})
-            self.assertEqual(dbprofiler.load_token_key(), TOKEN_KEY.encode("utf-8"))
-
-
-class TestTokenizerSecrecy(unittest.TestCase):
-    def test_the_tokenizer_never_reprs_its_key(self):
-        tokenizer = a_tokenizer()
-        self.assertNotIn(TOKEN_KEY, repr(tokenizer))
-        self.assertNotIn(TOKEN_KEY, str(tokenizer))
-        self.assertNotIn(TOKEN_KEY, f"{tokenizer}")
-        self.assertIn(dbprofiler.REDACTED, repr(tokenizer))
-
-    def test_the_key_never_reaches_a_child_process(self):
-        env = dbprofiler.safe_env(a_config())
-        self.assertNotIn(dbprofiler.TOKEN_KEY_ENV_VAR, env)
-        self.assertNotIn(TOKEN_KEY, env.values())
-
-    def test_a_token_does_not_contain_its_input(self):
-        tokenizer = a_tokenizer()
-        for value in ("user@example.invalid", "sample-region-1", "42"):
-            with self.subTest(value=value):
-                token = tokenizer.token(value, "public.users.email")
-                self.assertNotIn(value, token)
-                self.assertNotIn(TOKEN_KEY, token)
-
-    def test_a_token_is_hex(self):
-        token = a_tokenizer().token("x", "d")
-        self.assertEqual(len(token), 64)
-        int(token, 16)  # raises if it is not
-
-
-class TestTokenizeDeterminism(unittest.TestCase):
-    def setUp(self):
-        self.tokenizer = a_tokenizer()
-
-    def test_equal_values_in_one_domain_tokenize_equally(self):
-        # This is the property the whole design rests on: a join key on both
-        # sides of a foreign key has to survive tokenization as a join key.
-        left = self.tokenizer.token("4200", "public.users.id")
-        right = self.tokenizer.token("4200", "public.users.id")
-        self.assertEqual(left, right)
-
-    def test_different_domains_do_not_collide(self):
-        left = self.tokenizer.token("4200", "public.users.id")
-        right = self.tokenizer.token("4200", "public.orders.id")
-        self.assertNotEqual(left, right)
-
-    def test_a_domain_boundary_cannot_be_forged(self):
-        """Concatenating domain and value without a separator would make
-        ("ab", "c") and ("a", "bc") the same token."""
-        self.assertNotEqual(
-            self.tokenizer.token("c", "ab"),
-            self.tokenizer.token("bc", "a"),
-        )
-
-    def test_a_different_key_gives_a_different_token(self):
-        other = a_tokenizer("example-token-key-9876543210")
-        self.assertNotEqual(
-            self.tokenizer.token("4200", "public.users.id"),
-            other.token("4200", "public.users.id"),
-        )
-
-    def test_null_is_distinguishable_from_the_empty_string(self):
-        self.assertNotEqual(
-            self.tokenizer.token(None, "public.users.email"),
-            self.tokenizer.token("", "public.users.email"),
-        )
-
-
-class TestTokenDomain(unittest.TestCase):
-    def test_a_domain_names_the_schema_table_and_column(self):
-        domain = dbprofiler.token_domain("public", "users", "id")
-        self.assertEqual(domain.split(dbprofiler.DOMAIN_SEPARATOR), ["public", "users", "id"])
-
-    def test_identifiers_containing_a_dot_cannot_forge_a_domain(self):
-        # PostgreSQL permits a dot inside a quoted identifier, so a dotted join
-        # would let one column's values impersonate another's.
-        self.assertNotEqual(
-            dbprofiler.token_domain("public", "users.id", "x"),
-            dbprofiler.token_domain("public", "users", "id.x"),
-        )
-
-
-class TestTypedRepresentation(unittest.TestCase):
-    """Numeric canonicalization, so a foreign key across int4 and int8 -- which
-    PostgreSQL permits -- still tokenizes to the same value on both sides."""
-
-    def setUp(self):
-        self.tokenizer = a_tokenizer()
-
-    def test_numeric_types_are_canonicalized(self):
-        domain = "public.orders.total"
-        self.assertEqual(
-            self.tokenizer.token("42", domain, "int8"),
-            self.tokenizer.token("42.0", domain, "numeric"),
-        )
-        self.assertEqual(
-            self.tokenizer.token("42", domain, "int4"),
-            self.tokenizer.token("4.2e1", domain, "float8"),
-        )
-
-    def test_text_is_never_canonicalized_as_a_number(self):
-        """"0001" and "1" are different strings. Collapsing them would merge two
-        most-common values into one token and corrupt the frequency it carries."""
-        domain = "public.users.code"
-        self.assertNotEqual(
-            self.tokenizer.token("0001", domain, "text"),
-            self.tokenizer.token("1", domain, "text"),
-        )
-
-    def test_significant_whitespace_in_text_is_preserved(self):
-        domain = "public.users.name"
-        self.assertNotEqual(
-            self.tokenizer.token("ada ", domain, "text"),
-            self.tokenizer.token("ada", domain, "text"),
-        )
-
-    def test_an_unparseable_numeric_falls_back_to_its_text(self):
-        # "NaN" and "Infinity" are legal float8 values and must not crash.
-        domain = "public.readings.value"
-        for value in ("NaN", "Infinity", "-Infinity", ""):
-            with self.subTest(value=value):
-                self.assertEqual(len(self.tokenizer.token(value, domain, "float8")), 64)
-
-    def test_the_type_name_is_not_part_of_the_hashed_material(self):
-        """A foreign key may cross int4 and int8. Hashing the type name would
-        break exactly the equality the tokens exist to preserve."""
-        domain = "public.users.id"
-        self.assertEqual(
-            self.tokenizer.token("7", domain, "int4"),
-            self.tokenizer.token("7", domain, "int8"),
-        )
-
-
-class TestTypeShapedTokens(unittest.TestCase):
-    """A tokenized UUID stays loadable as a UUID.
-
-    The profile is meant to be replayed into a CockroachDB schema for sizing. A
-    64-character hex string in a uuid column would not load, so the migration
-    team would have to retype the column and the shape they were testing would
-    no longer be the shape being migrated.
-    """
-
-    def setUp(self):
-        self.tokenizer = a_tokenizer()
-
-    def test_a_uuid_tokenizes_to_a_uuid(self):
-        token = self.tokenizer.token(
-            "6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", "public.users.id", "uuid"
-        )
-        self.assertEqual(str(uuid.UUID(token)), token)
-
-    def test_uuid_tokens_stay_deterministic_and_distinct(self):
-        domain = "public.users.id"
-        one = self.tokenizer.token("6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", domain, "uuid")
-        again = self.tokenizer.token("6b3a8f2e-1d4c-4a5b-9e7f-0c1d2e3f4a5b", domain, "uuid")
-        other = self.tokenizer.token("11111111-2222-3333-4444-555555555555", domain, "uuid")
-        self.assertEqual(one, again)
-        self.assertNotEqual(one, other)
-
-    def test_a_uuid_is_case_and_hyphen_canonical_before_hashing(self):
-        # PostgreSQL renders uuid lowercase and hyphenated, but a text column
-        # holding a uuid may not be. Both sides of a foreign key must agree.
-        domain = "public.users.id"
-        self.assertEqual(
-            self.tokenizer.token("6B3A8F2E-1D4C-4A5B-9E7F-0C1D2E3F4A5B", domain, "uuid"),
-            self.tokenizer.token("6b3a8f2e1d4c4a5b9e7f0c1d2e3f4a5b", domain, "uuid"),
-        )
-
-    def test_an_unparseable_uuid_does_not_crash(self):
-        token = self.tokenizer.token("not-a-uuid", "public.users.id", "uuid")
-        self.assertEqual(str(uuid.UUID(token)), token)
-
-    def test_every_other_type_gets_a_plain_hex_token(self):
-        for type_name in ("text", "int8", "jsonb", ""):
-            with self.subTest(type_name=type_name):
-                self.assertEqual(len(self.tokenizer.token("x", "d", type_name)), 64)
-
-
-class TestTokenizeSequences(unittest.TestCase):
-    def test_a_sequence_tokenizes_elementwise_and_in_order(self):
-        tokenizer = a_tokenizer()
-        tokens = tokenizer.tokens(("a", "b", "a"), "public.users.email", "text")
-        self.assertEqual(len(tokens), 3)
-        self.assertEqual(tokens[0], tokens[2])
-        self.assertNotEqual(tokens[0], tokens[1])
-
-    def test_an_empty_sequence_tokenizes_to_an_empty_tuple(self):
-        self.assertEqual(a_tokenizer().tokens((), "d", "text"), ())
-
-
 def a_catalog(**overrides):
     """The golden catalog, collected once and reused across normalization tests."""
     with mock.patch("subprocess.run", side_effect=catalog_calls(**overrides)):
@@ -1717,9 +1639,8 @@ def a_catalog(**overrides):
 
 class NormalizationCase(unittest.TestCase):
     def setUp(self):
-        self.tokenizer = a_tokenizer()
         self.catalog = a_catalog()
-        self.tables = dbprofiler.normalize_tables(self.catalog, self.tokenizer)
+        self.tables = dbprofiler.normalize_tables(self.catalog)
         self.by_table = {(t.schema, t.name): t for t in self.tables}
 
     def column(self, schema, table, name):
@@ -1773,7 +1694,8 @@ class TestNormalizeColumns(NormalizationCase):
         self.assertIsNone(profile.distinct_estimate)
         self.assertIsNone(profile.null_fraction)
         self.assertIsNone(profile.avg_width_bytes)
-        self.assertEqual(profile.most_common_tokens, ())
+        self.assertEqual(profile.most_common_values, ())
+        self.assertIsNone(profile.correlation)
         self.assertIn("no pg_stats row", profile.provenance)
 
     def test_type_support_is_carried_onto_the_contract(self):
@@ -1800,52 +1722,185 @@ class TestNormalizeColumns(NormalizationCase):
         self.assertIn("absolute", absolute)
 
 
-class TestNormalizedValuesAreTokens(NormalizationCase):
-    def test_most_common_values_are_replaced_by_tokens(self):
-        user_id = self.column("public", "orders", "user_id")
-        self.assertEqual(len(user_id.most_common_tokens), 3)
-        for raw in ("1", "2", "3"):
-            for token in user_id.most_common_tokens:
-                self.assertNotEqual(token, raw)
+class TestNormalizedValues(NormalizationCase):
+    """The statistics are published as PostgreSQL computed them.
 
-    def test_frequencies_survive_tokenization_in_order(self):
-        # The tokens hide which parent is hot. The frequencies must not.
+    Ordering, spacing and skew are the signal a downstream generator replays,
+    so a value-preserving transform is not enough: the values themselves have
+    to survive.
+    """
+
+    def test_most_common_values_are_carried_through_verbatim(self):
+        user_id = self.column("public", "orders", "user_id")
+        self.assertEqual(user_id.most_common_values, ("1", "2", "3"))
+
+    def test_frequencies_stay_positionally_paired_with_their_values(self):
         user_id = self.column("public", "orders", "user_id")
         self.assertEqual(user_id.most_common_freqs, (0.1, 0.05, 0.02))
-        self.assertEqual(len(user_id.most_common_tokens), len(user_id.most_common_freqs))
+        self.assertEqual(len(user_id.most_common_values), len(user_id.most_common_freqs))
 
-    def test_histogram_bounds_are_replaced_by_tokens(self):
-        bounds = self.column("public", "users", "id").histogram_token_bounds
-        self.assertEqual(len(bounds), 5)
-        self.assertNotIn("250", bounds)
+    def test_histogram_bounds_keep_their_ascending_order(self):
+        bounds = self.column("public", "users", "id").histogram_bounds
+        self.assertEqual(bounds, ("1", "250", "500", "750", "1000"))
 
-    def test_an_email_never_appears_in_a_normalized_record(self):
-        planted = "alpha@example.invalid"
-        self.assertIn(planted, golden("column_stats"))
-        self.assertNotIn(planted, repr(self.tables))
+    def test_a_text_histogram_survives_as_text(self):
+        # Bounds are sorted under the database collation, not as bytes, which
+        # is why Source carries datcollate alongside them.
+        bounds = self.column("public", "users", "email").histogram_bounds
+        self.assertEqual(bounds, ("alpha@example.invalid", "zulu@example.invalid"))
 
-    def test_a_foreign_key_still_joins_after_tokenization(self):
-        """The whole point. orders.user_id = 1 and users.id = 1 have to produce
-        the same token, or the profile shows no relationship at all."""
-        child = self.column("public", "orders", "user_id").most_common_tokens[0]
-        parent = self.column("public", "users", "id").histogram_token_bounds[0]
-        self.assertEqual(child, parent)
+    def test_correlation_is_carried_through_with_its_sign(self):
+        self.assertEqual(self.column("public", "users", "id").correlation, 0.98)
+        self.assertEqual(self.column("public", "users", "legacy_balance").correlation, -0.1)
 
-    def test_a_transitive_foreign_key_chain_resolves_to_one_domain(self):
-        # invoices.order_id -> orders.id, and orders.id is nobody's child.
-        child = self.column("sales", "invoices", "order_id").histogram_token_bounds[0]
-        parent = self.column("public", "orders", "id").histogram_token_bounds[0]
-        self.assertEqual(child, parent)
+    def test_a_missing_correlation_is_absent_rather_than_zero(self):
+        """Zero correlation is a claim about physical order. A column PostgreSQL
+        recorded nothing for has to say nothing."""
+        self.assertIsNone(self.column("sales", "invoices", "order_id").correlation)
 
-    def test_unrelated_columns_do_not_share_a_domain(self):
-        users_id = self.column("public", "users", "id").histogram_token_bounds[0]
-        orders_id = self.column("public", "orders", "id").histogram_token_bounds[0]
-        self.assertNotEqual(users_id, orders_id)
+    def test_column_provenance_explains_what_the_numbers_are_relative_to(self):
+        provenance = self.column("public", "orders", "user_id").provenance
+        self.assertIn("most_common_freqs", provenance)
+        self.assertIn("correlation", provenance)
+
+
+class TestNormalizeColumnShape(NormalizationCase):
+    """The declarations a generator needs in order to recreate the column."""
+
+    def test_a_collation_is_recorded_where_one_applies(self):
+        self.assertEqual(self.column("public", "users", "email").collation, "default")
+        self.assertIsNone(self.column("public", "users", "id").collation)
+
+    def test_a_column_default_is_carried_as_its_expression(self):
+        self.assertEqual(
+            self.column("public", "orders", "id").default_expression,
+            "nextval('public.orders_id_seq'::regclass)",
+        )
+        self.assertEqual(self.column("public", "orders", "placed_at").default_expression, "now()")
+        self.assertIsNone(self.column("public", "users", "email").default_expression)
+
+    def test_an_identity_column_reports_its_kind(self):
+        """An identity column has no pg_attrdef row, so without this it would
+        look like a column with no default at all."""
+        self.assertEqual(self.column("public", "users", "id").identity, "always")
+        self.assertEqual(self.column("sales", "invoices", "id").identity, "by default")
+        self.assertIsNone(self.column("public", "orders", "id").identity)
+
+    def test_a_raised_statistics_target_is_reported_and_the_default_is_not(self):
+        # -1 means "use default_statistics_target", which is a server setting
+        # and not a property of the column.
+        self.assertEqual(self.column("public", "orders", "placed_at").statistics_target, 250)
+        self.assertIsNone(self.column("public", "users", "id").statistics_target)
+
+
+class TestNormalizeTableStorage(NormalizationCase):
+    def test_page_count_is_separate_from_total_size(self):
+        """relpages covers the main fork; pg_total_relation_size covers indexes
+        and TOAST too. A sizing estimate that conflated them would be wrong by
+        whatever the indexes cost."""
+        users = self.by_table[("public", "users")]
+        self.assertEqual(users.page_count, 20)
+        self.assertEqual(users.size_bytes, 163840)
+
+    def test_a_toast_relation_is_reported(self):
+        self.assertTrue(self.by_table[("public", "users")].has_toast)
+        self.assertFalse(self.by_table[("public", "orders")].has_toast)
+
+    def test_table_provenance_names_the_page_size(self):
+        self.assertIn("8192", self.by_table[("public", "users")].provenance)
+
+
+class TestNormalizeIndexes(unittest.TestCase):
+    def setUp(self):
+        self.indexes = dbprofiler.normalize_indexes(a_catalog())
+        self.by_name = {i.name: i for i in self.indexes}
+
+    def test_indexes_are_sorted_deterministically(self):
+        self.assertEqual(
+            [(i.schema, i.table, i.name) for i in self.indexes],
+            sorted((i.schema, i.table, i.name) for i in self.indexes),
+        )
+
+    def test_key_columns_keep_their_declared_order(self):
+        index = self.by_name["orders_user_id_idx"]
+        self.assertEqual([c.name for c in index.columns], ["user_id", "placed_at", "id"])
+        self.assertEqual([c.position for c in index.columns], [1, 2, 3])
+
+    def test_a_descending_nulls_first_key_is_decoded_from_indoption(self):
+        """indoption is a bitmask. Publishing the integer would make every
+        consumer reimplement this decode, and one of them would get it wrong."""
+        placed_at = self.by_name["orders_user_id_idx"].columns[1]
+        self.assertTrue(placed_at.descending)
+        self.assertTrue(placed_at.nulls_first)
+
+    def test_an_ascending_key_defaults_to_nulls_last(self):
+        user_id = self.by_name["orders_user_id_idx"].columns[0]
+        self.assertFalse(user_id.descending)
+        self.assertFalse(user_id.nulls_first)
+
+    def test_an_include_column_is_marked_as_payload_not_key(self):
+        """An INCLUDE column is stored but not ordered on, so it cannot satisfy
+        a range scan. Reporting it as a key would overstate what the index does."""
+        columns = self.by_name["orders_user_id_idx"].columns
+        self.assertEqual([c.is_key for c in columns], [True, True, False])
+
+    def test_an_include_column_has_no_direction_of_its_own(self):
+        # Its indoption subscript runs past indnkeyatts and arrives as NULL.
+        payload = self.by_name["orders_user_id_idx"].columns[2]
+        self.assertFalse(payload.descending)
+        self.assertFalse(payload.nulls_first)
+        self.assertIsNone(payload.operator_class)
+
+    def test_an_expression_key_has_no_column_name(self):
+        index = self.by_name["orders_lower_ref_idx"]
+        self.assertTrue(index.has_expressions)
+        self.assertIsNone(index.columns[0].name)
+        self.assertEqual(index.columns[0].collation, "C")
+
+    def test_operator_class_is_recorded_per_key(self):
+        self.assertEqual(self.by_name["users_pkey"].columns[0].operator_class, "int8_ops")
+
+    def test_uniqueness_primacy_and_validity_are_carried_through(self):
+        pkey = self.by_name["users_pkey"]
+        self.assertTrue(pkey.is_unique)
+        self.assertTrue(pkey.is_primary)
+        self.assertTrue(pkey.is_valid)
+
+    def test_clustering_is_recorded(self):
+        """CLUSTER is what pg_stats.correlation is measuring against, so the two
+        have to be readable together."""
+        self.assertTrue(self.by_name["users_pkey"].is_clustered)
+        self.assertFalse(self.by_name["orders_pkey"].is_clustered)
+
+    def test_a_partial_index_is_flagged(self):
+        self.assertTrue(self.by_name["orders_lower_ref_idx"].is_partial)
+        self.assertFalse(self.by_name["users_pkey"].is_partial)
+
+    def test_index_provenance_points_at_the_schema_for_the_predicate(self):
+        self.assertIn("schema.sql", self.by_name["orders_lower_ref_idx"].provenance)
+
+
+class TestNormalizeSequences(unittest.TestCase):
+    def setUp(self):
+        self.sequences = dbprofiler.normalize_sequences(a_catalog())
+
+    def test_sequence_parameters_are_carried_through(self):
+        sequence = self.sequences[0]
+        self.assertEqual((sequence.schema, sequence.name), ("public", "orders_id_seq"))
+        self.assertEqual(sequence.start, 1)
+        self.assertEqual(sequence.increment, 1)
+        self.assertEqual(sequence.minimum, 1)
+        self.assertEqual(sequence.cache, 1)
+        self.assertFalse(sequence.cycles)
+
+    def test_a_bigint_bound_survives_exactly(self):
+        """bigint's maximum does not fit a float64. Routing it through one
+        returns a number one larger than the sequence will ever reach."""
+        self.assertEqual(self.sequences[0].maximum, 9223372036854775807)
 
 
 class TestNormalizeRelationships(unittest.TestCase):
     def setUp(self):
-        self.tokenizer = a_tokenizer()
         self.catalog = a_catalog()
         self.relationships = dbprofiler.normalize_relationships(self.catalog)
         self.by_name = {r.constraint_name: r for r in self.relationships}
@@ -1884,7 +1939,7 @@ class TestSingleColumnFanOut(unittest.TestCase):
     def test_nulls_are_excluded_from_the_numerator(self):
         # A nullable foreign key with half its rows null has half the children
         # to distribute, and counting them would double the estimate.
-        stats = "public,orders,user_id,0.5,8,500,,,\n"
+        stats = "public,orders,user_id,0.5,8,500,,,,0.15\n"
         catalog = a_catalog(column_stats=stats)
         fan_out = next(
             r for r in dbprofiler.normalize_relationships(catalog)
@@ -1912,7 +1967,7 @@ class TestSingleColumnFanOut(unittest.TestCase):
 
     def test_an_unknown_n_distinct_is_insufficient_not_a_division_by_zero(self):
         # PostgreSQL writes 0 for "no estimate available".
-        stats = "public,orders,user_id,0,8,0,,,\n"
+        stats = "public,orders,user_id,0,8,0,,,,0.15\n"
         fan_out = next(
             r for r in dbprofiler.normalize_relationships(a_catalog(column_stats=stats))
             if r.constraint_name == "orders_user_id_fkey"
@@ -1974,7 +2029,7 @@ class TestCompositeFanOut(unittest.TestCase):
 
     def test_extended_statistics_for_a_different_column_set_do_not_count(self):
         other = (
-            'public,orders,orders_other_stx,"{id,placed_at}","{""1, 3"": 900}",t\n'
+            'public,orders,orders_other_stx,"{id,placed_at}","{""1, 3"": 900}",,,\n'
         )
         fan_out = self.fan_out(self.composite_catalog(extended_stats=other))
         self.assertEqual(fan_out.status, "insufficient_statistics")
@@ -1992,7 +2047,7 @@ class TestProfileAssembly(unittest.TestCase):
             database=DATABASE,
             collected_schemas=("public", "sales"),
         )
-        return dbprofiler.build_profile(source, catalog, workload, a_tokenizer())
+        return dbprofiler.build_profile(source, catalog, workload)
 
     def test_the_profile_carries_the_contract_version(self):
         self.assertEqual(self.build().contract_version, dbprofiler.CONTRACT_VERSION)
@@ -2007,8 +2062,7 @@ class TestProfileAssembly(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=workload_calls(statements_installed="")):
             workload = dbprofiler.collect_workload(a_config())
         profile = dbprofiler.build_profile(
-            dbprofiler.Source("postgres", 160002, "16.2", DATABASE), catalog, workload,
-            a_tokenizer(),
+            dbprofiler.Source("postgres", 160002, "16.2", DATABASE), catalog, workload
         )
         self.assertIn("pg_stat_statements_missing", [w.code for w in profile.warnings])
 
@@ -2070,12 +2124,9 @@ def read_csv(entry):
 
 class BundleCase(unittest.TestCase):
     def setUp(self):
-        self.tokenizer = a_tokenizer()
         self.catalog = a_catalog()
         self.workload = a_workload()
-        self.profile = dbprofiler.build_profile(
-            a_source(), self.catalog, self.workload, self.tokenizer
-        )
+        self.profile = dbprofiler.build_profile(a_source(), self.catalog, self.workload)
         self.payloads = self.build_payloads()
         self.by_path = {entry.path: entry for entry in self.payloads}
         self.manifest = dbprofiler.build_manifest(
@@ -2094,7 +2145,6 @@ class BundleCase(unittest.TestCase):
             profile=overrides.get("profile", self.profile),
             catalog=overrides.get("catalog", self.catalog),
             workload=overrides.get("workload", self.workload),
-            tokenizer=overrides.get("tokenizer", self.tokenizer),
             schema_sql=overrides.get("schema_sql", SCHEMA_SQL),
         )
 
@@ -2190,6 +2240,8 @@ class TestPayloads(BundleCase):
             [
                 "observations/foreign_keys.csv",
                 "observations/pg_class.csv",
+                "observations/pg_index.csv",
+                "observations/pg_sequence.csv",
                 "observations/pg_stat_indexes.csv",
                 "observations/pg_stat_statements.csv",
                 "observations/pg_stat_tables.csv",
@@ -2228,15 +2280,64 @@ class TestPayloads(BundleCase):
         self.assertEqual(users[header.index("row_count_estimate")], "1000.0")
         self.assertEqual(users[header.index("size_bytes")], "163840")
 
-    def test_pg_stats_carries_tokens_and_never_values(self):
+    def test_pg_stats_carries_the_values_and_their_frequencies(self):
         rows = read_csv(self.by_path["observations/pg_stats.csv"])
         header, body = rows[0], rows[1:]
         user_id = next(row for row in body if row[:3] == ["public", "orders", "user_id"])
-        tokens = user_id[header.index("most_common_tokens")].split("|")
-        self.assertEqual(len(tokens), 3)
-        for token in tokens:
-            self.assertRegex(token, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(user_id[header.index("most_common_values")], "1|2|3")
         self.assertEqual(user_id[header.index("most_common_freqs")], "0.1|0.05|0.02")
+
+    def test_pg_stats_carries_the_histogram_in_order(self):
+        rows = read_csv(self.by_path["observations/pg_stats.csv"])
+        header, body = rows[0], rows[1:]
+        users_id = next(row for row in body if row[:3] == ["public", "users", "id"])
+        self.assertEqual(users_id[header.index("histogram_bounds")], "1|250|500|750|1000")
+        self.assertEqual(users_id[header.index("correlation")], "0.98")
+
+    def test_pg_stats_carries_the_column_declaration(self):
+        rows = read_csv(self.by_path["observations/pg_stats.csv"])
+        header, body = rows[0], rows[1:]
+        placed_at = next(row for row in body if row[:3] == ["public", "orders", "placed_at"])
+        self.assertEqual(placed_at[header.index("default_expression")], "now()")
+        self.assertEqual(placed_at[header.index("statistics_target")], "250")
+        users_id = next(row for row in body if row[:3] == ["public", "users", "id"])
+        self.assertEqual(users_id[header.index("identity")], "always")
+
+    def test_pg_class_carries_the_storage_shape(self):
+        rows = read_csv(self.by_path["observations/pg_class.csv"])
+        header, body = rows[0], rows[1:]
+        users = next(row for row in body if row[:2] == ["public", "users"])
+        self.assertEqual(users[header.index("page_count")], "20")
+        self.assertEqual(users[header.index("has_toast")], "true")
+
+    def test_pg_index_carries_one_row_per_key_position(self):
+        rows = read_csv(self.by_path["observations/pg_index.csv"])
+        header, body = rows[0], rows[1:]
+        keys = [row for row in body if row[header.index("index")] == "orders_user_id_idx"]
+        self.assertEqual([row[header.index("position")] for row in keys], ["1", "2", "3"])
+        self.assertEqual([row[header.index("column")] for row in keys],
+                         ["user_id", "placed_at", "id"])
+        self.assertEqual([row[header.index("is_key")] for row in keys],
+                         ["true", "true", "false"])
+        self.assertEqual([row[header.index("descending")] for row in keys],
+                         ["false", "true", "false"])
+
+    def test_pg_sequence_carries_a_bigint_bound_without_rounding(self):
+        rows = read_csv(self.by_path["observations/pg_sequence.csv"])
+        header, body = rows[0], rows[1:]
+        self.assertEqual(body[0][header.index("maximum")], "9223372036854775807")
+
+    def test_a_value_containing_the_separator_is_escaped_not_split(self):
+        """With the values published literally, a pipe inside one of them would
+        otherwise split it in two and shift every frequency after it."""
+        stats = 'public,orders,user_id,0,8,500,"{a|b,c}","{0.1,0.05}",,0.15\n'
+        catalog = a_catalog(column_stats=stats)
+        profile = dbprofiler.build_profile(a_source(), catalog, self.workload)
+        payloads = self.build_payloads(profile=profile, catalog=catalog)
+        rows = read_csv({e.path: e for e in payloads}["observations/pg_stats.csv"])
+        header, body = rows[0], rows[1:]
+        user_id = next(row for row in body if row[:3] == ["public", "orders", "user_id"])
+        self.assertEqual(user_id[header.index("most_common_values")], r"a\|b|c")
 
     def test_pg_stats_ext_reports_one_row_per_column_combination(self):
         rows = read_csv(self.by_path["observations/pg_stats_ext.csv"])
@@ -2244,7 +2345,17 @@ class TestPayloads(BundleCase):
         self.assertEqual(len(body), 1)
         self.assertEqual(body[0][header.index("combination")], "user_id|placed_at")
         self.assertEqual(body[0][header.index("distinct_estimate")], "4200.0")
-        self.assertEqual(body[0][header.index("has_most_common_values")], "true")
+
+    def test_pg_stats_ext_carries_the_dependence_the_planner_would_miss(self):
+        """most_common_base_freqs is what the frequency would have been under
+        the independence assumption. The gap between it and the observed
+        frequency is the correlation, and it is the only reason the extended
+        statistics object exists."""
+        rows = read_csv(self.by_path["observations/pg_stats_ext.csv"])
+        header, body = rows[0], rows[1:]
+        self.assertEqual(body[0][header.index("most_common_freqs")], "0.08|0.03")
+        self.assertEqual(body[0][header.index("most_common_base_freqs")], "0.02|0.01")
+        self.assertIn("2026-01-01", body[0][header.index("most_common_values")])
 
     def test_foreign_keys_carry_the_fan_out_estimate(self):
         rows = read_csv(self.by_path["observations/foreign_keys.csv"])
@@ -2273,40 +2384,26 @@ class TestPayloads(BundleCase):
         self.assertEqual(orders[header.index("last_vacuum")], "")
         self.assertEqual(orders[header.index("autovacuum_count")], "9")
 
-    def test_statement_text_is_replaced_by_a_token(self):
+    def test_statement_text_is_carried_as_postgresql_normalized_it(self):
         rows = read_csv(self.by_path["observations/pg_stat_statements.csv"])
         header, body = rows[0], rows[1:]
-        self.assertNotIn("query", header)
-        for row in body:
-            self.assertRegex(row[header.index("query_token")], r"\A[0-9a-f]{64}\Z")
+        self.assertIn("query_text", header)
+        self.assertTrue(any("$1" in row[header.index("query_text")] for row in body))
 
-    def test_identical_statement_text_tokenizes_identically(self):
-        rows = read_csv(self.by_path["observations/pg_stat_statements.csv"])
-        header, body = rows[0], rows[1:]
-        tokens = {row[header.index("queryid")]: row[header.index("query_token")] for row in body}
-        self.assertEqual(len(tokens), len(body))
+    def test_the_build_is_byte_for_byte_reproducible(self):
         again = dbprofiler.build_payloads(
-            self.profile, self.catalog, self.workload, a_tokenizer(), SCHEMA_SQL
+            self.profile, self.catalog, self.workload, SCHEMA_SQL
         )
         self.assertEqual(
-            self.by_path["observations/pg_stat_statements.csv"].data,
-            {e.path: e for e in again}["observations/pg_stat_statements.csv"].data,
-        )
-
-    def test_a_different_key_produces_different_tokens(self):
-        other = dbprofiler.Tokenizer(b"a-different-example-key-0123456789")
-        rows = dbprofiler.build_payloads(self.profile, self.catalog, self.workload, other,
-                                         SCHEMA_SQL)
-        self.assertNotEqual(
-            self.by_path["observations/pg_stat_statements.csv"].data,
-            {e.path: e for e in rows}["observations/pg_stat_statements.csv"].data,
+            [(e.path, e.data) for e in self.payloads],
+            [(e.path, e.data) for e in again],
         )
 
 
 class TestDegradedPayloads(BundleCase):
     def omitted(self, **overrides):
         workload = a_workload(**overrides)
-        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload)
         payloads = self.build_payloads(profile=profile, workload=workload)
         return {entry.path for entry in payloads}, workload.warnings
 
@@ -2335,7 +2432,7 @@ class TestDegradedPayloads(BundleCase):
 
     def test_a_degraded_bundle_still_publishes(self):
         workload = a_workload(statements_installed="")
-        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload)
         payloads = self.build_payloads(profile=profile, workload=workload)
         manifest = dbprofiler.build_manifest(
             a_source(), FINGERPRINT, payloads, warnings=workload.warnings
@@ -2509,8 +2606,14 @@ class TestWriteBundleRejections(BundleCase):
             dbprofiler.write_bundle(self.destination, tampered, self.manifest)
 
 
-class TestNothingRawReachesDisk(BundleCase):
-    """The negative assertions. Each plants a value and proves its absence."""
+class TestWhatReachesDisk(BundleCase):
+    """What the bundle carries, and what it must never carry.
+
+    The statistics are published as PostgreSQL computed them, so the planted
+    values here are asserted *present* and intact. The negative assertion is
+    reserved for what has no business leaving the operator's machine: the
+    connection URL and the credentials in it.
+    """
 
     def bundle_and_temp(self, payloads=None, manifest=None):
         """Publish, capturing the temporary file's bytes before the rename."""
@@ -2525,41 +2628,33 @@ class TestNothingRawReachesDisk(BundleCase):
             self.publish(payloads=payloads, manifest=manifest)
         return zip_bytes(self.destination) + captured["temp"]
 
-    def test_an_unnormalized_query_literal_never_reaches_the_bundle(self):
+    def with_stats(self, stats):
+        catalog = a_catalog(column_stats=stats)
+        profile = dbprofiler.build_profile(a_source(), catalog, self.workload)
+        payloads = self.build_payloads(profile=profile, catalog=catalog)
+        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
+        return self.bundle_and_temp(payloads, manifest)
+
+    def test_an_unnormalized_query_literal_reaches_the_bundle(self):
         """pg_stat_statements normalizes literals to $1 -- usually. The golden
-        fixture carries one that was not normalized."""
+        fixture carries one that was not, and the bundle carries it through.
+        This is the case the bundle's own documentation has to warn about."""
         statements = golden("statements").replace("sample-region-1", PLANTED)
         workload = a_workload(statements=statements)
         self.assertIn(PLANTED, "".join(s.query_text for s in workload.statements))
 
-        profile = dbprofiler.build_profile(a_source(), self.catalog, workload, self.tokenizer)
+        profile = dbprofiler.build_profile(a_source(), self.catalog, workload)
         payloads = self.build_payloads(profile=profile, workload=workload)
         manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
-        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
+        self.assertIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
 
-    def test_a_most_common_value_never_reaches_the_bundle(self):
+    def test_a_most_common_value_reaches_the_bundle_intact(self):
         stats = golden("column_stats").replace("{1,2,3}", f"{{{PLANTED},2,3}}")
-        catalog = a_catalog(column_stats=stats)
-        self.assertIn(
-            PLANTED,
-            "".join("".join(s.most_common_vals) for s in catalog.column_stats),
-        )
+        self.assertIn(PLANTED.encode("utf-8"), self.with_stats(stats))
 
-        profile = dbprofiler.build_profile(a_source(), catalog, self.workload, self.tokenizer)
-        payloads = self.build_payloads(profile=profile, catalog=catalog)
-        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
-        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
-
-    def test_a_histogram_bound_never_reaches_the_bundle(self):
+    def test_a_histogram_bound_reaches_the_bundle_intact(self):
         stats = golden("column_stats").replace("{1,250,500,750,1000}", f"{{{PLANTED},250}}")
-        catalog = a_catalog(column_stats=stats)
-        profile = dbprofiler.build_profile(a_source(), catalog, self.workload, self.tokenizer)
-        payloads = self.build_payloads(profile=profile, catalog=catalog)
-        manifest = dbprofiler.build_manifest(a_source(), FINGERPRINT, payloads)
-        self.assertNotIn(PLANTED.encode("utf-8"), self.bundle_and_temp(payloads, manifest))
-
-    def test_the_tokenization_key_never_reaches_the_bundle(self):
-        self.assertNotIn(TOKEN_KEY.encode("utf-8"), self.bundle_and_temp())
+        self.assertIn(PLANTED.encode("utf-8"), self.with_stats(stats))
 
     def test_no_connection_detail_reaches_the_bundle(self):
         published = self.bundle_and_temp()
@@ -2594,6 +2689,9 @@ SQL_FIXTURES = {
     dbprofiler.SQL_EXTENDED_STATS: "extended_stats",
     dbprofiler.SQL_FOREIGN_KEYS: "foreign_keys",
     dbprofiler.SQL_INDEXES: "indexes",
+    dbprofiler.SQL_INDEX_COLUMNS: "index_columns",
+    dbprofiler.SQL_SEQUENCES: "sequences",
+    dbprofiler.SQL_DATABASE_COLLATION: "database_collation",
     dbprofiler.SQL_TABLE_ACTIVITY: "table_activity",
     dbprofiler.SQL_INDEX_ACTIVITY: "index_activity",
     dbprofiler.SQL_STATEMENTS_INSTALLED: "statements_installed",
@@ -2649,6 +2747,9 @@ FULL_RUN = [
     "extended_stats",
     "foreign_keys",
     "indexes",
+    "index_columns",
+    "sequences",
+    "database_collation",
     "table_activity",
     "index_activity",
     "statements_installed",
@@ -2668,10 +2769,7 @@ class OrchestrationCase(unittest.TestCase):
 
     def run_cli(self, fake=None, output=None, env=None, extra=()):
         fake = FakePostgres() if fake is None else fake
-        environment = {
-            dbprofiler.URL_ENV_VAR: URL,
-            dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY,
-        }
+        environment = {dbprofiler.URL_ENV_VAR: URL}
         environment.update(env or {})
         argv = ["postgres", "--output", str(output or self.output), *extra]
         with mock.patch.dict("os.environ", environment, clear=True):
@@ -2723,6 +2821,8 @@ class TestOrchestrationOrder(OrchestrationCase):
                 "manifest.json",
                 "observations/foreign_keys.csv",
                 "observations/pg_class.csv",
+                "observations/pg_index.csv",
+                "observations/pg_sequence.csv",
                 "observations/pg_stat_indexes.csv",
                 "observations/pg_stat_statements.csv",
                 "observations/pg_stat_tables.csv",
@@ -2842,7 +2942,7 @@ class TestOrchestrationFailures(OrchestrationCase):
         self.assertEqual(fake.calls, ["server_version"])
 
     def test_an_unsupported_layout_prevents_publication(self):
-        partitioned = golden("tables") + "public,events,p,0,0\n"
+        partitioned = golden("tables") + "public,events,p,0,0,0,f\n"
         self.expect_failure(FakePostgres(tables=partitioned))
 
     def test_cancellation_prevents_publication(self):
@@ -2850,13 +2950,6 @@ class TestOrchestrationFailures(OrchestrationCase):
         fake = self.expect_failure(FakePostgres(table_activity=KeyboardInterrupt()), code=130)
         self.assertEqual(fake.calls[-1], "table_activity")
         self.assertIn("cancelled", self.stderr.getvalue())
-
-    def test_a_missing_tokenization_key_fails_before_connecting(self):
-        """A key that is only discovered missing after collection wastes minutes
-        of the operator's time and a full pass over the catalog."""
-        fake = self.expect_failure(env={dbprofiler.TOKEN_KEY_ENV_VAR: ""})
-        self.assertEqual(fake.calls, [])
-        self.assertIn(dbprofiler.TOKEN_KEY_ENV_VAR, self.stderr.getvalue())
 
     def test_an_unusable_destination_fails_before_connecting(self):
         link = Path(self.directory.name) / "link.zip"
@@ -2875,7 +2968,7 @@ class TestOrchestrationFailures(OrchestrationCase):
 
 
 class TestOrchestrationSecrecy(OrchestrationCase):
-    SECRETS = (URL, PASSWORD, USER, HOST, TOKEN_KEY)
+    SECRETS = (URL, PASSWORD, USER, HOST)
 
     def assert_nothing_leaked(self):
         for stream, name in ((self.stderr, "stderr"), (self.stdout, "stdout")):
@@ -2906,7 +2999,7 @@ class TestOrchestrationSecrecy(OrchestrationCase):
         self.run_cli(FakePostgres(tables=echoed))
         self.assert_nothing_leaked()
 
-    def test_the_child_environment_carries_the_credentials_and_not_our_key(self):
+    def test_the_child_environment_carries_the_credentials_and_not_our_own(self):
         captured = {}
         fake = FakePostgres()
 
@@ -2916,7 +3009,7 @@ class TestOrchestrationSecrecy(OrchestrationCase):
 
         with mock.patch.dict(
             "os.environ",
-            {dbprofiler.URL_ENV_VAR: URL, dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY},
+            {dbprofiler.URL_ENV_VAR: URL},
             clear=True,
         ):
             with mock.patch("subprocess.run", side_effect=record):
@@ -2924,7 +3017,6 @@ class TestOrchestrationSecrecy(OrchestrationCase):
                     with contextlib.redirect_stdout(self.stdout):
                         dbprofiler.main(["postgres", "--output", str(self.output)])
         self.assertEqual(captured["PGPASSWORD"], PASSWORD)
-        self.assertNotIn(dbprofiler.TOKEN_KEY_ENV_VAR, captured)
         self.assertNotIn(dbprofiler.URL_ENV_VAR, captured)
 
     def test_no_credential_reaches_a_child_command_line(self):
@@ -2937,7 +3029,7 @@ class TestOrchestrationSecrecy(OrchestrationCase):
 
         with mock.patch.dict(
             "os.environ",
-            {dbprofiler.URL_ENV_VAR: URL, dbprofiler.TOKEN_KEY_ENV_VAR: TOKEN_KEY},
+            {dbprofiler.URL_ENV_VAR: URL},
             clear=True,
         ):
             with mock.patch("subprocess.run", side_effect=record):
@@ -3025,10 +3117,12 @@ class TestComposeSecrecy(unittest.TestCase):
     def test_the_compose_file_holds_no_connection_string(self):
         self.assertNotIn("://", self.text)
 
-    def test_the_compose_file_holds_no_token_key(self):
-        # The HMAC key belongs to the tool, not the server. If it appeared here
-        # it would also be handed to the container for no reason.
-        self.assertNotIn("DBPROFILER_TOKEN_KEY", self.text)
+    def test_the_compose_file_holds_no_variable_the_profiler_reads(self):
+        # The DBPROFILER_TEST_PG* substitutions below configure the server. The
+        # profiler's own variables carry the URL it connects with, which belongs
+        # to the operator, not to a committed container definition.
+        self.assertNotIn(dbprofiler.URL_ENV_VAR, self.text)
+        self.assertNotIn("DBPROFILER_POSTGRES_TEST_URL", self.text)
 
     def test_every_credential_field_is_a_substitution(self):
         for key in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
@@ -3185,13 +3279,6 @@ class TestIntegrationSuiteScope(unittest.TestCase):
     def test_it_holds_no_credentialed_url(self):
         for line in self.text.splitlines():
             self.assertNotRegex(line, r"://[^/\s]*:[^/\s]*@")
-
-    def test_it_invents_no_new_token_key(self):
-        """Only the synthetic keys the rules fix, so a reviewer grepping for a
-        leaked key can tell test data from the real thing."""
-        found = set(re.findall(r"\"(example-token-key-[0-9]+)\"", self.text))
-        self.assertEqual(found, {"example-token-key-0123456789", "example-token-key-9876543210"})
-        self.assertEqual(re.findall(r"\btoken_key\s*=\s*\"", self.text), [])
 
     def test_it_reads_the_connection_string_only_from_the_environment(self):
         self.assertNotIn("--url", self.text)

@@ -1,4 +1,5 @@
-public,users,users_pkey,t,t
-public,orders,orders_pkey,t,t
-public,orders,orders_user_id_idx,f,f
-sales,invoices,invoices_pkey,t,t
+public,users,users_pkey,t,t,t,t,f,f,1,1
+public,orders,orders_pkey,t,t,t,f,f,f,1,1
+public,orders,orders_user_id_idx,f,f,t,f,f,f,2,3
+public,orders,orders_lower_ref_idx,f,f,t,f,t,t,1,1
+sales,invoices,invoices_pkey,t,t,t,f,f,f,1,1

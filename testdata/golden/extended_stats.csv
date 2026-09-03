@@ -1,1 +1,1 @@
-public,orders,orders_user_placed_stx,"{user_id,placed_at}","{""2, 3"": 4200}",t
+public,orders,orders_user_placed_stx,"{user_id,placed_at}","{""2, 3"": 4200}","{""{1,2026-01-01}"",""{2,2026-06-01}""}","{0.08,0.03}","{0.02,0.01}"

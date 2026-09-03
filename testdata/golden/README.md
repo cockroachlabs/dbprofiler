@@ -22,4 +22,10 @@ orchestration tests, which drive every query in one run and need a reply for eac
 `statements.csv` records `pg_stat_statements` output. Its query text is deliberately
 representative of the worst case: normalized statements with `$1` placeholders, one
 statement carrying an unnormalized literal, and one `queryid` appearing twice. Those
-three shapes are what the top-N dedup and the tokenization tests are written against.
+three shapes are what the top-N dedup tests are written against, and the unnormalized
+literal is what the bundle's own documentation warns a reader to expect.
+
+`index_columns.csv` carries the ordering cases that a single-column index would not
+exercise: a descending key with nulls first, an `INCLUDE` payload column whose
+`indoption` subscript ran past the end of the vector and so arrives as NULL, and an
+expression key with no `attname` at all.

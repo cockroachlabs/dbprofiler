@@ -35,12 +35,11 @@ output from `testdata/golden/`; every value in there is synthetic.
 ## Integration tests
 
 These run the whole tool against a real PostgreSQL 16 and are **skipped unless
-configured**, so a plain `python3 -m unittest` stays offline. They need two environment
-variables:
+configured**, so a plain `python3 -m unittest` stays offline. They need one environment
+variable:
 
 - `DBPROFILER_POSTGRES_TEST_URL` — a connection string for a database you are willing to
   have fixtures created and dropped in.
-- `DBPROFILER_TOKEN_KEY` — any non-empty string.
 
 ### Configuration lives in `.env.test.local`
 
@@ -61,7 +60,6 @@ It defines, one `NAME=value` per line:
 | `DBPROFILER_TEST_PGPORT` | Compose, the loopback port to publish |
 | `DBPROFILER_POSTGRES_URL` | the tool, when you run it by hand |
 | `DBPROFILER_POSTGRES_TEST_URL` | the integration suite |
-| `DBPROFILER_TOKEN_KEY` | tokenization |
 
 Both URLs point at `127.0.0.1` on `DBPROFILER_TEST_PGPORT` with the user, password, and
 database above. There is deliberately no committed example file: an example env file is
@@ -114,13 +112,11 @@ python3 -m unittest integration_test -v
 is echoed. Prefer a subshell — `( set -a; . ./.env.test.local; set +a; python3 -m unittest
 integration_test -v )` — if you would rather the variables not outlive the run.
 
-If the suite reports skips instead of results, one of the two required variables is
-unset. Check which without revealing a value:
+If the suite reports skips instead of results, the required variable is unset. Check
+without revealing its value:
 
 ```bash
-for v in DBPROFILER_POSTGRES_TEST_URL DBPROFILER_TOKEN_KEY; do
-  [ -n "${!v-}" ] && echo "$v set" || echo "$v MISSING"
-done
+[ -n "${DBPROFILER_POSTGRES_TEST_URL-}" ] && echo set || echo MISSING
 ```
 
 ### Stop, and reset
@@ -161,7 +157,12 @@ must never become dependencies.
 
 ## A note on writing tests here
 
-For anything that writes a bundle, assert the negative. Plant a unique value in the
-input and prove the exact bytes on disk do not contain it — searching the archive as
+For anything that writes a bundle, assert on the exact bytes on disk — the archive as
 stored *and* every member decompressed, because a DEFLATE-compressed literal is invisible
 to a search of the raw file. `zip_bytes()` in `test_dbprofiler.py` does both.
+
+Which direction the assertion runs depends on what was planted. A statistic value is
+published deliberately, so plant one and prove it arrives *intact*: that catches a
+collector that silently drops a column or an encoder that mangles a separator, which an
+assertion of absence would not. A credential has no route into a bundle at all, so for
+those the assertion stays negative.

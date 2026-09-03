@@ -4,7 +4,7 @@ Data and workload profiling for migrating workloads to CockroachDB, starting wit
 
 `dbprofiler` connects to a source database, collects a schema and a catalog-derived
 data-shape profile, and writes a checksummed ZIP bundle you can share with a migration
-team — **without reading your data**.
+team — **without scanning your tables**.
 
 > **Status: pre-release.** The `postgres` subcommand collects and publishes a bundle,
 > and the integration suite exercises it end to end against a live PostgreSQL 16. See
@@ -20,13 +20,28 @@ The tool reads catalog and statistics views only. It does not scan user tables.
 - Credentials never appear on a child process command line, in logs, in errors, or in
   the bundle.
 
-Catalog statistics can still embed literal values — `pg_stats` most-common values and
-histogram bounds, and query text in `pg_stat_statements`. Every such value is replaced
-by an HMAC-SHA-256 token before it reaches disk. Equal values tokenize equally within a
-domain, which preserves the join and skew shape a migration needs without disclosing the
-values themselves.
+### What a bundle contains
 
-This is enforced mechanically, not just documented:
+The boundary is about *how* the tool reads, not about what the statistics happen to hold.
+PostgreSQL's own statistics embed literal values from your tables — `pg_stats`
+most-common values and histogram bounds, extended-statistics most-common value lists —
+and `pg_stat_statements` records query text, which is normalized to `$1` placeholders for
+DML but kept verbatim for utility statements. `dbprofiler` publishes all of that as
+PostgreSQL computed it.
+
+That is deliberate. The bundle's purpose is to drive synthetic data generation and
+statistics injection on the target, and both need real value distributions: ordering,
+range boundaries, skew, and physical clustering are exactly the properties a digest or a
+token would destroy.
+
+**Treat a bundle as carrying a sample of your data, and share it accordingly.** It is not
+a full extract — a few hundred values per column at most — but it is not anonymized
+either. Read `observations/pg_stats.csv` and `observations/pg_stat_statements.csv` in a
+bundle before sending one anywhere you would not send a data sample.
+
+### Mechanical enforcement
+
+The boundary is enforced by the tool, not just documented:
 
 ```bash
 python3 dbprofiler.py --check-safety
@@ -80,7 +95,6 @@ It is a single file with no dependencies, so you can read all of it before you r
 
 ```bash
 export DBPROFILER_POSTGRES_URL='postgres://...'   # parsed once, never logged
-export DBPROFILER_TOKEN_KEY='...'                 # HMAC key for tokenization
 
 python3 dbprofiler.py postgres --output ./source-profile.zip
 ```
@@ -98,10 +112,10 @@ transaction, so a migration running concurrently would otherwise produce a bundl
 mixed two versions of a schema; if the fingerprints disagree the run fails and writes
 nothing. Cancelling with Ctrl-C leaves no partial bundle behind.
 
-`DBPROFILER_TOKEN_KEY` is read from the environment only — never from an argument, so it
-cannot appear in a process listing — and there is no default, because a default would
-tokenize every deployment identically. Keep it: re-running with the same key produces
-comparable tokens, and a different key makes two bundles impossible to correlate.
+Two runs against an unchanged source produce byte-identical *payloads* — entries are
+written in a fixed order, with a fixed archive timestamp, so the SHA-256 of every entry
+in `manifest.json` can be compared between runs. The manifest itself records when the
+collection ran, so the archive as a whole differs run to run by that one field.
 
 ## Bundle contents
 
@@ -111,14 +125,20 @@ source-profile.zip
 ├── schema.sql             # pg_dump --schema-only --no-owner --no-privileges
 ├── profile.json           # normalized contract
 └── observations/
-    ├── pg_class.csv
-    ├── pg_stats.csv
-    ├── pg_stats_ext.csv
+    ├── pg_class.csv             # row and page counts, TOAST presence
+    ├── pg_stats.csv             # per-column distribution, ordering, correlation
+    ├── pg_stats_ext.csv         # multi-column distribution where it exists
+    ├── pg_index.csv             # one row per index key position
+    ├── pg_sequence.csv          # sequence parameters
     ├── foreign_keys.csv
     ├── pg_stat_indexes.csv
     ├── pg_stat_tables.csv
     └── pg_stat_statements.csv   # omitted with a warning if the extension is absent
 ```
+
+`observations/` holds one CSV per statistics source, as close to what the source returned
+as the format allows. `profile.json` is the normalized contract derived from them —
+versioned, and the thing downstream tooling should read.
 
 `manifest.json` records a SHA-256 of every other entry's uncompressed bytes, so a
 recipient can verify the bundle without trusting the transport. It is written last,
@@ -139,8 +159,8 @@ Deliberately out of scope for now, so that what is here can be reviewed as a who
 - **No other source types.** MySQL and Oracle would each be their own subcommand.
 - **Tier 1 workload telemetry only** — table, index, and statement counters. Per-block
   I/O, replication, bgwriter and WAL, and function statistics are not collected.
-- **No configurable privacy policy.** Tokenization is always on and is not tunable;
-  there is no mode that emits raw values.
+- **No redaction or masking.** Statistics are published as PostgreSQL computed them.
+  There is no mode that suppresses, hashes, or masks the values they contain.
 - **No `--schema-file` or `--exclude-code`.** Scope is set with `--schema-include` and
   `--schema-exclude` only.
 - **Coarse unsupported-type reporting.** A column is marked supported or not; the bundle

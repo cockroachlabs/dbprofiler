@@ -1,5 +1,4 @@
-# Local test environment — contains connection strings and the HMAC key.
-# Never commit.
+# Local test environment — contains connection strings. Never commit.
 .env.test.local
 
 # Profile bundles produced by running the tool.
@@ -13,3 +12,6 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 dist/
+
+# macOS
+.DS_Store

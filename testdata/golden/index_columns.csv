@@ -1,0 +1,7 @@
+public,users,users_pkey,1,id,0,int8_ops,,t
+public,orders,orders_pkey,1,id,0,int8_ops,,t
+public,orders,orders_user_id_idx,1,user_id,0,int8_ops,,t
+public,orders,orders_user_id_idx,2,placed_at,3,timestamptz_ops,,t
+public,orders,orders_user_id_idx,3,id,,,,f
+public,orders,orders_lower_ref_idx,1,,0,text_ops,C,t
+sales,invoices,invoices_pkey,1,id,0,int8_ops,,t

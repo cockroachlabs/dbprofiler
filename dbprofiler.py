@@ -24,11 +24,14 @@ This tool does not read your data. Concretely, and enforced mechanically by
   * Credentials are never placed on a child process command line and never
     appear in logs, errors, or the published bundle.
 
-Catalog statistics can still embed literal user values -- ``pg_stats`` most-common
-values and histogram bounds, and query text in ``pg_stat_statements``. Every such
-value is replaced by an HMAC-SHA-256 token before it reaches the filesystem. Equal
-values tokenize equally within a domain, which preserves the join and skew shape a
-migration needs without disclosing the values themselves.
+What the boundary does *not* do is obscure the statistics themselves. ``pg_stats``
+most-common values and histogram bounds are literal user values, and they are
+published as PostgreSQL computed them. That is deliberate: their order, their
+spacing and their skew are the whole signal. A value-preserving transform that
+destroyed ordering would leave a bundle that cannot reproduce a range scan, an
+index's physical clustering, or a write hotspot -- the findings a migration plan
+is being built to surface. Treat a bundle as carrying a sample of the source data
+and share it accordingly.
 
 Everything the tool does lives in this one file, so that a reviewer can read it
 end to end before running it against a production database.
@@ -37,7 +40,6 @@ USAGE
 =====
 
     export DBPROFILER_POSTGRES_URL='postgres://...'
-    export DBPROFILER_TOKEN_KEY='...'
 
     python3 dbprofiler.py postgres --output source-profile.zip
     python3 dbprofiler.py --check-safety
@@ -50,9 +52,7 @@ import argparse
 import ast
 import csv
 import datetime
-import decimal
 import hashlib
-import hmac
 import io
 import json
 import math
@@ -62,7 +62,6 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-import uuid
 import zipfile
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -71,14 +70,11 @@ VERSION = "0.1.0"
 
 # Version of the normalized profile contract written to profile.json. Any change
 # to field names or semantics in the contract dataclasses must bump this.
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "2.0"
 
 PROG = "dbprofiler"
 
 URL_ENV_VAR = "DBPROFILER_POSTGRES_URL"
-# The name of the variable, not a key. The key itself is only ever read from the
-# environment at runtime and is never stored in a module constant.
-TOKEN_KEY_ENV_VAR = "DBPROFILER_TOKEN_KEY"  # noqa: S105
 
 DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -182,6 +178,7 @@ ALLOWED_RELATIONS = frozenset(
         "pg_attrdef",
         "pg_attribute",
         "pg_class",
+        "pg_collation",
         "pg_constraint",
         "pg_database",
         "pg_description",
@@ -189,6 +186,7 @@ ALLOWED_RELATIONS = frozenset(
         "pg_index",
         "pg_inherits",
         "pg_namespace",
+        "pg_opclass",
         "pg_sequence",
         "pg_stat_statements",
         "pg_stat_statements_info",
@@ -373,6 +371,16 @@ def check_safety() -> int:
 
 SQL_SERVER_VERSION = "SELECT current_setting('server_version_num')::int"
 
+# The database's default collation and character classification. Text ordering is
+# collation-dependent -- 'C' sorts by byte, 'en_US.UTF-8' does not -- so the
+# histogram bounds below are only in sorted order with respect to this. A consumer
+# rebuilding an index or a range partition on the target has to know which.
+SQL_DATABASE_COLLATION = """
+SELECT d.datcollate, d.datctype
+FROM pg_catalog.pg_database d
+WHERE d.datname = pg_catalog.current_database()
+"""
+
 # One row per user relation, for the catalog fingerprint. Reads names and kinds
 # only -- no column contents, no statistics, nothing from inside a table. The
 # left() test excludes pg_catalog, pg_toast, pg_temp_N and pg_toast_temp_N in one
@@ -388,9 +396,16 @@ WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
 # by autovacuum -- reading it is what makes profiling a large table free. The
 # relkind filter includes 'p' and 'I' deliberately: the layout check below has
 # to see a partitioned object in order to reject it.
+#
+# relpages is the main fork in 8 KiB pages, so relpages against reltuples gives
+# bytes per row as stored rather than as declared -- the number that says whether
+# a synthetic table will occupy the same space. reltoastrelid is reduced to a
+# boolean: the OID means nothing off the source server, but "some rows in this
+# table were moved out of line" changes the storage arithmetic.
 SQL_TABLES = """
 SELECT n.nspname, c.relname, c.relkind, c.reltuples,
-       pg_catalog.pg_total_relation_size(c.oid)
+       pg_catalog.pg_total_relation_size(c.oid),
+       c.relpages, (c.reltoastrelid <> 0)
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'm', 'p', 'I')
@@ -409,14 +424,33 @@ WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
 # Column shape. format_type gives the declared type as an operator would write
 # it; typname, typtype and typcategory give the classifier something stable to
 # match on, since "character varying(50)" and "varchar" are the same type.
+#
+# Four things past the declared type, each about how the column's values are
+# ordered or produced:
+#
+#   collname is the column's collation. Two text columns with identical
+#   histogram bounds sort differently under 'C' and under 'en_US.UTF-8', so the
+#   bounds are not interpretable without it.
+#   pg_get_expr(ad.adbin) is the DEFAULT expression, and attidentity carries the
+#   GENERATED ... AS IDENTITY case, which does not appear in pg_attrdef at all.
+#   Read together they say whether a column's values are sequential -- the shape
+#   that produces a write hotspot on the target.
+#   attstattarget is how many histogram buckets the operator asked for, -1 for
+#   the default. A column whose target was lowered has a coarser histogram than
+#   the rest of the profile, and the difference is not otherwise visible.
 SQL_COLUMNS = """
 SELECT n.nspname, c.relname, a.attname, a.attnum,
        pg_catalog.format_type(a.atttypid, a.atttypmod),
-       t.typname, t.typtype, t.typcategory, a.attnotnull
+       t.typname, t.typtype, t.typcategory, a.attnotnull,
+       col.collname, pg_catalog.pg_get_expr(ad.adbin, ad.adrelid),
+       a.attidentity, a.attstattarget
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+LEFT JOIN pg_catalog.pg_collation col ON col.oid = a.attcollation
+LEFT JOIN pg_catalog.pg_attrdef ad
+  ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum AND a.atthasdef
 WHERE a.attnum > 0 AND NOT a.attisdropped
   AND c.relkind IN ('r', 'm')
   AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
@@ -425,21 +459,38 @@ WHERE a.attnum > 0 AND NOT a.attisdropped
 # Per-column statistics as PostgreSQL already computed them. pg_stats is a view
 # over pg_statistic that shows a row only where the caller could read the table
 # itself, which is why this reads the view and never the underlying catalog.
-# most_common_vals and histogram_bounds are raw customer values; they are held in
-# memory here and tokenized before anything is written.
+#
+# most_common_vals and histogram_bounds are literal customer values, published as
+# they are found. histogram_bounds is equi-depth and sorted ascending by
+# construction, so the gaps between adjacent bounds are the column's distribution
+# shape; most_common_vals is ordered by frequency and pairs positionally with
+# most_common_freqs.
+#
+# correlation is the statistical correlation between physical row order and
+# logical value order, from -1 to 1. It is what says whether an index scan over
+# this column reads sequentially or jumps, and it is computed over the non-null
+# values only -- null clustering does not appear in it.
 SQL_COLUMN_STATS = """
 SELECT s.schemaname, s.tablename, s.attname, s.null_frac, s.avg_width, s.n_distinct,
-       s.most_common_vals::text, s.most_common_freqs::text, s.histogram_bounds::text
+       s.most_common_vals::text, s.most_common_freqs::text, s.histogram_bounds::text,
+       s.correlation
 FROM pg_catalog.pg_stats s
 WHERE left(s.schemaname, 3) <> 'pg_' AND s.schemaname <> 'information_schema'
 """
 
-# Multicolumn statistics, where the operator has already created them. Only the
-# n-distinct estimate and the existence of an MCV list are read: the MCV entries
-# themselves are raw values, and their presence is all a migration plan needs.
+# Multicolumn statistics, where the operator has already created them. The
+# n-distinct estimate says how far the columns are from independent; the MCV list
+# says which combinations are hot, which single-column statistics cannot express
+# -- (state='CA', city='Fresno') is common and (state='NY', city='Fresno') is not,
+# and neither column alone shows that.
+#
+# most_common_base_freqs is the frequency the planner would have assumed under
+# independence. Published beside the real one because the ratio between them is
+# the correlation the extended statistics object exists to record.
 SQL_EXTENDED_STATS = """
 SELECT e.schemaname, e.tablename, e.statistics_name, e.attnames::text,
-       e.n_distinct::text, (e.most_common_freqs IS NOT NULL)
+       e.n_distinct::text, e.most_common_vals::text, e.most_common_freqs::text,
+       e.most_common_base_freqs::text
 FROM pg_catalog.pg_stats_ext e
 WHERE left(e.schemaname, 3) <> 'pg_' AND e.schemaname <> 'information_schema'
 """
@@ -464,8 +515,8 @@ WHERE con.contype = 'f'
 ORDER BY con.conname, k.ord
 """
 
-# Index inventory. The DDL is already in schema.sql; this is the machine-readable
-# form that pairs with the Tier 1 usage counters.
+# Per-table activity counters: what the source actually does to each table, as
+# opposed to what it holds.
 SQL_TABLE_ACTIVITY = """
 SELECT s.schemaname, s.relname, s.seq_scan, s.seq_tup_read, s.idx_scan,
        s.idx_tup_fetch, s.n_tup_ins, s.n_tup_upd, s.n_tup_del, s.n_tup_hot_upd,
@@ -521,11 +572,63 @@ WHERE t.by_time <= 200 OR t.by_calls <= 200
 ORDER BY t.by_time
 """
 
+# Index inventory. The DDL is in schema.sql already; this is the machine-readable
+# form, and it carries the facts a consumer would otherwise have to recover by
+# parsing DDL: whether the index is partial, whether it is over an expression
+# rather than plain columns, whether it is still being built, and whether the
+# heap was ever clustered on it.
 SQL_INDEXES = """
-SELECT n.nspname, c.relname, ic.relname, i.indisunique, i.indisprimary
+SELECT n.nspname, c.relname, ic.relname, i.indisunique, i.indisprimary,
+       i.indisvalid, i.indisclustered, (i.indpred IS NOT NULL),
+       (i.indexprs IS NOT NULL), i.indnkeyatts, i.indnatts
 FROM pg_catalog.pg_index i
 JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
 JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+"""
+
+# One row per index key position, in declared order. This is the ordering
+# metadata: which columns form the key, in what sequence, ascending or
+# descending, nulls first or last, under which operator class and collation.
+# A composite index on (tenant_id, created_at DESC) clusters rows very
+# differently from one on (created_at, tenant_id), and nothing in the counters
+# distinguishes them.
+#
+# indkey holds indnatts entries while indoption, indclass and indcollation hold
+# only indnkeyatts, so the subscripts go out of range on an INCLUDE column and
+# PostgreSQL yields NULL -- which is the right answer: a payload column has no
+# sort direction. The subscripts are 0-based, hence ord - 1. attnum is 0 for an
+# expression key, which matches no pg_attribute row, so the join is LEFT and the
+# position still appears with no name.
+SQL_INDEX_COLUMNS = """
+SELECT n.nspname, c.relname, ic.relname, k.ord, a.attname,
+       i.indoption[k.ord - 1], oc.opcname, col.collname,
+       (k.ord <= i.indnkeyatts)
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+LEFT JOIN pg_catalog.pg_attribute a
+  ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND NOT a.attisdropped
+LEFT JOIN pg_catalog.pg_opclass oc ON oc.oid = i.indclass[k.ord - 1]
+LEFT JOIN pg_catalog.pg_collation col ON col.oid = i.indcollation[k.ord - 1]
+WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+ORDER BY n.nspname, c.relname, ic.relname, k.ord
+"""
+
+# Sequence parameters. A sequence-backed key is the classic monotonically
+# increasing index key, and start, increment and bounds are what let a consumer
+# reproduce the same key stream -- and the same tail-of-the-index write pattern
+# -- rather than a random one. The current value is deliberately not read: it
+# lives in the sequence relation itself, not in the catalog, and reading it would
+# put this tool outside the catalog boundary.
+SQL_SEQUENCES = """
+SELECT n.nspname, c.relname, s.seqstart, s.seqincrement, s.seqmin, s.seqmax,
+       s.seqcache, s.seqcycle
+FROM pg_catalog.pg_sequence s
+JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
 """
@@ -563,6 +666,10 @@ class Source:
     server_version: str  # e.g. "16.2"
     database: str
     collected_schemas: tuple[str, ...] = ()
+    # The database default collation and ctype. Text ordering is meaningless
+    # without them: histogram bounds are sorted under this collation and no other.
+    collate: str = ""
+    ctype: str = ""
 
 
 @dataclass(frozen=True)
@@ -580,10 +687,61 @@ class Column:
     # to mean "fraction of rows"; normalization resolves that to a count here so
     # consumers never have to know the encoding.
     distinct_estimate: float | None = None
-    most_common_tokens: tuple[str, ...] = ()  # HMAC tokens, never raw values
+    # Literal source values. Ordered by descending frequency and positionally
+    # paired with most_common_freqs.
+    most_common_values: tuple[str, ...] = ()
     most_common_freqs: tuple[float, ...] = ()
-    histogram_token_bounds: tuple[str, ...] = ()  # HMAC tokens, never raw bounds
+    # Literal equi-depth bucket boundaries, ascending under `collation`. Adjacent
+    # bounds delimit buckets holding roughly equal numbers of rows, so the
+    # spacing between them is the distribution and not an artifact.
+    histogram_bounds: tuple[str, ...] = ()
+    # Physical-to-logical order correlation, -1 to 1, over non-null values only.
+    correlation: float | None = None
+    collation: str | None = None  # absent for a type that is not collatable
+    default_expression: str | None = None
+    identity: str | None = None  # "always" | "by default" -- GENERATED AS IDENTITY
+    statistics_target: int | None = None  # None when the column uses the default
     provenance: str = ""  # PostgreSQL-native semantics behind the normalized values
+
+
+@dataclass(frozen=True)
+class IndexColumn:
+    """One key position of an index, in declared order."""
+
+    position: int  # 1-based
+    name: str | None  # absent for an expression key; the expression is in schema.sql
+    is_key: bool  # False for an INCLUDE payload column
+    descending: bool = False
+    nulls_first: bool = False
+    operator_class: str | None = None
+    collation: str | None = None
+
+
+@dataclass(frozen=True)
+class Index:
+    schema: str
+    table: str
+    name: str
+    is_unique: bool
+    is_primary: bool
+    is_valid: bool = True
+    is_clustered: bool = False  # the heap was last CLUSTERed on this index
+    is_partial: bool = False  # has a WHERE predicate; the predicate is in schema.sql
+    has_expressions: bool = False  # at least one key is an expression
+    columns: tuple[IndexColumn, ...] = ()
+    provenance: str = ""
+
+
+@dataclass(frozen=True)
+class Sequence:
+    schema: str
+    name: str
+    start: int
+    increment: int
+    minimum: int
+    maximum: int
+    cache: int
+    cycles: bool
 
 
 @dataclass(frozen=True)
@@ -592,6 +750,8 @@ class Table:
     name: str
     row_count_estimate: float  # pg_class.reltuples -- an estimate, never a COUNT(*)
     size_bytes: int
+    page_count: int = 0  # pg_class.relpages -- main fork only, in 8 KiB pages
+    has_toast: bool = False
     columns: tuple[Column, ...] = ()
     provenance: str = ""
 
@@ -635,6 +795,8 @@ class Profile:
     contract_version: str = CONTRACT_VERSION
     tables: tuple[Table, ...] = ()
     relationships: tuple[Relationship, ...] = ()
+    indexes: tuple[Index, ...] = ()
+    sequences: tuple[Sequence, ...] = ()
     warnings: tuple[ProfileWarning, ...] = ()
 
 
@@ -919,9 +1081,9 @@ def safe_env(config: PostgresConfig) -> dict[str, str]:
 
     Starts from our own environment so the customer's PGSSLMODE, PGSSLROOTCERT
     and friends keep working, drops every DBPROFILER_* variable so no child ever
-    sees the raw URL or the token key, then lets the parsed connection settings
-    win. LC_ALL is pinned so error text and number formatting do not depend on
-    the operator's locale.
+    sees the raw URL, then lets the parsed connection settings win. LC_ALL is
+    pinned so error text and number formatting do not depend on the operator's
+    locale.
     """
     env = {key: value for key, value in os.environ.items() if not key.startswith("DBPROFILER_")}
     env.update(config.env)
@@ -1120,6 +1282,17 @@ def pg_bool(text: str) -> bool:
 
 
 def pg_int(text: str, default: int = 0) -> int:
+    """Parse an integer field, tolerating the float form PostgreSQL renders some in.
+
+    The exact parse comes first because it is the only one that survives a
+    64-bit bound: bigint's maximum does not fit a float64, and routing it
+    through one silently returns a number one larger than the value the
+    sequence will actually stop at.
+    """
+    try:
+        return int(text)
+    except ValueError:
+        pass
     try:
         return int(float(text))
     except ValueError:
@@ -1131,6 +1304,17 @@ def pg_float(text: str) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def pg_text(text: str) -> str | None:
+    """Parse a text field that may be NULL.
+
+    ``--csv`` renders NULL as an empty field, so the two are indistinguishable
+    on the wire. Every caller reads a catalog column -- a collation name, an
+    operator class, a default expression, an identity kind -- that PostgreSQL
+    cannot store as the empty string, so an empty field can only be NULL.
+    """
+    return text or None
 
 
 def parse_pg_array(text: str) -> tuple[str, ...]:
@@ -1241,6 +1425,8 @@ class CatalogTable:
     relkind: str
     reltuples: float
     size_bytes: int
+    relpages: int = 0
+    has_toast: bool = False
 
 
 @dataclass(frozen=True)
@@ -1253,11 +1439,15 @@ class CatalogColumn:
     type_name: str
     is_nullable: bool
     is_supported: bool
+    collation: str | None = None
+    default_expression: str | None = None
+    identity: str | None = None  # pg_attribute.attidentity, spelled out
+    stats_target: int = -1  # -1 is "use the system default"
 
 
 @dataclass(frozen=True)
 class ColumnStatistics:
-    """One pg_stats row. most_common_vals and histogram_bounds are raw values."""
+    """One pg_stats row, holding the source's own values."""
 
     schema: str
     table: str
@@ -1268,6 +1458,7 @@ class ColumnStatistics:
     most_common_vals: tuple[str, ...]
     most_common_freqs: tuple[float, ...]
     histogram_bounds: tuple[str, ...]
+    correlation: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1280,7 +1471,11 @@ class ExtendedStatistics:
     # composite fan-out looks up an exact column set; this is a collection
     # record, not part of the serialized contract.
     n_distinct: dict
-    has_most_common_values: bool
+    # Each element is one combination of values across `columns`, rendered by
+    # PostgreSQL as a nested array literal.
+    most_common_vals: tuple[str, ...] = ()
+    most_common_freqs: tuple[float, ...] = ()
+    most_common_base_freqs: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1498,37 @@ class CatalogIndex:
     name: str
     is_unique: bool
     is_primary: bool
+    is_valid: bool = True
+    is_clustered: bool = False
+    is_partial: bool = False
+    has_expressions: bool = False
+    key_attribute_count: int = 0  # indnkeyatts
+    attribute_count: int = 0  # indnatts, key columns plus INCLUDE payload
+
+
+@dataclass(frozen=True)
+class CatalogIndexColumn:
+    schema: str
+    table: str
+    index: str
+    position: int  # 1-based, as declared
+    name: str | None  # None for an expression key
+    option_bits: int | None  # pg_index.indoption; None for an INCLUDE column
+    operator_class: str | None
+    collation: str | None
+    is_key: bool
+
+
+@dataclass(frozen=True)
+class CatalogSequence:
+    schema: str
+    name: str
+    start: int
+    increment: int
+    minimum: int
+    maximum: int
+    cache: int
+    cycles: bool
 
 
 @dataclass(frozen=True)
@@ -1313,6 +1539,10 @@ class CatalogObservations:
     extended_stats: tuple[ExtendedStatistics, ...] = ()
     foreign_keys: tuple[CatalogForeignKey, ...] = ()
     indexes: tuple[CatalogIndex, ...] = ()
+    index_columns: tuple[CatalogIndexColumn, ...] = ()
+    sequences: tuple[CatalogSequence, ...] = ()
+    collate: str = ""
+    ctype: str = ""
 
 
 # pg_constraint stores referential actions as single characters.
@@ -1328,6 +1558,17 @@ REFERENTIAL_ACTIONS = {
 # row-count and fan-out arithmetic -- a parent's reltuples is not the sum of its
 # children, and a fan-out computed as though it were would be silently wrong.
 UNSUPPORTED_RELKINDS = {"p": "partitioned table", "I": "partitioned index"}
+
+# pg_index.indoption flag bits, per position.
+INDOPTION_DESC = 0x0001
+INDOPTION_NULLS_FIRST = 0x0002
+
+# pg_attribute.attidentity. Empty means the column is not an identity column.
+IDENTITY_KINDS = {"a": "always", "d": "by default"}
+
+# pg_attribute.attstattarget when the column uses whatever default_statistics_target
+# happens to be set to. Reported as absent rather than as -1.
+DEFAULT_STATS_TARGET = -1
 
 
 def collect_catalog(config: PostgresConfig) -> CatalogObservations:
@@ -1347,9 +1588,11 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
             relkind=row[2],
             reltuples=pg_float(row[3]) or 0.0,
             size_bytes=pg_int(row[4]),
+            relpages=pg_int(row[5]),
+            has_toast=pg_bool(row[6]),
         )
         for row in run_psql(SQL_TABLES, config)
-        if len(row) == 5 and in_scope(row[0])
+        if len(row) == 7 and in_scope(row[0])
     )
     inherited = tuple(
         (row[0], row[1]) for row in run_psql(SQL_INHERITED, config) if row and in_scope(row[0])
@@ -1366,9 +1609,13 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
             type_name=row[5],
             is_nullable=not pg_bool(row[8]),
             is_supported=is_supported_type(row[5], row[6], row[7]),
+            collation=pg_text(row[9]),
+            default_expression=pg_text(row[10]),
+            identity=IDENTITY_KINDS.get(row[11]),
+            stats_target=pg_int(row[12], DEFAULT_STATS_TARGET),
         )
         for row in run_psql(SQL_COLUMNS, config)
-        if len(row) == 9 and in_scope(row[0])
+        if len(row) == 13 and in_scope(row[0])
     )
 
     column_stats = tuple(
@@ -1382,9 +1629,10 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
             most_common_vals=parse_pg_array(row[6]),
             most_common_freqs=parse_pg_float_array(row[7]),
             histogram_bounds=parse_pg_array(row[8]),
+            correlation=pg_float(row[9]),
         )
         for row in run_psql(SQL_COLUMN_STATS, config)
-        if len(row) == 9 and in_scope(row[0])
+        if len(row) == 10 and in_scope(row[0])
     )
 
     attnums = {(c.schema, c.table, c.ordinal): c.name for c in columns}
@@ -1395,10 +1643,12 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
             name=row[2],
             columns=parse_pg_array(row[3]),
             n_distinct=parse_extended_n_distinct(row[4], row[0], row[1], attnums),
-            has_most_common_values=pg_bool(row[5]),
+            most_common_vals=parse_pg_array(row[5]),
+            most_common_freqs=parse_pg_float_array(row[6]),
+            most_common_base_freqs=parse_pg_float_array(row[7]),
         )
         for row in run_psql(SQL_EXTENDED_STATS, config)
-        if len(row) == 6 and in_scope(row[0])
+        if len(row) == 8 and in_scope(row[0])
     )
 
     foreign_keys = assemble_foreign_keys(
@@ -1412,10 +1662,52 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
             name=row[2],
             is_unique=pg_bool(row[3]),
             is_primary=pg_bool(row[4]),
+            is_valid=pg_bool(row[5]),
+            is_clustered=pg_bool(row[6]),
+            is_partial=pg_bool(row[7]),
+            has_expressions=pg_bool(row[8]),
+            key_attribute_count=pg_int(row[9]),
+            attribute_count=pg_int(row[10]),
         )
         for row in run_psql(SQL_INDEXES, config)
-        if len(row) == 5 and in_scope(row[0])
+        if len(row) == 11 and in_scope(row[0])
     )
+
+    index_columns = tuple(
+        CatalogIndexColumn(
+            schema=row[0],
+            table=row[1],
+            index=row[2],
+            position=pg_int(row[3]),
+            # An expression key has attnum 0, which joins to no pg_attribute row.
+            name=pg_text(row[4]),
+            # An INCLUDE column has no entry in indoption, so the subscript ran
+            # off the end and psql rendered NULL. That is absent, not zero.
+            option_bits=None if row[5] == "" else pg_int(row[5]),
+            operator_class=pg_text(row[6]),
+            collation=pg_text(row[7]),
+            is_key=pg_bool(row[8]),
+        )
+        for row in run_psql(SQL_INDEX_COLUMNS, config)
+        if len(row) == 9 and in_scope(row[0])
+    )
+
+    sequences = tuple(
+        CatalogSequence(
+            schema=row[0],
+            name=row[1],
+            start=pg_int(row[2]),
+            increment=pg_int(row[3]),
+            minimum=pg_int(row[4]),
+            maximum=pg_int(row[5]),
+            cache=pg_int(row[6]),
+            cycles=pg_bool(row[7]),
+        )
+        for row in run_psql(SQL_SEQUENCES, config)
+        if len(row) == 8 and in_scope(row[0])
+    )
+
+    collate, ctype = collect_database_collation(config)
 
     return CatalogObservations(
         tables=tuple(t for t in tables if t.relkind not in UNSUPPORTED_RELKINDS),
@@ -1424,7 +1716,19 @@ def collect_catalog(config: PostgresConfig) -> CatalogObservations:
         extended_stats=extended_stats,
         foreign_keys=foreign_keys,
         indexes=indexes,
+        index_columns=index_columns,
+        sequences=sequences,
+        collate=collate,
+        ctype=ctype,
     )
+
+
+def collect_database_collation(config: PostgresConfig) -> tuple[str, str]:
+    """Return (datcollate, datctype) for the database being profiled."""
+    for row in run_psql(SQL_DATABASE_COLLATION, config):
+        if len(row) == 2:
+            return row[0], row[1]
+    return "", ""
 
 
 def require_supported_layout(tables, inherited) -> None:
@@ -1539,7 +1843,7 @@ class IndexActivity:
 
 @dataclass(frozen=True)
 class StatementActivity:
-    """One pg_stat_statements entry. query_text is raw and is never serialized."""
+    """One pg_stat_statements entry, with the statement text as the view holds it."""
 
     queryid: str
     query_text: str
@@ -1738,168 +2042,6 @@ def dedupe_statements(rows) -> tuple[StatementActivity, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Tokenization
-# ---------------------------------------------------------------------------
-# Catalog statistics embed literal customer values: pg_stats most-common values
-# and histogram bounds are actual rows. Every one of them is replaced by an
-# HMAC-SHA-256 token before anything is written.
-#
-# The property that has to survive is equality within a domain. A foreign key is
-# only visible in the profile if the same value on the child and the parent
-# tokenizes identically, and skew is only visible if a hot value stays a single
-# distinct token. Everything below exists to preserve that equality and nothing
-# more: no ordering, no length, no prefix.
-
-# Shorter than this and the tokens are reversible by brute force over a small
-# value space -- a hundred-row lookup table falls in seconds. There is
-# deliberately no default: one would tokenize every deployment identically,
-# which is the same as not tokenizing at all.
-MIN_TOKEN_KEY_LENGTH = 16
-
-# Separates domain from value in the hashed material. Without it, domain "ab"
-# with value "c" and domain "a" with value "bc" would produce the same token,
-# and a value could be made to impersonate one from another column.
-DOMAIN_SEPARATOR = "\x00"
-
-# Distinguishes SQL NULL from the empty string, which are different values that
-# would otherwise hash identically.
-NULL_SENTINEL = "\x00NULL"
-
-# Types whose tokens are reshaped to stay loadable as that type. The profile is
-# meant to be replayed into a CockroachDB schema for sizing; a 64-character hex
-# string in a uuid column would force the migration team to retype it, at which
-# point the shape under test is no longer the shape being migrated.
-UUID_TYPE_NAMES = frozenset({"uuid"})
-
-# Types whose text form is canonicalized numerically before hashing. PostgreSQL
-# permits a foreign key across int4 and int8, and renders 42 and 42.0 for the
-# same number; both sides have to hash alike. Text is deliberately excluded:
-# "0001" and "1" are different strings, and collapsing them would merge two
-# most-common values into one token and corrupt the frequency it carries.
-NUMERIC_TYPE_NAMES = frozenset(
-    {"float4", "float8", "int2", "int4", "int8", "numeric", "oid"}
-)
-
-
-def load_token_key(env: dict[str, str] | None = None) -> bytes:
-    """Read the tokenization key from the environment, once, at startup.
-
-    Read from the environment rather than an argument so it never appears in a
-    process listing. No error below echoes the value.
-    """
-    raw = (env if env is not None else os.environ).get(TOKEN_KEY_ENV_VAR, "")
-    if not raw.strip():
-        raise ConfigError(
-            f"{TOKEN_KEY_ENV_VAR} is not set; it is the key that tokenizes statistic "
-            "values, and there is no default because a default would tokenize every "
-            "deployment identically"
-        )
-    if len(raw) < MIN_TOKEN_KEY_LENGTH:
-        raise ConfigError(
-            f"{TOKEN_KEY_ENV_VAR} is shorter than {MIN_TOKEN_KEY_LENGTH} characters; a "
-            "short key makes the tokens reversible by brute force"
-        )
-    return raw.encode("utf-8")
-
-
-def token_domain(schema: str, table: str, column: str) -> str:
-    """The tokenization domain for one column.
-
-    Separated by the same NUL as the value, because PostgreSQL permits a dot
-    inside a quoted identifier and a dotted join would let one column's values
-    impersonate another's.
-    """
-    return DOMAIN_SEPARATOR.join((schema, table, column))
-
-
-def canonical_number(text: str) -> str | None:
-    """Return the canonical decimal form of text, or None if it is not one."""
-    try:
-        number = decimal.Decimal(text)
-    except (decimal.InvalidOperation, ValueError):
-        return None
-    if not number.is_finite():  # NaN and Infinity are legal float8 values.
-        return None
-    return format(number.normalize(), "f")
-
-
-def canonical_uuid(text: str) -> str | None:
-    """Return the canonical uuid form of text, or None if it is not one."""
-    try:
-        return str(uuid.UUID(text))
-    except (ValueError, AttributeError):
-        return None
-
-
-def repr_typed(value: str | None, type_name: str = "") -> str:
-    """Canonical text of a source value, for hashing.
-
-    The type name steers canonicalization but is never itself hashed: a foreign
-    key may cross int4 and int8, and folding the type into the material would
-    break exactly the equality these tokens exist to preserve.
-    """
-    if value is None:
-        return NULL_SENTINEL
-
-    lowered = type_name.lower()
-    if lowered in NUMERIC_TYPE_NAMES:
-        canonical = canonical_number(value.strip())
-        if canonical is not None:
-            return canonical
-    elif lowered in UUID_TYPE_NAMES:
-        canonical = canonical_uuid(value.strip())
-        if canonical is not None:
-            return canonical
-
-    # Not canonicalizable, or a type where the text is the value. Returned
-    # unstripped: trailing whitespace in a text column is part of the value.
-    return value
-
-
-@dataclass(frozen=True, repr=False)
-class Tokenizer:
-    """Replaces source values with HMAC tokens.
-
-    Holds the key, so the key lives in one object with a repr that cannot leak
-    it. A module-level key would end up in a traceback the first time an
-    unrelated function was called with one in scope.
-    """
-
-    key: bytes
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}(key={REDACTED})"
-
-    def token(self, value: str | None, domain: str, type_name: str = "") -> str:
-        """Return the token for one value in one domain."""
-        material = domain + DOMAIN_SEPARATOR + repr_typed(value, type_name)
-        digest = hmac.new(self.key, material.encode("utf-8"), hashlib.sha256).hexdigest()
-        if type_name.lower() in UUID_TYPE_NAMES:
-            return shape_as_uuid(digest)
-        return digest
-
-    def tokens(self, values, domain: str, type_name: str = "") -> tuple[str, ...]:
-        """Tokenize a sequence elementwise, preserving order.
-
-        Order is preserved because the caller's parallel array of frequencies is
-        positional; the tokens themselves carry no ordering information.
-        """
-        return tuple(self.token(value, domain, type_name) for value in values)
-
-
-def shape_as_uuid(digest: str) -> str:
-    """Format the first 128 bits of a digest as a uuid.
-
-    Not a version-4 uuid: the version and variant bits are left as digest bits
-    rather than overwritten, because a token that advertised itself as random
-    would be a lie about where it came from. Any 128-bit value is a valid uuid
-    to both PostgreSQL and CockroachDB.
-    """
-    head = digest[:32]
-    return "-".join((head[:8], head[8:12], head[12:16], head[16:20], head[20:32]))
-
-
-# ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
 # Turns collected catalog rows into the contract. Two rules govern this section.
@@ -1917,6 +2059,20 @@ def shape_as_uuid(digest: str) -> str:
 # pg_stats.most_common_freqs are fractions of all rows in the table, nulls
 # included -- not fractions of the non-null rows, and not of the distinct values.
 FREQ_BASIS = "all rows, nulls included"
+
+HISTOGRAM_BASIS = (
+    "pg_stats.histogram_bounds are equi-depth bucket boundaries, ascending under the "
+    "column collation and excluding the most-common values and nulls"
+)
+
+CORRELATION_BASIS = (
+    "pg_stats.correlation is physical-to-logical order correlation over the non-null "
+    "values only, so it does not describe where the nulls sit"
+)
+
+# PostgreSQL's block size, and the unit pg_class.relpages counts in. Configurable
+# at compile time; 8 KiB is the default and what every packaged build ships.
+PAGE_SIZE_BYTES = 8192
 
 FAN_OUT_ESTIMATED = "estimated"
 FAN_OUT_INSUFFICIENT = "insufficient_statistics"
@@ -1961,89 +2117,27 @@ def format_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
 
 
-def build_token_domains(columns, foreign_keys) -> dict:
-    """Map every column to the (domain, type) its values tokenize under.
-
-    A foreign key is only visible in the profile if the same value tokenizes
-    identically on the child and the parent, so a child column borrows its
-    parent's domain. Chains are followed to their root: with A.x -> B.y and
-    B.y -> C.z, A.x tokenizing under B.y while B.y tokenizes under C.z would
-    make the A-to-B join invisible, which is the exact failure this prevents.
-
-    The root column's type also wins, so a text column referencing a uuid one
-    canonicalizes and shapes the same way on both sides.
-    """
-    parent_of: dict = {}
-    for fk in foreign_keys:
-        for child, parent in zip(fk.child_columns, fk.parent_columns):
-            key = (fk.child_schema, fk.child_table, child)
-            parent_of.setdefault(key, (fk.parent_schema, fk.parent_table, parent))
-
-    types = {(c.schema, c.table, c.name): c.type_name for c in columns}
-    domains = {}
-    for column in columns:
-        key = (column.schema, column.table, column.name)
-        root = resolve_domain_root(key, parent_of)
-        domains[key] = (token_domain(*root), types.get(root, column.type_name))
-    return domains
-
-
-def resolve_domain_root(key, parent_of):
-    """Follow a foreign-key chain to its root, stopping on a cycle.
-
-    Self-referential and mutually referential keys are legal in PostgreSQL, so
-    this cannot assume termination.
-    """
-    seen = {key}
-    while key in parent_of:
-        key = parent_of[key]
-        if key in seen:
-            break
-        seen.add(key)
-    return key
-
-
-def normalize_columns(catalog: CatalogObservations, tokenizer: Tokenizer) -> dict:
+def normalize_columns(catalog: CatalogObservations) -> dict:
     """Return (schema, table) -> ordered tuple of contract Columns."""
     row_counts = {(t.schema, t.name): t.reltuples for t in catalog.tables}
     stats = {(s.schema, s.table, s.column): s for s in catalog.column_stats}
-    domains = build_token_domains(catalog.columns, catalog.foreign_keys)
 
     by_table: dict = {}
     for column in sorted(catalog.columns, key=lambda c: (c.schema, c.table, c.ordinal)):
         key = (column.schema, column.table, column.name)
-        domain, type_name = domains[key]
         by_table.setdefault((column.schema, column.table), []).append(
             normalize_column(
                 column,
                 stats.get(key),
                 row_counts.get((column.schema, column.table), 0.0),
-                tokenizer,
-                domain,
-                type_name,
             )
         )
     return {table: tuple(columns) for table, columns in by_table.items()}
 
 
-def normalize_column(column, statistic, row_count, tokenizer, domain, type_name) -> Column:
-    """Build one contract Column, tokenizing every value it carries."""
-    if statistic is None:
-        return Column(
-            schema=column.schema,
-            table=column.table,
-            name=column.name,
-            ordinal=column.ordinal,
-            data_type=column.data_type,
-            is_nullable=column.is_nullable,
-            is_supported=column.is_supported,
-            provenance=(
-                "no pg_stats row: the column has never been analyzed, so PostgreSQL "
-                "has no distribution for it"
-            ),
-        )
-
-    return Column(
+def normalize_column(column, statistic, row_count) -> Column:
+    """Build one contract Column from its catalog row and its pg_stats row."""
+    declared = dict(
         schema=column.schema,
         table=column.table,
         name=column.name,
@@ -2051,37 +2145,124 @@ def normalize_column(column, statistic, row_count, tokenizer, domain, type_name)
         data_type=column.data_type,
         is_nullable=column.is_nullable,
         is_supported=column.is_supported,
+        collation=column.collation,
+        default_expression=column.default_expression,
+        identity=column.identity,
+        statistics_target=(
+            None if column.stats_target == DEFAULT_STATS_TARGET else column.stats_target
+        ),
+    )
+
+    if statistic is None:
+        return Column(
+            **declared,
+            provenance=(
+                "no pg_stats row: the column has never been analyzed, so PostgreSQL "
+                "has no distribution for it"
+            ),
+        )
+
+    return Column(
+        **declared,
         null_fraction=statistic.null_frac,
         avg_width_bytes=statistic.avg_width,
         distinct_estimate=resolve_distinct(statistic.n_distinct, row_count),
-        most_common_tokens=tokenizer.tokens(statistic.most_common_vals, domain, type_name),
+        most_common_values=statistic.most_common_vals,
         most_common_freqs=statistic.most_common_freqs,
-        histogram_token_bounds=tokenizer.tokens(statistic.histogram_bounds, domain, type_name),
+        histogram_bounds=statistic.histogram_bounds,
+        correlation=statistic.correlation,
         provenance=(
             f"{describe_distinct(statistic.n_distinct, row_count)}; "
             f"pg_stats.most_common_freqs are fractions of {FREQ_BASIS}; "
-            "values are HMAC tokens, equal within a foreign-key domain"
+            f"{HISTOGRAM_BASIS}; {CORRELATION_BASIS}"
         ),
     )
 
 
-def normalize_tables(catalog: CatalogObservations, tokenizer: Tokenizer) -> tuple[Table, ...]:
+def normalize_tables(catalog: CatalogObservations) -> tuple[Table, ...]:
     """Return the contract Tables, sorted, each with its columns in ordinal order."""
-    columns = normalize_columns(catalog, tokenizer)
+    columns = normalize_columns(catalog)
     return tuple(
         Table(
             schema=table.schema,
             name=table.name,
             row_count_estimate=table.reltuples,
             size_bytes=table.size_bytes,
+            page_count=table.relpages,
+            has_toast=table.has_toast,
             columns=columns.get((table.schema, table.name), ()),
             provenance=(
                 "row_count_estimate is pg_class.reltuples, an estimate maintained by "
                 "the autovacuum daemon and never a row count; size_bytes is "
-                "pg_total_relation_size, including indexes and TOAST"
+                "pg_total_relation_size, including indexes and TOAST, while page_count "
+                f"is pg_class.relpages over the main fork alone, in {PAGE_SIZE_BYTES}-byte pages"
             ),
         )
         for table in sorted(catalog.tables, key=lambda t: (t.schema, t.name))
+    )
+
+
+def normalize_indexes(catalog: CatalogObservations) -> tuple[Index, ...]:
+    """Return the contract Indexes, each with its key columns in declared order."""
+    by_index: dict = {}
+    for entry in catalog.index_columns:
+        by_index.setdefault((entry.schema, entry.table, entry.index), []).append(entry)
+
+    return tuple(
+        Index(
+            schema=index.schema,
+            table=index.table,
+            name=index.name,
+            is_unique=index.is_unique,
+            is_primary=index.is_primary,
+            is_valid=index.is_valid,
+            is_clustered=index.is_clustered,
+            is_partial=index.is_partial,
+            has_expressions=index.has_expressions,
+            columns=tuple(
+                normalize_index_column(entry)
+                for entry in sorted(
+                    by_index.get((index.schema, index.table, index.name), ()),
+                    key=lambda entry: entry.position,
+                )
+            ),
+            provenance=(
+                "key order, direction and null placement are pg_index.indkey and "
+                "indoption; a partial index's WHERE predicate and an expression key's "
+                "expression are in schema.sql, not here"
+            ),
+        )
+        for index in sorted(catalog.indexes, key=lambda i: (i.schema, i.table, i.name))
+    )
+
+
+def normalize_index_column(entry: CatalogIndexColumn) -> IndexColumn:
+    """Decode one key position's indoption bits into named flags."""
+    bits = entry.option_bits or 0
+    return IndexColumn(
+        position=entry.position,
+        name=entry.name,
+        is_key=entry.is_key,
+        descending=bool(bits & INDOPTION_DESC),
+        nulls_first=bool(bits & INDOPTION_NULLS_FIRST),
+        operator_class=entry.operator_class,
+        collation=entry.collation,
+    )
+
+
+def normalize_sequences(catalog: CatalogObservations) -> tuple[Sequence, ...]:
+    return tuple(
+        Sequence(
+            schema=sequence.schema,
+            name=sequence.name,
+            start=sequence.start,
+            increment=sequence.increment,
+            minimum=sequence.minimum,
+            maximum=sequence.maximum,
+            cache=sequence.cache,
+            cycles=sequence.cycles,
+        )
+        for sequence in sorted(catalog.sequences, key=lambda s: (s.schema, s.name))
     )
 
 
@@ -2203,13 +2384,14 @@ def build_profile(
     source: Source,
     catalog: CatalogObservations,
     workload: WorkloadObservations,
-    tokenizer: Tokenizer,
 ) -> Profile:
     """Assemble the normalized contract from everything collected."""
     return Profile(
         source=source,
-        tables=normalize_tables(catalog, tokenizer),
+        tables=normalize_tables(catalog),
         relationships=normalize_relationships(catalog),
+        indexes=normalize_indexes(catalog),
+        sequences=normalize_sequences(catalog),
         warnings=workload.warnings,
     )
 
@@ -2220,11 +2402,11 @@ def build_profile(
 # The only code in this file that writes to disk. Two properties matter, and
 # both are enforced here rather than trusted:
 #
-#   Nothing raw escapes. Serialization is by allowlist -- only the contract
-#   dataclasses become JSON, and every CSV is shaped from already-tokenized
-#   records. The collector records holding raw statistics values and raw query
-#   text are dataclasses too, so a structural serializer would have written
-#   them out; to_jsonable() refuses them by name.
+#   Only the contract is serialized. Serialization is by allowlist -- a
+#   dataclass becomes JSON only if it is named in CONTRACT_TYPES, and every CSV
+#   is shaped field by field. The collector records are dataclasses too, so a
+#   structural serializer would have written PostgreSQL's own encodings into
+#   the bundle; to_jsonable() refuses them by name.
 #
 #   Publication is all-or-nothing. The archive is built in a temporary file
 #   beside the destination, fsynced, and moved into place with os.replace().
@@ -2239,6 +2421,8 @@ OBSERVATION_TABLES = "observations/pg_class.csv"
 OBSERVATION_COLUMNS = "observations/pg_stats.csv"
 OBSERVATION_EXTENDED = "observations/pg_stats_ext.csv"
 OBSERVATION_FOREIGN_KEYS = "observations/foreign_keys.csv"
+OBSERVATION_INDEXES = "observations/pg_index.csv"
+OBSERVATION_SEQUENCES = "observations/pg_sequence.csv"
 OBSERVATION_INDEX_ACTIVITY = "observations/pg_stat_indexes.csv"
 OBSERVATION_TABLE_ACTIVITY = "observations/pg_stat_tables.csv"
 OBSERVATION_STATEMENTS = "observations/pg_stat_statements.csv"
@@ -2253,6 +2437,8 @@ BUNDLE_PAYLOAD_PATHS = (
     OBSERVATION_TABLES,
     OBSERVATION_COLUMNS,
     OBSERVATION_EXTENDED,
+    OBSERVATION_INDEXES,
+    OBSERVATION_SEQUENCES,
     OBSERVATION_INDEX_ACTIVITY,
     OBSERVATION_TABLE_ACTIVITY,
     OBSERVATION_STATEMENTS,
@@ -2270,6 +2456,7 @@ REQUIRED_BUNDLE_PATHS = frozenset(
         OBSERVATION_TABLES,
         OBSERVATION_COLUMNS,
         OBSERVATION_FOREIGN_KEYS,
+        OBSERVATION_INDEXES,
     }
 )
 
@@ -2307,25 +2494,26 @@ BUNDLE_CREATE_SYSTEM = 3  # Unix, so the mode above is read as a unix mode.
 
 TEMP_SUFFIX = ".zip.tmp"
 
-# Tokens are hex and identifiers cannot contain it, so a pipe separates the
-# repeated values inside one CSV cell without needing an escape.
+# Separates the repeated values inside one CSV cell. A statistic value can
+# contain anything, including a pipe, so the cell is escaped on the way out and
+# a consumer has to unescape before splitting -- see escaped() below.
 CELL_SEPARATOR = "|"
+CELL_ESCAPE = "\\"
 
-# pg_stat_statements is cluster-wide and its text is not attributable to one
-# column, so query text gets its own domain rather than a column's.
-STATEMENT_DOMAIN = token_domain("pg_stat_statements", "", "query")
-
-# The dataclasses that may be serialized. Everything else -- including the
-# collector records that hold raw most-common values and raw query text -- is
-# refused. See the section note above.
+# The dataclasses that may be serialized. Everything else -- including every
+# collector record, which carries PostgreSQL's own encodings -- is refused. See
+# the section note above.
 CONTRACT_TYPES = (
     Column,
     FanOut,
+    Index,
+    IndexColumn,
     Manifest,
     Observation,
     Profile,
     ProfileWarning,
     Relationship,
+    Sequence,
     Source,
     Table,
 )
@@ -2383,8 +2571,23 @@ def cell(value) -> str:
     return str(value)
 
 
+def escaped(value) -> str:
+    """Escape one repeated value so a reader can split the cell back apart.
+
+    Statistic values are published as the source holds them, so a value may
+    contain the separator, or the escape character itself. Both are
+    backslash-escaped, which keeps the join reversible; without it a single
+    value containing a pipe would silently read back as two values and shift
+    every frequency in the parallel list by one.
+    """
+    text = cell(value)
+    return text.replace(CELL_ESCAPE, CELL_ESCAPE * 2).replace(
+        CELL_SEPARATOR, CELL_ESCAPE + CELL_SEPARATOR
+    )
+
+
 def joined(values) -> str:
-    return CELL_SEPARATOR.join(cell(value) for value in values)
+    return CELL_SEPARATOR.join(escaped(value) for value in values)
 
 
 def csv_entry(path: str, header, rows) -> BundleEntry:
@@ -2405,10 +2608,11 @@ def csv_entry(path: str, header, rows) -> BundleEntry:
 def observation_tables(profile: Profile) -> BundleEntry:
     return csv_entry(
         OBSERVATION_TABLES,
-        ("schema", "table", "row_count_estimate", "size_bytes", "column_count", "provenance"),
+        ("schema", "table", "row_count_estimate", "size_bytes", "page_count", "has_toast",
+         "column_count", "provenance"),
         (
             (table.schema, table.name, table.row_count_estimate, table.size_bytes,
-             len(table.columns), table.provenance)
+             table.page_count, table.has_toast, len(table.columns), table.provenance)
             for table in profile.tables
         ),
     )
@@ -2418,14 +2622,17 @@ def observation_columns(profile: Profile) -> BundleEntry:
     return csv_entry(
         OBSERVATION_COLUMNS,
         ("schema", "table", "column", "ordinal", "data_type", "is_nullable", "is_supported",
-         "null_fraction", "avg_width_bytes", "distinct_estimate", "most_common_tokens",
-         "most_common_freqs", "histogram_token_bounds", "provenance"),
+         "null_fraction", "avg_width_bytes", "distinct_estimate", "most_common_values",
+         "most_common_freqs", "histogram_bounds", "correlation", "collation",
+         "default_expression", "identity", "statistics_target", "provenance"),
         (
             (column.schema, column.table, column.name, column.ordinal, column.data_type,
              column.is_nullable, column.is_supported, column.null_fraction,
              column.avg_width_bytes, column.distinct_estimate,
-             joined(column.most_common_tokens), joined(column.most_common_freqs),
-             joined(column.histogram_token_bounds), column.provenance)
+             joined(column.most_common_values), joined(column.most_common_freqs),
+             joined(column.histogram_bounds), column.correlation, column.collation,
+             column.default_expression, column.identity, column.statistics_target,
+             column.provenance)
             for table in profile.tables
             for column in table.columns
         ),
@@ -2435,18 +2642,57 @@ def observation_columns(profile: Profile) -> BundleEntry:
 def observation_extended_stats(catalog: CatalogObservations) -> BundleEntry:
     """One row per column combination the source has a distinct estimate for.
 
-    Only the estimates are published. The extended most-common-value lists hold
-    literals, so the bundle records that they exist and nothing more.
+    The most-common combinations are attached to every row of a statistics
+    object rather than to one of them: they describe the object as a whole, over
+    all its declared columns, not the particular column subset an n-distinct
+    estimate covers.
     """
     return csv_entry(
         OBSERVATION_EXTENDED,
         ("schema", "table", "statistics_name", "declared_columns", "combination",
-         "distinct_estimate", "has_most_common_values"),
+         "distinct_estimate", "most_common_values", "most_common_freqs",
+         "most_common_base_freqs"),
         (
             (statistic.schema, statistic.table, statistic.name, joined(statistic.columns),
-             joined(combination), estimate, statistic.has_most_common_values)
+             joined(combination), estimate, joined(statistic.most_common_vals),
+             joined(statistic.most_common_freqs), joined(statistic.most_common_base_freqs))
             for statistic in catalog.extended_stats
             for combination, estimate in sorted(statistic.n_distinct.items())
+        ),
+    )
+
+
+def observation_indexes(profile: Profile) -> BundleEntry:
+    """One row per index key position, in declared order.
+
+    Flattened rather than one row per index: the ordering is the payload, and a
+    pipe-joined column list would have to be unpacked in parallel with three
+    more joined lists to be read at all.
+    """
+    return csv_entry(
+        OBSERVATION_INDEXES,
+        ("schema", "table", "index", "position", "column", "is_key", "descending",
+         "nulls_first", "operator_class", "collation", "is_unique", "is_primary",
+         "is_valid", "is_clustered", "is_partial", "has_expressions"),
+        (
+            (index.schema, index.table, index.name, key.position, key.name, key.is_key,
+             key.descending, key.nulls_first, key.operator_class, key.collation,
+             index.is_unique, index.is_primary, index.is_valid, index.is_clustered,
+             index.is_partial, index.has_expressions)
+            for index in profile.indexes
+            for key in index.columns
+        ),
+    )
+
+
+def observation_sequences(profile: Profile) -> BundleEntry:
+    return csv_entry(
+        OBSERVATION_SEQUENCES,
+        ("schema", "sequence", "start", "increment", "minimum", "maximum", "cache", "cycles"),
+        (
+            (sequence.schema, sequence.name, sequence.start, sequence.increment,
+             sequence.minimum, sequence.maximum, sequence.cache, sequence.cycles)
+            for sequence in profile.sequences
         ),
     )
 
@@ -2509,24 +2755,22 @@ def observation_index_activity(
     )
 
 
-def observation_statements(
-    workload: WorkloadObservations, tokenizer: Tokenizer
-) -> BundleEntry:
-    """Statement counters, with the query text replaced by a token.
+def observation_statements(workload: WorkloadObservations) -> BundleEntry:
+    """Statement counters, with the statement text as pg_stat_statements holds it.
 
-    pg_stat_statements normally normalizes literals to $1 placeholders, but not
-    for utility statements and not for constants the parser folds, so the text
-    cannot be published. The token still separates one statement's counters
-    from another's, and queryid remains for correlating with the source server.
+    pg_stat_statements normalizes literals to $1 placeholders for ordinary DML,
+    so most of this text is already parameterized. It is not universal: utility
+    statements are stored verbatim, constants the parser folded are gone before
+    normalization sees them, and text longer than track_activity_query_size is
+    truncated. Assume a literal can appear here.
     """
     return csv_entry(
         OBSERVATION_STATEMENTS,
-        ("queryid", "query_token", "calls", "rows", "total_exec_time", "mean_exec_time",
+        ("queryid", "query_text", "calls", "rows", "total_exec_time", "mean_exec_time",
          "stddev_exec_time", "shared_blks_hit", "shared_blks_read", "shared_blks_dirtied",
          "shared_blks_written", "temp_blks_read", "temp_blks_written"),
         (
-            (statement.queryid,
-             tokenizer.token(statement.query_text, STATEMENT_DOMAIN),
+            (statement.queryid, statement.query_text,
              statement.calls, statement.rows, statement.total_exec_time,
              statement.mean_exec_time, statement.stddev_exec_time, statement.shared_blks_hit,
              statement.shared_blks_read, statement.shared_blks_dirtied,
@@ -2541,7 +2785,6 @@ def build_payloads(
     profile: Profile,
     catalog: CatalogObservations,
     workload: WorkloadObservations,
-    tokenizer: Tokenizer,
     schema_sql: str,
 ) -> tuple[BundleEntry, ...]:
     """Serialize everything collected, dropping the sections that degraded."""
@@ -2552,9 +2795,11 @@ def build_payloads(
         observation_columns(profile),
         observation_extended_stats(catalog),
         observation_foreign_keys(profile),
+        observation_indexes(profile),
+        observation_sequences(profile),
         observation_table_activity(workload),
         observation_index_activity(workload, catalog),
-        observation_statements(workload, tokenizer),
+        observation_statements(workload),
     ]
     reported = {warning.code for warning in workload.warnings}
     kept = [
@@ -2762,10 +3007,8 @@ def run_postgres(args: argparse.Namespace) -> int:
     """Collect a profile from a PostgreSQL source and publish the bundle."""
     config = build_postgres_config(args)
 
-    # Both of these fail before a connection is opened. A tokenization key that
-    # turns out to be missing after collection, or a destination that cannot be
-    # written to, costs the operator a full pass over the catalog to discover.
-    tokenizer = Tokenizer(load_token_key())
+    # Before a connection is opened: a destination that turns out not to be
+    # writable costs the operator a full pass over the catalog to discover.
     require_publishable_destination(config.output)
 
     progress("checking the source server version")
@@ -2794,9 +3037,11 @@ def run_postgres(args: argparse.Namespace) -> int:
         server_version=server_version,
         database=config.env.get("PGDATABASE", ""),
         collected_schemas=collected_schemas(catalog),
+        collate=catalog.collate,
+        ctype=catalog.ctype,
     )
-    profile = build_profile(source, catalog, workload, tokenizer)
-    payloads = build_payloads(profile, catalog, workload, tokenizer, schema_sql)
+    profile = build_profile(source, catalog, workload)
+    payloads = build_payloads(profile, catalog, workload, schema_sql)
     require_complete_bundle(payloads)
     manifest = build_manifest(
         source=source,
@@ -2842,7 +3087,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"profile a PostgreSQL {SUPPORTED_MAJOR} source",
         description=(
             f"Profile a PostgreSQL {SUPPORTED_MAJOR} source. Set {URL_ENV_VAR} to the "
-            f"connection string and {TOKEN_KEY_ENV_VAR} to the tokenization key."
+            "connection string."
         ),
     )
     postgres.add_argument(

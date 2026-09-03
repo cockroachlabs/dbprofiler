@@ -3,16 +3,16 @@
 """End-to-end integration test for dbprofiler.
 
 Runs the shipped script, as a subprocess, against a real PostgreSQL 16, and
-checks the bundle it produces. Skipped unless both DBPROFILER_POSTGRES_TEST_URL
-and DBPROFILER_TOKEN_KEY are set, so a plain `python3 -m unittest` stays
-offline. See docs/TESTING.md for the disposable server.
+checks the bundle it produces. Skipped unless DBPROFILER_POSTGRES_TEST_URL is
+set, so a plain `python3 -m unittest` stays offline. See docs/TESTING.md for
+the disposable server.
 
     python3 -m unittest integration_test -v
 
-Neither variable's value is ever printed. The connection string reaches psql
-and the profiler through the environment only, as it does in production, and
-child-process stderr goes through dbprofiler.redact_error before it can reach
-an assertion message.
+Its value is never printed. The connection string reaches psql and the profiler
+through the environment only, as it does in production, and child-process
+stderr goes through dbprofiler.redact_error before it can reach an assertion
+message.
 
 This file issues DDL, DML, ANALYZE, and CREATE STATISTICS. Those are forbidden
 to dbprofiler.py and enforced against it by --check-safety, which reflects over
@@ -47,10 +47,10 @@ SCRIPT = REPO / "dbprofiler.py"
 
 TEST_URL_ENV_VAR = "DBPROFILER_POSTGRES_TEST_URL"
 
-# Read as booleans. The values are never held in a module constant, never
+# Read as a boolean. The value is never held in a module constant, never
 # logged, and never quoted into a failure message.
-CONFIGURED = bool(os.getenv(TEST_URL_ENV_VAR)) and bool(os.getenv(dbprofiler.TOKEN_KEY_ENV_VAR))
-WHY_SKIPPED = f"set {TEST_URL_ENV_VAR} and {dbprofiler.TOKEN_KEY_ENV_VAR} to run"
+CONFIGURED = bool(os.getenv(TEST_URL_ENV_VAR))
+WHY_SKIPPED = f"set {TEST_URL_ENV_VAR} to run"
 
 PSQL = os.getenv("DBPROFILER_TEST_PSQL", "psql")
 
@@ -68,8 +68,8 @@ SCHEMA = f"dbprofiler_it_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 #   UTILITY_TEXT  a literal in a utility statement, which pg_stat_statements
 #                 records verbatim rather than normalizing to $1
 #
-# None appears in an identifier, a default, or a comment, so none can reach
-# schema.sql by a route that has nothing to do with tokenization.
+# None appears in an identifier, a default, or a comment, so a value found in
+# the bundle got there through the statistics and not through schema.sql.
 PLANTED = {
     "REGION_CODE": "planted-region-6b1d4f9c",
     "EMAIL_DOMAIN": "planted-mail-2a7e83d5.invalid",
@@ -82,6 +82,8 @@ BUNDLE_ENTRIES = frozenset({
     "schema.sql",
     "profile.json",
     "observations/pg_class.csv",
+    "observations/pg_index.csv",
+    "observations/pg_sequence.csv",
     "observations/pg_stats.csv",
     "observations/pg_stats_ext.csv",
     "observations/foreign_keys.csv",
@@ -89,12 +91,6 @@ BUNDLE_ENTRIES = frozenset({
     "observations/pg_stat_tables.csv",
     "observations/pg_stat_statements.csv",
 })
-
-# The synthetic keys fixed by .claude/rules/development.md, long enough to pass
-# MIN_TOKEN_KEY_LENGTH. Two runs under KEY_A prove tokens are reproducible; one
-# under KEY_B proves two bundles cannot be correlated.
-KEY_A = "example-token-key-0123456789"
-KEY_B = "example-token-key-9876543210"
 
 ROWS_CUSTOMERS = 500
 ROWS_ORDERS = 5000
@@ -113,8 +109,8 @@ FIRST_HOT_CUSTOMER = 401
 HOT_EVERY = 7
 REFERENCED_CUSTOMERS = UNIFORM_CUSTOMERS + HOT_CUSTOMERS
 
-# One hot id, for the token assertion: it is one of the five most common values
-# of orders.customer_id, so it is certain to reach the most-common-token list.
+# One hot id: it is one of the five most common values of orders.customer_id,
+# so it is certain to reach the published most-common-values list.
 HOT_CUSTOMER = str(FIRST_HOT_CUSTOMER)
 
 # Distinct (org_id, site_id) pairs the orders carry. Fewer than the five site
@@ -170,8 +166,11 @@ def create_fixtures() -> None:
 
     Shapes chosen so every collector has something to find: ordinary tables of
     different widths, a spread of supported types, types with no CockroachDB
-    equivalent, a unique index, an index nothing ever scans, a single-column
-    foreign key, and a composite one with extended statistics behind it.
+    equivalent, a unique index, an index nothing ever scans, a descending key
+    with an INCLUDE payload, a partial index, an expression index, an identity
+    column and the sequence behind it, a non-default collation, a raised
+    statistics target, a clustered heap, a single-column foreign key, and a
+    composite one with extended statistics behind it.
     """
     execute(f"CREATE SCHEMA {SCHEMA}")
 
@@ -214,6 +213,18 @@ def create_fixtures() -> None:
         );
     """)
 
+    # An identity column, an explicit collation and a column default, none of
+    # which appear anywhere else. The identity brings its own sequence, which
+    # is what pg_sequence.csv has to find.
+    execute(f"""
+        CREATE TABLE {SCHEMA}.receipts (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            order_id bigint NOT NULL,
+            note text COLLATE "C",
+            issued_on date DEFAULT CURRENT_DATE
+        );
+    """)
+
     # Types with no CockroachDB equivalent, kept in their own table so a
     # misclassification cannot disturb the shape assertions elsewhere. A range
     # and a domain: jsonb and text[] read like exotic types but both map
@@ -232,6 +243,23 @@ def create_fixtures() -> None:
         CREATE INDEX orders_customer_id_idx ON {SCHEMA}.orders (customer_id);
         CREATE INDEX orders_placed_at_idx ON {SCHEMA}.orders (placed_at);
     """)
+
+    # The index shapes a downstream generator cannot infer from a column list:
+    # a descending key with nulls first and a payload that is stored but not
+    # ordered on, a predicate that excludes most of the table, and a key that
+    # is an expression rather than a column.
+    execute(f"""
+        CREATE INDEX orders_recent_first_idx
+            ON {SCHEMA}.orders (placed_at DESC NULLS FIRST) INCLUDE (total);
+        CREATE INDEX orders_large_idx
+            ON {SCHEMA}.orders (customer_id) WHERE total > 400;
+        CREATE INDEX customers_lower_email_idx
+            ON {SCHEMA}.customers (lower(email));
+    """)
+
+    # A raised per-column target changes how many buckets ANALYZE builds, so a
+    # consumer reproducing the distribution has to know it was not the default.
+    execute(f"ALTER TABLE {SCHEMA}.orders ALTER COLUMN placed_at SET STATISTICS 250")
 
     # org_id and site_id are correlated, so multiplying the per-column distinct
     # estimates overshoots badly. This is what gives composite fan-out a real
@@ -288,7 +316,16 @@ def seed_fixtures() -> None:
         INSERT INTO {SCHEMA}.exotic (id, during, quantity)
         SELECT g, int4range(g, g + 10), g
         FROM generate_series(1, 50) AS g;
+
+        INSERT INTO {SCHEMA}.receipts (order_id, note)
+        SELECT g, 'note ' || g
+        FROM generate_series(1, 100) AS g;
     """)
+
+    # Sort the heap so pg_stats.correlation over customers.id comes back at 1
+    # and says so. Without it the number would be an accident of insertion
+    # order, which is exactly what the statistic is supposed to distinguish.
+    execute(f"CLUSTER {SCHEMA}.customers USING customers_pkey")
 
     # The one ANALYZE in this repository, against the fixtures created above.
     # The profiler reads statistics rather than computing them; without this
@@ -296,7 +333,7 @@ def seed_fixtures() -> None:
     # pass vacuously against nulls.
     execute(f"""
         ANALYZE {SCHEMA}.regions, {SCHEMA}.tenants, {SCHEMA}.customers,
-                {SCHEMA}.orders, {SCHEMA}.exotic
+                {SCHEMA}.orders, {SCHEMA}.exotic, {SCHEMA}.receipts
     """)
 
 
@@ -337,12 +374,11 @@ def drop_fixtures() -> None:
     execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
 
 
-def run_profiler(output: Path, token_key: str) -> subprocess.CompletedProcess:
+def run_profiler(output: Path) -> subprocess.CompletedProcess:
     """Run the shipped script the way a customer does: as a subprocess, with
-    the connection string and the key supplied only through the environment."""
+    the connection string supplied only through the environment."""
     env = dict(os.environ)
     env[dbprofiler.URL_ENV_VAR] = os.environ[TEST_URL_ENV_VAR]
-    env[dbprofiler.TOKEN_KEY_ENV_VAR] = token_key
     env.pop(TEST_URL_ENV_VAR, None)
     return subprocess.run(
         [sys.executable, str(SCRIPT), "postgres",
@@ -356,7 +392,7 @@ def run_profiler(output: Path, token_key: str) -> subprocess.CompletedProcess:
 
 
 def setUpModule():
-    """Build the fixtures and run the profiler three times, once."""
+    """Build the fixtures and run the profiler twice, once."""
     global WORKDIR
     if not CONFIGURED:
         return
@@ -368,9 +404,9 @@ def setUpModule():
         created = True
         seed_fixtures()
         seed_activity()
-        for name, key in (("first", KEY_A), ("again", KEY_A), ("other", KEY_B)):
+        for name in ("first", "again"):
             output = WORKDIR / f"{name}.zip"
-            done = run_profiler(output, key)
+            done = run_profiler(output)
             if done.returncode != 0:
                 raise AssertionError(
                     f"profiler exited {done.returncode}: "
@@ -416,7 +452,7 @@ def bundle_bytes(path: Path) -> bytes:
 
 @unittest.skipUnless(CONFIGURED, WHY_SKIPPED)
 class IntegrationCase(unittest.TestCase):
-    """Shared accessors over the bundle produced under KEY_A."""
+    """Shared accessors over the first of the two bundles."""
 
     def setUp(self):
         self.archive = zipfile.ZipFile(BUNDLES["first"])
@@ -494,7 +530,7 @@ class TestScope(IntegrationCase):
 
     def test_the_schema_sql_covers_the_fixtures(self):
         schema_sql = self.archive.read("schema.sql").decode("utf-8")
-        for name in ("regions", "tenants", "customers", "orders", "exotic"):
+        for name in ("regions", "tenants", "customers", "orders", "exotic", "receipts"):
             with self.subTest(name=name):
                 self.assertIn(f"{SCHEMA}.{name}", schema_sql)
 
@@ -507,7 +543,9 @@ class TestScope(IntegrationCase):
 class TestShape(IntegrationCase):
     def test_every_fixture_table_is_reported(self):
         found = {table["name"] for table in self.profile["tables"]}
-        self.assertEqual(found, {"regions", "tenants", "customers", "orders", "exotic"})
+        self.assertEqual(
+            found, {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
+        )
 
     def test_row_counts_are_estimates_of_the_right_magnitude(self):
         """reltuples after ANALYZE, not a COUNT(*): close, but never promised
@@ -579,7 +617,7 @@ class TestShape(IntegrationCase):
             self.archive, "observations/pg_class.csv"
         )}
         self.assertEqual(
-            set(rows), {"regions", "tenants", "customers", "orders", "exotic"}
+            set(rows), {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
         )
         self.assertEqual(int(rows["orders"]["column_count"]), 6)
 
@@ -647,13 +685,16 @@ class TestRelationships(IntegrationCase):
         self.assertTrue(rows, "expected the multicolumn statistics object")
         self.assertTrue(any(row["distinct_estimate"] for row in rows))
 
-    def test_extended_most_common_values_are_recorded_but_not_published(self):
-        """The extended MCV list holds literals, so the bundle records only
-        that it exists."""
-        rows = read_rows(self.archive, "observations/pg_stats_ext.csv")
-        mine = [row for row in rows if row["statistics_name"] == "orders_tenant_stats"]
-        self.assertTrue(all(row["has_most_common_values"] == "true" for row in mine))
-        self.assertNotIn("most_common_values", rows[0])
+    def test_extended_most_common_values_are_published(self):
+        """The MCV list over (org_id, site_id) is the dependence itself: the
+        observed frequency of a pair against the frequency independence would
+        have predicted. An n-distinct count alone cannot say which pairs are
+        hot, only how many there are."""
+        rows = [row for row in read_rows(self.archive, "observations/pg_stats_ext.csv")
+                if row["statistics_name"] == "orders_tenant_stats"]
+        self.assertTrue(all(row["most_common_values"] for row in rows))
+        self.assertTrue(all(row["most_common_freqs"] for row in rows))
+        self.assertTrue(all(row["most_common_base_freqs"] for row in rows))
 
 
 class TestTier1Telemetry(IntegrationCase):
@@ -669,7 +710,9 @@ class TestTier1Telemetry(IntegrationCase):
 
     def test_table_activity_is_populated(self):
         rows = self.table_activity()
-        self.assertEqual(set(rows), {"regions", "tenants", "customers", "orders", "exotic"})
+        self.assertEqual(
+            set(rows), {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
+        )
         self.assertEqual(int(rows["orders"]["n_tup_ins"]), ROWS_ORDERS)
         self.assertTrue(rows["orders"]["last_analyze"])
 
@@ -692,11 +735,10 @@ class TestTier1Telemetry(IntegrationCase):
         self.assertTrue(all(row["queryid"] for row in rows))
         self.assertTrue(any(int(row["calls"]) >= 3 for row in rows))
 
-    def test_every_statement_carries_a_token_instead_of_its_text(self):
+    def test_every_statement_carries_the_text_postgresql_normalized(self):
         rows = read_rows(self.archive, "observations/pg_stat_statements.csv")
-        self.assertNotIn("query", rows[0])
-        self.assertNotIn("query_text", rows[0])
-        self.assertTrue(all(row["query_token"] for row in rows))
+        self.assertTrue(all(row["query_text"] for row in rows))
+        self.assertTrue(any("$1" in row["query_text"] for row in rows))
 
     def test_each_queryid_appears_once(self):
         ids = [row["queryid"] for row in read_rows(
@@ -705,72 +747,208 @@ class TestTier1Telemetry(IntegrationCase):
         self.assertEqual(len(ids), len(set(ids)))
 
 
-class TestTokens(IntegrationCase):
-    """Tokens have to be stable enough to join on and useless without the key."""
+class TestPublishedStatistics(IntegrationCase):
+    """The values themselves, and the properties a generator replays from them."""
 
     @staticmethod
-    def token_map(path: Path) -> dict:
+    def stats_map(path: Path) -> dict:
         with zipfile.ZipFile(path) as archive:
             return {
-                (row["schema"], row["table"], row["column"]):
-                    (row["most_common_tokens"], row["histogram_token_bounds"])
+                (row["schema"], row["table"], row["column"]): row
                 for row in read_rows(archive, "observations/pg_stats.csv")
             }
 
-    def test_a_column_with_skew_has_most_common_tokens(self):
-        self.assertTrue(self.column("customers", "region_id")["most_common_tokens"])
+    def test_a_column_with_skew_publishes_its_most_common_values(self):
+        region_id = self.column("customers", "region_id")
+        self.assertTrue(region_id["most_common_values"])
+        self.assertIn("1", region_id["most_common_values"])
 
-    def test_a_high_cardinality_column_has_histogram_bounds(self):
-        self.assertTrue(self.column("customers", "email")["histogram_token_bounds"])
-
-    def test_tokens_and_frequencies_stay_aligned(self):
+    def test_values_and_frequencies_stay_positionally_paired(self):
         column = self.column("customers", "region_id")
-        self.assertEqual(len(column["most_common_tokens"]), len(column["most_common_freqs"]))
+        self.assertEqual(len(column["most_common_values"]), len(column["most_common_freqs"]))
 
-    def test_the_same_key_produces_the_same_tokens(self):
-        """Two runs of one source must be comparable, or nobody can tell a
-        migration's before from its after."""
-        self.assertEqual(self.token_map(BUNDLES["first"]), self.token_map(BUNDLES["again"]))
+    def test_a_high_cardinality_column_publishes_an_ascending_histogram(self):
+        """The spacing between bounds is the distribution. A consumer that
+        cannot rely on the order cannot reproduce a range scan."""
+        bounds = self.column("orders", "id")["histogram_bounds"]
+        self.assertTrue(bounds)
+        self.assertEqual([int(bound) for bound in bounds],
+                         sorted(int(bound) for bound in bounds))
 
-    def test_a_different_key_produces_different_tokens(self):
-        """Two engagements must not be correlatable."""
-        mine = self.token_map(BUNDLES["first"])
-        theirs = self.token_map(BUNDLES["other"])
-        self.assertEqual(set(mine), set(theirs))
-        shared = [key for key in mine if any(mine[key]) and mine[key] == theirs[key]]
-        self.assertEqual(shared, [])
+    def test_a_text_histogram_is_ordered_under_the_database_collation(self):
+        bounds = self.column("customers", "email")["histogram_bounds"]
+        self.assertTrue(bounds)
+        self.assertEqual(bounds, sorted(bounds))
 
-    def test_a_child_column_tokenizes_under_its_parents_domain(self):
-        """The property the whole scheme exists for: equal values tokenize
-        equally across a foreign key, so a join on the tokens is still a join.
+    def test_the_database_collation_is_recorded_beside_the_bundle(self):
+        """Text bounds are only sorted with respect to a collation, so the
+        bundle has to say which one."""
+        self.assertTrue(self.manifest["source"]["collate"])
+        self.assertTrue(self.manifest["source"]["ctype"])
 
-        Asserted against a token computed here from the key rather than against
-        an overlap between two lists, because an overlap could also be produced
-        by tokenizing both sides under a domain that happens to match.
-        """
-        tokenizer = dbprofiler.Tokenizer(KEY_A.encode("utf-8"))
-        parent_domain = dbprofiler.token_domain(SCHEMA, "customers", "id")
-        expected = tokenizer.token(HOT_CUSTOMER, parent_domain, "int8")
-        self.assertIn(expected, self.column("orders", "customer_id")["most_common_tokens"])
+    def test_a_clustered_heap_reports_a_correlation_of_one(self):
+        """CLUSTER sorted the heap on the primary key. If correlation came back
+        near zero, a consumer would size the migration for random I/O on a
+        table that reads sequentially."""
+        self.assertAlmostEqual(self.column("customers", "id")["correlation"], 1.0, places=2)
 
-    def test_that_token_is_not_what_the_childs_own_domain_would_give(self):
-        """Guards the test above: if the domains were wrong in the same way on
-        both sides, the assertion there could still pass."""
-        tokenizer = dbprofiler.Tokenizer(KEY_A.encode("utf-8"))
-        child_domain = dbprofiler.token_domain(SCHEMA, "orders", "customer_id")
-        wrong = tokenizer.token(HOT_CUSTOMER, child_domain, "int8")
-        self.assertNotIn(wrong, self.column("orders", "customer_id")["most_common_tokens"])
+    def test_an_alternating_column_has_a_correlation_well_below_one(self):
+        # region_id alternates between 1 and a rotating value, so physical
+        # order says nothing about logical order.
+        self.assertLess(abs(self.column("customers", "region_id")["correlation"]), 0.9)
+
+    def test_two_runs_of_one_source_publish_the_same_statistics(self):
+        """A migration's before and after are only comparable if a run that
+        changed nothing produces the same numbers."""
+        self.assertEqual(self.stats_map(BUNDLES["first"]), self.stats_map(BUNDLES["again"]))
+
+    def test_a_hot_parent_value_is_published_as_itself(self):
+        """The five hot customer ids take one order in seven between them.
+        Publishing the id is what lets a generator place the skew on the same
+        key rather than on an arbitrary one."""
+        self.assertIn(HOT_CUSTOMER, self.column("orders", "customer_id")["most_common_values"])
+
+    def test_the_raised_statistics_target_is_reported(self):
+        self.assertEqual(self.column("orders", "placed_at")["statistics_target"], 250)
+        self.assertIsNone(self.column("orders", "total")["statistics_target"])
 
 
-class TestNothingRawEscapes(IntegrationCase):
-    """The negative assertion. Each planted value took a different route into
-    the statistics; none may reach the bytes on disk."""
+class TestColumnDeclarations(IntegrationCase):
+    def test_an_identity_column_reports_its_kind(self):
+        self.assertEqual(self.column("receipts", "id")["identity"], "always")
+        self.assertIsNone(self.column("orders", "id")["identity"])
 
-    def test_no_planted_value_appears_in_any_bundle(self):
+    def test_a_column_default_is_carried_as_its_expression(self):
+        self.assertIn("CURRENT_DATE", self.column("receipts", "issued_on")["default_expression"])
+        self.assertIsNone(self.column("receipts", "order_id")["default_expression"])
+
+    def test_a_non_default_collation_is_reported(self):
+        """A text column collated C sorts by byte. Recreating it under the
+        database default would reorder every range scan over it."""
+        self.assertEqual(self.column("receipts", "note")["collation"], "C")
+        self.assertNotEqual(self.column("customers", "email")["collation"], "C")
+
+    def test_a_table_reports_its_page_count_and_toast(self):
+        customers = self.table("customers")
+        self.assertGreater(customers["page_count"], 0)
+        self.assertLessEqual(customers["page_count"] * 8192, customers["size_bytes"])
+        self.assertTrue(customers["has_toast"])
+
+
+class TestIndexShape(IntegrationCase):
+    def indexes(self):
+        rows = read_rows(self.archive, "observations/pg_index.csv")
+        by_index = {}
+        for row in rows:
+            by_index.setdefault(row["index"], []).append(row)
+        for keys in by_index.values():
+            keys.sort(key=lambda row: int(row["position"]))
+        return by_index
+
+    def test_every_fixture_index_is_reported(self):
+        self.assertEqual(
+            set(self.indexes()),
+            {
+                "regions_pkey", "tenants_pkey", "customers_pkey", "orders_pkey",
+                "exotic_pkey", "receipts_pkey", "customers_email_key",
+                "orders_customer_id_idx", "orders_placed_at_idx",
+                "orders_recent_first_idx", "orders_large_idx",
+                "customers_lower_email_idx",
+            },
+        )
+
+    def test_a_composite_key_keeps_its_declared_order(self):
+        keys = self.indexes()["tenants_pkey"]
+        self.assertEqual([row["column"] for row in keys], ["org_id", "site_id"])
+
+    def test_a_descending_key_reports_its_direction_and_null_placement(self):
+        """DESC NULLS FIRST is the index's whole reason for existing: it serves
+        a newest-first scan without a sort. Recreated ascending it would not."""
+        first = self.indexes()["orders_recent_first_idx"][0]
+        self.assertEqual(first["column"], "placed_at")
+        self.assertEqual(first["descending"], "true")
+        self.assertEqual(first["nulls_first"], "true")
+
+    def test_an_include_column_is_payload_and_not_a_key(self):
+        keys = self.indexes()["orders_recent_first_idx"]
+        self.assertEqual([row["column"] for row in keys], ["placed_at", "total"])
+        self.assertEqual([row["is_key"] for row in keys], ["true", "false"])
+
+    def test_a_partial_index_is_flagged(self):
+        self.assertTrue(all(row["is_partial"] == "true"
+                            for row in self.indexes()["orders_large_idx"]))
+        self.assertTrue(all(row["is_partial"] == "false"
+                            for row in self.indexes()["orders_pkey"]))
+
+    def test_the_predicate_itself_is_in_the_schema_and_not_the_csv(self):
+        schema_sql = self.archive.read("schema.sql").decode("utf-8")
+        self.assertIn("orders_large_idx", schema_sql)
+        self.assertIn("total > ", schema_sql)
+
+    def test_an_expression_key_has_no_column_name(self):
+        keys = self.indexes()["customers_lower_email_idx"]
+        self.assertEqual(keys[0]["column"], "")
+        self.assertEqual(keys[0]["has_expressions"], "true")
+
+    def test_the_clustered_index_is_identified(self):
+        self.assertTrue(all(row["is_clustered"] == "true"
+                            for row in self.indexes()["customers_pkey"]))
+        self.assertTrue(all(row["is_clustered"] == "false"
+                            for row in self.indexes()["orders_pkey"]))
+
+    def test_operator_classes_are_reported(self):
+        self.assertEqual(self.indexes()["orders_pkey"][0]["operator_class"], "int8_ops")
+
+    def test_uniqueness_and_primacy_come_from_the_catalog(self):
+        self.assertEqual(self.indexes()["customers_email_key"][0]["is_unique"], "true")
+        self.assertEqual(self.indexes()["customers_email_key"][0]["is_primary"], "false")
+        self.assertEqual(self.indexes()["orders_pkey"][0]["is_primary"], "true")
+
+
+class TestSequences(IntegrationCase):
+    def sequences(self):
+        return {row["sequence"]: row
+                for row in read_rows(self.archive, "observations/pg_sequence.csv")}
+
+    def test_the_identity_sequence_is_reported(self):
+        """An identity column has no pg_attrdef row. Without the sequence, a
+        consumer would have no way to know the column allocates keys at all."""
+        self.assertIn("receipts_id_seq", self.sequences())
+
+    def test_sequence_parameters_are_carried_through(self):
+        sequence = self.sequences()["receipts_id_seq"]
+        self.assertEqual(int(sequence["start"]), 1)
+        self.assertEqual(int(sequence["increment"]), 1)
+        self.assertEqual(sequence["cycles"], "false")
+
+    def test_the_bigint_upper_bound_survives_exactly(self):
+        """9223372036854775807 does not fit a float64. A bound that came back
+        one larger would be a value the sequence can never reach."""
+        self.assertEqual(int(self.sequences()["receipts_id_seq"]["maximum"]),
+                         9223372036854775807)
+
+    def test_the_current_value_is_not_read(self):
+        """Reading it would mean selecting from the sequence itself, which is
+        outside the catalog-only boundary and tells a migration plan nothing
+        that the parameters do not."""
+        self.assertNotIn("last_value", self.sequences()["receipts_id_seq"])
+
+
+class TestWhatEscapes(IntegrationCase):
+    """What the bundle carries out, and what it must not.
+
+    The statistics are published as PostgreSQL computed them, so each planted
+    value is expected to appear. The negative assertion is reserved for the
+    credentials, which have no route into a bundle at all.
+    """
+
+    def test_every_planted_value_appears_in_the_bundle(self):
+        """Each took a different route into the statistics, and the bundle
+        carries all four. This is the posture the README documents: treat a
+        bundle as holding a sample of the source data."""
         for name, value in PLANTED.items():
-            for label, path in BUNDLES.items():
-                with self.subTest(planted=name, bundle=label):
-                    self.assertNotIn(value.encode("utf-8"), bundle_bytes(path))
+            with self.subTest(planted=name):
+                self.assertIn(value.encode("utf-8"), bundle_bytes(BUNDLES["first"]))
 
     def test_the_plants_really_are_in_the_source(self):
         """Guards the test above. If a fixture silently failed to insert, every

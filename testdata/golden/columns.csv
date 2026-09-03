@@ -1,11 +1,11 @@
-public,users,id,1,bigint,int8,b,N,t
-public,users,email,2,text,text,b,S,f
-public,users,profile,3,jsonb,jsonb,b,U,f
-public,users,tags,4,text[],_text,b,A,f
-public,users,legacy_balance,5,money,money,b,N,f
-public,orders,id,1,bigint,int8,b,N,t
-public,orders,user_id,2,bigint,int8,b,N,t
-public,orders,placed_at,3,timestamp with time zone,timestamptz,b,D,f
-sales,invoices,id,1,bigint,int8,b,N,t
-sales,invoices,order_id,2,bigint,int8,b,N,f
-sales,invoices,region,3,region_code,region_code,e,E,f
+public,users,id,1,bigint,int8,b,N,t,,,a,-1
+public,users,email,2,text,text,b,S,f,default,,,-1
+public,users,profile,3,jsonb,jsonb,b,U,f,,,,-1
+public,users,tags,4,text[],_text,b,A,f,default,,,-1
+public,users,legacy_balance,5,money,money,b,N,f,,,,-1
+public,orders,id,1,bigint,int8,b,N,t,,nextval('public.orders_id_seq'::regclass),,-1
+public,orders,user_id,2,bigint,int8,b,N,t,,,,-1
+public,orders,placed_at,3,timestamp with time zone,timestamptz,b,D,f,,now(),,250
+sales,invoices,id,1,bigint,int8,b,N,t,,,d,-1
+sales,invoices,order_id,2,bigint,int8,b,N,f,,,,-1
+sales,invoices,region,3,region_code,region_code,e,E,f,,,,-1
