@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-import uuid
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -476,6 +475,25 @@ class TestRunPsql(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=completed(stdout=out)):
             rows = dbprofiler.run_psql("SELECT 1", a_config())
         self.assertEqual(rows, [["a,b", "line1\nline2"]])
+
+    def test_a_field_past_the_csv_default_limit_survives_parsing(self):
+        """`csv` caps a single field at 128 KiB unless told otherwise, and a
+        statistics array goes well past that: ANALYZE caps an individual value
+        at about 1 KiB, but it collects `statistics_target` of them, and that
+        target can be raised to 10000. Publishing values verbatim rather than as
+        fixed-width digests is what made this reachable.
+        """
+        cell = "{" + ",".join("x" * 1000 for _ in range(200)) + "}"
+        out = 'public,users,email,"' + cell + '"\n'
+        self.assertGreater(len(cell), 131072, "fixture must exceed the default cap")
+        with mock.patch("subprocess.run", return_value=completed(stdout=out)):
+            rows = dbprofiler.run_psql("SELECT 1", a_config())
+        self.assertEqual(rows, [["public", "users", "email", cell]])
+
+    def test_the_csv_field_limit_is_raised_portably(self):
+        """`sys.maxsize` is the usual idiom and overflows the C long behind this
+        limit on 64-bit Windows, where a long is 32 bits."""
+        self.assertGreaterEqual(csv.field_size_limit(), 2**31 - 1)
 
     def test_scalar_helper_returns_one_value(self):
         with mock.patch("subprocess.run", return_value=completed(stdout="160002\n")):
