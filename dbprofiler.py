@@ -66,7 +66,14 @@ import zipfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-VERSION = "0.1.0"
+# A single CSV field is capped at 128 KiB by default, and one statistics array
+# goes past that: ANALYZE caps an individual value at about 1 KiB but collects
+# statistics_target of them, and that target can be raised to 10000. 2**31-1
+# rather than the usual sys.maxsize, which overflows the C long behind this
+# limit on 64-bit Windows.
+csv.field_size_limit(2**31 - 1)
+
+VERSION = "0.2.0"
 
 # Version of the normalized profile contract written to profile.json. Any change
 # to field names or semantics in the contract dataclasses must bump this.
