@@ -1,9 +1,16 @@
 # Local test environment — contains connection strings. Never commit.
 .env.test.local
 
-# Profile bundles produced by running the tool.
+# Profile bundles produced by running the tool, and anything extracted from one.
+# A bundle carries a sample of the source database: statistics values, query
+# text, and the schema. None of it belongs in a public repository.
 *.zip
 *.zip.tmp
+source-profile/
+**/manifest.json
+**/observations/
+**/profile.json
+**/schema.sql
 
 # Python
 __pycache__/
