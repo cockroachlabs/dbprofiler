@@ -80,6 +80,7 @@ PLANTED = {
 BUNDLE_ENTRIES = frozenset({
     "manifest.json",
     "schema.sql",
+    "schema_by_table.sql",
     "profile.json",
     "observations/pg_class.csv",
     "observations/pg_index.csv",

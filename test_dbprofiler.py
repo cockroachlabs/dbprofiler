@@ -981,6 +981,11 @@ def golden(name):
     return (GOLDEN / f"{name}.csv").read_text(encoding="utf-8")
 
 
+def golden_sql(name):
+    """Read a recorded pg_dump fixture."""
+    return (GOLDEN / f"{name}.sql").read_text(encoding="utf-8")
+
+
 # The order collect_catalog issues its queries in. Tables and inheritance come
 # first so an unsupported layout fails before anything else is read.
 CATALOG_FIXTURES = (
@@ -2108,7 +2113,12 @@ class TestProfileAssembly(unittest.TestCase):
 # assertions have something they would actually catch if the sanitizer broke.
 PLANTED = "planted-literal-4f2c9ae7"
 
-SCHEMA_SQL = "CREATE TABLE public.users (id bigint PRIMARY KEY);\n"
+SCHEMA_SQL = golden_sql("schema_dump")
+
+# The same dump regrouped. Recorded rather than recomputed: asserting the
+# payload against render_schema_by_table() applied to the same input would pass
+# no matter what the renderer did.
+SCHEMA_BY_TABLE_SQL = golden_sql("schema_by_table")
 
 FINGERPRINT = "0" * 64
 
@@ -2175,6 +2185,246 @@ class BundleCase(unittest.TestCase):
 
     def leftovers(self):
         return sorted(p.name for p in Path(self.directory.name).iterdir())
+
+
+# --- schema regrouping -----------------------------------------------------
+
+SECTION_TITLE = re.compile(r"^-- ={20} (.*?) ={20}$", re.MULTILINE)
+TABLE_SECTION_TITLE = re.compile(r"^-- ={20} TABLE: (\S+) ={20}$", re.MULTILINE)
+INLINE_FK = re.compile(
+    r"^ALTER TABLE ONLY ([\w.\"]+)\n"
+    r"    ADD CONSTRAINT ([\w\"]+) FOREIGN KEY \([^)]*\) REFERENCES ([\w\"]+)\.([\w\"]+)",
+    re.MULTILINE,
+)
+
+
+def sql_lines(text):
+    """Every non-comment, non-blank line, whitespace-normalized and sorted.
+
+    A multiset rather than a sequence: the regrouping reorders statements on
+    purpose, so order is what the other assertions check. What this one catches
+    is a statement the transform dropped, duplicated, or rewrote.
+    """
+    return sorted(
+        " ".join(line.split())
+        for line in text.split("\n")
+        if line.strip() and not line.lstrip().startswith("--")
+    )
+
+
+def a_dump(*blocks):
+    """Assemble a minimal pg_dump file out of (name, type, schema, sql) blocks."""
+    lines = ["--", "-- PostgreSQL database dump", "--", ""]
+    for name, kind, schema, sql in blocks:
+        lines += [
+            "--",
+            f"-- Name: {name}; Type: {kind}; Schema: {schema}; Owner: -",
+            "--",
+            "",
+            sql,
+            "",
+            "",
+        ]
+    lines += ["--", "-- PostgreSQL database dump complete", "--", ""]
+    return "\n".join(lines)
+
+
+def a_table(schema, name):
+    return (name, "TABLE", schema, f"CREATE TABLE {schema}.{name} (\n    id bigint NOT NULL\n);")
+
+
+def a_foreign_key(schema, name, constraint, references):
+    return (
+        f"{name} {constraint}",
+        "FK CONSTRAINT",
+        schema,
+        f"ALTER TABLE ONLY {schema}.{name}\n"
+        f"    ADD CONSTRAINT {constraint} FOREIGN KEY (id) REFERENCES {references}(id);",
+    )
+
+
+class TestSchemaRegrouping(unittest.TestCase):
+    def setUp(self):
+        self.rendered = dbprofiler.render_schema_by_table(SCHEMA_SQL)
+
+    def sections(self, text=None):
+        return SECTION_TITLE.findall(self.rendered if text is None else text)
+
+    def section_body(self, title):
+        """Everything between one section banner and the next."""
+        starts = [(m.group(1), m.start()) for m in SECTION_TITLE.finditer(self.rendered)]
+        for position, (found, start) in enumerate(starts):
+            if found != title:
+                continue
+            end = starts[position + 1][1] if position + 1 < len(starts) else len(self.rendered)
+            return self.rendered[start:end]
+        raise AssertionError(f"no section {title!r} in the rendered schema")
+
+    def test_the_recorded_rendering_is_reproduced(self):
+        self.assertEqual(self.rendered, SCHEMA_BY_TABLE_SQL)
+
+    def test_no_sql_is_added_lost_or_rewritten(self):
+        self.assertEqual(sql_lines(SCHEMA_SQL), sql_lines(self.rendered))
+
+    def test_the_sections_appear_in_the_documented_order(self):
+        self.assertEqual(
+            self.sections(),
+            [
+                "SECTION: PREAMBLE (non-table-scoped objects)",
+                "TABLE: public.regions",
+                "TABLE: public.users",
+                "TABLE: public.orders",
+                "TABLE: sales.invoices",
+                "SECTION: CROSS-TABLE OBJECTS (FKs, triggers, views, other)",
+            ],
+        )
+
+    def test_every_table_gets_exactly_one_section(self):
+        found = TABLE_SECTION_TITLE.findall(self.rendered)
+        self.assertEqual(sorted(found), sorted(set(found)))
+
+    def test_a_table_section_holds_everything_that_table_owns(self):
+        """The whole point: a reader sees one table without scrolling."""
+        body = self.section_body("TABLE: public.orders")
+        for statement in (
+            "CREATE TABLE public.orders (",
+            "ADD CONSTRAINT orders_pkey PRIMARY KEY (id);",
+            "ADD CONSTRAINT orders_total_check CHECK",
+            "CREATE INDEX orders_placed_by_idx ON public.orders",
+            "ADD CONSTRAINT orders_placed_by_fkey FOREIGN KEY",
+            "COMMENT ON TABLE public.orders IS",
+            "COMMENT ON COLUMN public.orders.total IS",
+            "ALTER PUBLICATION ledger_pub ADD TABLE ONLY public.orders;",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, body)
+
+    def test_the_owned_sequence_travels_with_its_table(self):
+        body = self.section_body("TABLE: public.users")
+        self.assertIn("CREATE SEQUENCE public.users_id_seq", body)
+        self.assertIn("ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;", body)
+        self.assertIn("ALTER COLUMN id SET DEFAULT nextval", body)
+
+    def test_a_table_section_orders_its_statements_so_it_can_replay(self):
+        body = self.section_body("TABLE: sales.invoices")
+        positions = [
+            body.index("CREATE TABLE sales.invoices"),
+            body.index("ADD CONSTRAINT invoices_pkey"),
+            body.index("CREATE INDEX invoices_order_id_idx"),
+            body.index("ADD CONSTRAINT invoices_order_id_fkey"),
+            body.index("CREATE UNIQUE INDEX invoices_replica_identity_idx"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_a_replica_identity_alter_follows_its_index_immediately(self):
+        """The ALTER is only valid once the index exists, and reads as noise
+        anywhere other than directly beneath it."""
+        self.assertIn(
+            "CREATE UNIQUE INDEX invoices_replica_identity_idx ON sales.invoices"
+            " USING btree (id, issued_on);\n\n"
+            "ALTER TABLE ONLY sales.invoices REPLICA IDENTITY USING INDEX"
+            " invoices_replica_identity_idx;",
+            self.rendered,
+        )
+
+    def test_an_inlined_foreign_key_follows_the_table_it_references(self):
+        """The property that makes inlining legal: by the time an FK runs, the
+        referenced table has already been created."""
+        starts = {
+            m.group(1): m.start() for m in TABLE_SECTION_TITLE.finditer(self.rendered)
+        }
+        cross_table = self.rendered.index("SECTION: CROSS-TABLE OBJECTS")
+        checked = 0
+        for match in INLINE_FK.finditer(self.rendered):
+            if match.start() > cross_table:
+                continue
+            referenced = f"{match.group(3)}.{match.group(4)}"
+            with self.subTest(constraint=match.group(2)):
+                self.assertIn(referenced, starts)
+                self.assertLess(starts[referenced], match.start())
+            checked += 1
+        self.assertEqual(checked, 4)
+
+    def test_cross_table_objects_are_held_back_to_the_end(self):
+        body = self.section_body("SECTION: CROSS-TABLE OBJECTS (FKs, triggers, views, other)")
+        self.assertIn("CREATE VIEW public.recent_orders AS", body)
+        self.assertIn("CREATE TRIGGER touch_orders", body)
+        self.assertIn("CREATE EVENT TRIGGER audit_ddl", body)
+
+    def test_the_preamble_holds_what_is_not_table_scoped(self):
+        body = self.section_body("SECTION: PREAMBLE (non-table-scoped objects)")
+        for statement in (
+            "CREATE SCHEMA sales;",
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+            "COMMENT ON EXTENSION pgcrypto IS",
+            "CREATE FUNCTION public.touch_updated_at()",
+            "CREATE PUBLICATION ledger_pub",
+            "SET default_tablespace = '';",
+            "SET default_table_access_method = heap;",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, body)
+
+    def test_the_pg_dump_header_and_trailer_are_kept(self):
+        self.assertTrue(self.rendered.startswith("--\n-- PostgreSQL database dump\n--\n"))
+        self.assertIn("-- Dumped by pg_dump version 16.2", self.rendered)
+        trailer = self.rendered.index("-- PostgreSQL database dump complete")
+        last_section = max(match.start() for match in SECTION_TITLE.finditer(self.rendered))
+        self.assertGreater(trailer, last_section)
+
+    def test_the_rendering_is_deterministic(self):
+        self.assertEqual(self.rendered, dbprofiler.render_schema_by_table(SCHEMA_SQL))
+
+    def test_a_dump_with_no_object_banners_is_passed_through_unchanged(self):
+        for text in ("", "-- nothing here\n", "SET row_security = off;\n"):
+            with self.subTest(text=text):
+                self.assertEqual(dbprofiler.render_schema_by_table(text), text)
+
+    def test_a_foreign_key_cycle_keeps_one_edge_cross_table(self):
+        """Two tables referencing each other cannot both be inlined. The edge
+        out of the alphabetically first table is the one that gives way, so the
+        choice does not depend on the order pg_dump happened to emit."""
+        dump = a_dump(
+            a_table("public", "a"),
+            a_table("public", "b"),
+            a_foreign_key("public", "a", "a_b_fkey", "public.b"),
+            a_foreign_key("public", "b", "b_a_fkey", "public.a"),
+        )
+        rendered = dbprofiler.render_schema_by_table(dump)
+        cross_table = rendered.index("SECTION: CROSS-TABLE OBJECTS")
+        self.assertLess(rendered.index("b_a_fkey"), cross_table)
+        self.assertGreater(rendered.index("a_b_fkey"), cross_table)
+        self.assertEqual(sql_lines(dump), sql_lines(rendered))
+
+    def test_a_foreign_key_to_a_table_outside_the_dump_stays_cross_table(self):
+        """Nothing in this file says where that table gets created, so there is
+        no position the FK can be inlined at and still be known to replay."""
+        dump = a_dump(
+            a_table("public", "a"),
+            a_foreign_key("public", "a", "a_elsewhere_fkey", "other.elsewhere"),
+        )
+        rendered = dbprofiler.render_schema_by_table(dump)
+        self.assertGreater(
+            rendered.index("a_elsewhere_fkey"), rendered.index("SECTION: CROSS-TABLE OBJECTS")
+        )
+
+    def test_a_self_reference_is_inlined(self):
+        """A table exists by the time its own FK runs, so a self-reference is
+        not a cycle and does not need to be held back."""
+        body = self.section_body("TABLE: public.users")
+        self.assertIn("ADD CONSTRAINT users_manager_id_fkey FOREIGN KEY", body)
+
+    def test_a_block_that_cannot_be_attributed_goes_to_the_cross_table_section(self):
+        """A wrong guess would put a statement somewhere it cannot run. The
+        cross-table section replays after every table, so it always can."""
+        dump = a_dump(
+            a_table("public", "a"),
+            ("orphan_idx", "INDEX", "public", "CREATE INDEX orphan_idx ON public.ghost (id);"),
+        )
+        rendered = dbprofiler.render_schema_by_table(dump)
+        self.assertGreater(
+            rendered.index("orphan_idx"), rendered.index("SECTION: CROSS-TABLE OBJECTS")
+        )
 
 
 class TestSafeEntryPaths(unittest.TestCase):
@@ -2267,6 +2517,7 @@ class TestPayloads(BundleCase):
                 "observations/pg_stats_ext.csv",
                 "profile.json",
                 "schema.sql",
+                "schema_by_table.sql",
             ],
         )
 
@@ -2290,6 +2541,18 @@ class TestPayloads(BundleCase):
 
     def test_the_schema_payload_is_the_dump_verbatim(self):
         self.assertEqual(self.by_path["schema.sql"].data, SCHEMA_SQL.encode("utf-8"))
+
+    def test_the_regrouped_schema_payload_matches_the_recorded_rendering(self):
+        self.assertEqual(
+            self.by_path["schema_by_table.sql"].data, SCHEMA_BY_TABLE_SQL.encode("utf-8")
+        )
+
+    def test_the_regrouped_schema_does_not_displace_the_verbatim_dump(self):
+        """Downstream consumers read schema.sql. The regrouped file is an
+        addition, so the two payloads have to differ and both have to be here."""
+        self.assertNotEqual(
+            self.by_path["schema.sql"].data, self.by_path["schema_by_table.sql"].data
+        )
 
     def test_pg_class_reports_estimates_and_sizes(self):
         rows = read_csv(self.by_path["observations/pg_class.csv"])
@@ -2848,6 +3111,7 @@ class TestOrchestrationOrder(OrchestrationCase):
                 "observations/pg_stats_ext.csv",
                 "profile.json",
                 "schema.sql",
+                "schema_by_table.sql",
             ],
         )
 
@@ -2879,6 +3143,11 @@ class TestOrchestrationContent(OrchestrationCase):
 
     def test_the_schema_dump_is_stored_verbatim(self):
         self.assertEqual(self.archive()["schema.sql"], SCHEMA_SQL.encode("utf-8"))
+
+    def test_the_regrouped_schema_is_stored_beside_it(self):
+        self.assertEqual(
+            self.archive()["schema_by_table.sql"], SCHEMA_BY_TABLE_SQL.encode("utf-8")
+        )
 
     def test_the_profile_carries_the_normalized_contract(self):
         profile = json.loads(self.archive()["profile.json"])

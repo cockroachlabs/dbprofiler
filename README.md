@@ -123,6 +123,7 @@ collection ran, so the archive as a whole differs run to run by that one field.
 source-profile.zip
 ├── manifest.json          # written last; SHA-256 of every other payload
 ├── schema.sql             # pg_dump --schema-only --no-owner --no-privileges
+├── schema_by_table.sql    # the same statements, regrouped one table per section
 ├── profile.json           # normalized contract
 └── observations/
     ├── pg_class.csv             # row and page counts, TOAST presence
@@ -139,6 +140,15 @@ source-profile.zip
 `observations/` holds one CSV per statistics source, as close to what the source returned
 as the format allows. `profile.json` is the normalized contract derived from them —
 versioned, and the thing downstream tooling should read.
+
+`schema.sql` is the pg_dump output byte for byte and stays the authority. `pg_dump`
+writes DDL in phase order, though — every `CREATE TABLE`, then every default, then every
+constraint, then every index — so one table's definition is scattered over six or more
+places. `schema_by_table.sql` is the same statements rearranged for reading: a preamble
+of the objects that are not table-scoped, one section per table, and a trailing section
+for views, triggers, and anything that spans tables. No SQL is rewritten, and table
+sections are emitted in foreign-key dependency order, so the regrouped file still
+replays.
 
 `manifest.json` records a SHA-256 of every other entry's uncompressed bytes, so a
 recipient can verify the bundle without trusting the transport. It is written last,

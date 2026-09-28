@@ -73,7 +73,7 @@ from pathlib import Path
 # limit on 64-bit Windows.
 csv.field_size_limit(2**31 - 1)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Version of the normalized profile contract written to profile.json. Any change
 # to field names or semantics in the contract dataclasses must bump this.
@@ -2422,6 +2422,7 @@ def build_profile(
 
 BUNDLE_MANIFEST = "manifest.json"
 BUNDLE_SCHEMA = "schema.sql"
+BUNDLE_SCHEMA_BY_TABLE = "schema_by_table.sql"
 BUNDLE_PROFILE = "profile.json"
 
 OBSERVATION_TABLES = "observations/pg_class.csv"
@@ -2440,6 +2441,7 @@ OBSERVATION_STATEMENTS = "observations/pg_stat_statements.csv"
 BUNDLE_PAYLOAD_PATHS = (
     BUNDLE_PROFILE,
     BUNDLE_SCHEMA,
+    BUNDLE_SCHEMA_BY_TABLE,
     OBSERVATION_FOREIGN_KEYS,
     OBSERVATION_TABLES,
     OBSERVATION_COLUMNS,
@@ -2460,6 +2462,7 @@ REQUIRED_BUNDLE_PATHS = frozenset(
     {
         BUNDLE_PROFILE,
         BUNDLE_SCHEMA,
+        BUNDLE_SCHEMA_BY_TABLE,
         OBSERVATION_TABLES,
         OBSERVATION_COLUMNS,
         OBSERVATION_FOREIGN_KEYS,
@@ -2539,6 +2542,399 @@ def require_safe_entry_path(path: str) -> None:
     """Reject any entry name an extractor could resolve outside its target."""
     if not SAFE_ENTRY_PATH.match(path):
         raise BundleError(f"unsafe bundle entry path: {path!r}")
+
+
+# --- schema regrouping -----------------------------------------------------
+# pg_dump writes DDL in phase order: every CREATE TABLE, then every column
+# default, then every constraint, then every index, and so on. One table's
+# definition therefore lands in six or more places, often hundreds of lines
+# apart. schema_by_table.sql is the same dump regrouped so that a table reads
+# as one block: a preamble of the objects that are not table-scoped, one
+# section per table in foreign-key dependency order, and a trailing section for
+# the objects that span tables.
+#
+# Three properties are deliberate:
+#
+#   No SQL is rewritten. Every statement is carried across byte for byte, so
+#   the regrouped file is a rearrangement of schema.sql and not a second
+#   rendering that could quietly disagree with it. schema.sql stays in the
+#   bundle unchanged and remains the authority.
+#
+#   No new reads. This is a pure function of the dump the collector already
+#   holds: no query, no catalog relation, no child process.
+#
+#   Table sections are emitted in foreign-key dependency order, referenced
+#   table first, alphabetical tie-break. That is what makes it legal to inline
+#   a table's own FK constraints into its section -- the referenced table has
+#   already been created at that point -- so the regrouped file still replays.
+#   An FK that closes a genuine cycle, or that points at a table outside the
+#   dump, cannot be inlined and stays in the trailing section.
+
+SCHEMA_BANNER = re.compile(
+    r"^-- Name: (?P<name>.*); Type: (?P<type>[^;]*); "
+    r"Schema: (?P<schema>[^;]*); Owner: (?P<owner>.*)$"
+)
+
+# The last line pg_dump writes before its own trailer. Everything from the
+# comment block around it onwards is copied through untouched.
+SCHEMA_DUMP_COMPLETE = "-- PostgreSQL database dump complete"
+
+# pg_dump drops bare session settings between objects. They belong to the file,
+# not to the object they happen to follow, so they are pulled off the tail of a
+# block and re-emitted once, after the preamble.
+SCHEMA_SESSION_SET = re.compile(r"^SET (?:default_tablespace|default_table_access_method) = .*;$")
+
+# An index that backs a replica identity arrives in the same block as the ALTER
+# that installs it, and the ALTER is only valid once the index exists. Ranking
+# the pair last inside a section keeps them adjacent and keeps the ALTER after
+# its index.
+SCHEMA_REPLICA_IDENTITY = re.compile(
+    r"^ALTER TABLE ONLY .* REPLICA IDENTITY USING INDEX ", re.MULTILINE
+)
+
+SCHEMA_FK_REFERENCE = re.compile(
+    r"ADD CONSTRAINT [\w\"]+ FOREIGN KEY \([^)]*\) REFERENCES ([\w\"]+)\.([\w\"]+)"
+)
+SCHEMA_SEQUENCE_OWNED_BY = re.compile(r"ALTER SEQUENCE ([\w.\"]+) OWNED BY ([\w.\"]+)\.[\w\"]+;")
+SCHEMA_INDEX_TARGET = re.compile(r"\bON (?:ONLY )?([\w\"]+)\.([\w\"]+)")
+SCHEMA_PUBLICATION_TARGET = re.compile(r"ADD TABLE (?:ONLY )?([\w\"]+)\.([\w\"]+)")
+
+# Object types that are never table-scoped.
+SCHEMA_PREAMBLE_TYPES = frozenset(
+    {
+        "SCHEMA",
+        "EXTENSION",
+        "TYPE",
+        "DOMAIN",
+        "FUNCTION",
+        "PROCEDURE",
+        "AGGREGATE",
+        "PUBLICATION",
+    }
+)
+
+# Object types that have to wait until every table exists. FK CONSTRAINT is
+# deliberately absent: FKs are inlined into the section of the table that owns
+# them, which the dependency order makes safe.
+SCHEMA_TRAILING_TYPES = frozenset({"TRIGGER", "VIEW", "MATERIALIZED VIEW", "EVENT TRIGGER"})
+
+# Order of object types inside one table's section. Lower emits first.
+SCHEMA_TABLE_ORDER = {
+    "TABLE": 0,
+    "SEQUENCE": 1,
+    "SEQUENCE OWNED BY": 2,
+    "DEFAULT": 3,
+    "CONSTRAINT": 4,
+    "INDEX": 5,
+    "FK CONSTRAINT": 6,
+    "COMMENT": 7,
+}
+SCHEMA_REPLICA_IDENTITY_RANK = 8
+SCHEMA_OTHER_RANK = 9
+
+SCHEMA_SECTION_RULE = "=" * 20
+
+
+@dataclass(frozen=True)
+class SchemaBlock:
+    """One pg_dump object block: its `-- Name:` banner and the SQL beneath it."""
+
+    name: str
+    type: str
+    schema: str
+    lines: tuple[str, ...]
+    index: int
+
+    @property
+    def body(self) -> str:
+        return "\n".join(self.lines)
+
+
+@dataclass(frozen=True)
+class SchemaDump:
+    """A parsed pg_dump file, still holding every original line."""
+
+    preamble: tuple[str, ...]
+    blocks: tuple[SchemaBlock, ...]
+    session_sets: tuple[str, ...]
+    footer: tuple[str, ...]
+
+
+def qualified(schema: str, name: str) -> str:
+    return f"{schema}.{name}"
+
+
+def split_session_sets(lines: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split the bare session settings off the tail of a block."""
+    end = len(lines)
+    position = end - 1
+    while position >= 0:
+        stripped = lines[position].strip()
+        if stripped == "":
+            position -= 1
+            continue
+        if SCHEMA_SESSION_SET.match(stripped):
+            end = position
+            position -= 1
+            continue
+        break
+    pulled = tuple(line for line in lines[end:] if line.strip())
+    return lines[:end], pulled
+
+
+def parse_schema_dump(text: str) -> SchemaDump | None:
+    """Split a pg_dump file into preamble, object blocks, and trailer.
+
+    Returns None when the text carries no `-- Name:` banners at all -- an empty
+    dump, or output from something that is not pg_dump. There is nothing to
+    regroup in that case and inventing a structure would be worse than saying
+    so; the caller passes the text through unchanged.
+    """
+    lines = text.split("\n")
+
+    starts = [
+        position
+        for position in range(len(lines) - 2)
+        if lines[position] == "--"
+        and lines[position + 2] == "--"
+        and SCHEMA_BANNER.match(lines[position + 1])
+    ]
+    if not starts:
+        return None
+
+    footer_start = len(lines)
+    for position in range(len(lines) - 1, -1, -1):
+        if lines[position] == SCHEMA_DUMP_COMPLETE:
+            footer_start = position - 1  # the "--" that opens the trailer
+            break
+
+    blocks = []
+    session_sets: list[str] = []
+    bounds = starts + [footer_start]
+    for ordinal, start in enumerate(starts):
+        match = SCHEMA_BANNER.match(lines[start + 1])
+        if match is None:  # unreachable: the same pattern selected this start
+            continue
+        body, pulled = split_session_sets(tuple(lines[start : bounds[ordinal + 1]]))
+        session_sets.extend(pulled)
+        blocks.append(
+            SchemaBlock(
+                name=match.group("name"),
+                type=match.group("type"),
+                schema=match.group("schema"),
+                lines=body,
+                index=ordinal,
+            )
+        )
+
+    return SchemaDump(
+        preamble=tuple(lines[: starts[0]]),
+        blocks=tuple(blocks),
+        session_sets=tuple(session_sets),
+        footer=tuple(lines[footer_start:]),
+    )
+
+
+def sequence_owners(blocks) -> dict[str, str]:
+    """Map a sequence's qualified name to the table that owns it."""
+    owners = {}
+    for block in blocks:
+        if block.type != "SEQUENCE OWNED BY":
+            continue
+        match = SCHEMA_SEQUENCE_OWNED_BY.search(block.body)
+        if match:
+            owners[match.group(1)] = match.group(2)
+    return owners
+
+
+def block_target(block: SchemaBlock, owners: dict[str, str]) -> str | None:
+    """The qualified table a block belongs to, or None if it is not table-scoped."""
+    kind = block.type
+    if kind == "TABLE":
+        return qualified(block.schema, block.name)
+    if kind == "COMMENT":
+        obj = block.name.split(" ", 1)[1]
+        if block.name.startswith("COLUMN "):
+            obj = obj.rsplit(".", 1)[0]
+        return qualified(block.schema, obj)
+    if kind in ("SEQUENCE", "SEQUENCE OWNED BY"):
+        return owners.get(qualified(block.schema, block.name))
+    if kind in ("DEFAULT", "CONSTRAINT", "FK CONSTRAINT", "ACL"):
+        return qualified(block.schema, block.name.split(" ")[0])
+    if kind == "INDEX":
+        match = SCHEMA_INDEX_TARGET.search(block.body)
+        return qualified(match.group(1), match.group(2)) if match else None
+    if kind == "PUBLICATION TABLE":
+        match = SCHEMA_PUBLICATION_TARGET.search(block.body)
+        return qualified(match.group(1), match.group(2)) if match else None
+    return None
+
+
+def attribute_schema_blocks(blocks):
+    """Sort every block into the preamble, a table, or the trailing section.
+
+    A block whose owning table cannot be identified goes to the trailing
+    section rather than to a guess. The trailing section replays after every
+    table exists, so an unattributed block is still in a position where it can
+    run; a wrong attribution would not be.
+    """
+    owners = sequence_owners(blocks)
+    known = {qualified(block.schema, block.name) for block in blocks if block.type == "TABLE"}
+
+    preamble: list[SchemaBlock] = []
+    tables: dict[str, list[SchemaBlock]] = {name: [] for name in known}
+    trailing: list[SchemaBlock] = []
+
+    for block in blocks:
+        if block.type in SCHEMA_PREAMBLE_TYPES:
+            preamble.append(block)
+            continue
+        if block.type == "COMMENT" and not block.name.startswith(("TABLE ", "COLUMN ")):
+            preamble.append(block)  # COMMENT ON EXTENSION, SCHEMA, FUNCTION, ...
+            continue
+        if block.type in SCHEMA_TRAILING_TYPES:
+            trailing.append(block)
+            continue
+
+        target = block_target(block, owners)
+        if target is None or target not in known:
+            trailing.append(block)
+        else:
+            tables[target].append(block)
+
+    return preamble, tables, trailing
+
+
+def foreign_key_edges(tables):
+    """Return (edges, unresolved) over the FK blocks inlined into each table.
+
+    A self-reference is not an edge: the table exists by the time its own FK
+    runs. A reference to a table outside the dump cannot be ordered against, so
+    it is reported unresolved and its block is evicted to the trailing section.
+    """
+    edges: dict[str, list[tuple[str, SchemaBlock]]] = {}
+    unresolved = []
+    for owner, blocks in tables.items():
+        for block in blocks:
+            if block.type != "FK CONSTRAINT":
+                continue
+            match = SCHEMA_FK_REFERENCE.search(block.body)
+            if not match:
+                unresolved.append(block)
+                continue
+            referenced = qualified(match.group(1), match.group(2))
+            if referenced == owner:
+                continue
+            if referenced not in tables:
+                unresolved.append(block)
+                continue
+            edges.setdefault(owner, []).append((referenced, block))
+    return edges, unresolved
+
+
+def topological_order(names, edges):
+    """Kahn's algorithm over the FK edges, alphabetical tie-break.
+
+    Returns (order, cut) where `cut` holds the FK blocks whose edge had to be
+    broken to get past a genuine cycle. Those cannot be inlined.
+
+    One table is emitted per round rather than a whole ready layer, so the
+    alphabetical tie-break orders the file as a whole and not just within a
+    layer. That is what makes the output stable across runs.
+    """
+    dependencies = {name: set() for name in names}
+    for owner, references in edges.items():
+        for referenced, _block in references:
+            dependencies[owner].add(referenced)
+
+    order = []
+    cut = []
+    emitted: set[str] = set()
+    remaining = set(names)
+    while remaining:
+        ready = sorted(name for name in remaining if dependencies[name] <= emitted)
+        if not ready:
+            # A genuine cycle. Cut the unsatisfied edges of the alphabetically
+            # first table still waiting, so the resolution is deterministic.
+            victim = sorted(remaining)[0]
+            cut.extend(
+                block for referenced, block in edges.get(victim, []) if referenced not in emitted
+            )
+            dependencies[victim] &= emitted
+            ready = [victim]
+        chosen = ready[0]
+        order.append(chosen)
+        emitted.add(chosen)
+        remaining.discard(chosen)
+    return order, cut
+
+
+def table_block_order(block: SchemaBlock) -> tuple[int, int]:
+    """Sort key inside one table's section: rank first, dump order within a rank."""
+    if block.type == "INDEX" and SCHEMA_REPLICA_IDENTITY.search(block.body):
+        rank = SCHEMA_REPLICA_IDENTITY_RANK
+    else:
+        rank = SCHEMA_TABLE_ORDER.get(block.type, SCHEMA_OTHER_RANK)
+    return (rank, block.index)
+
+
+def section_banner(title: str) -> list[str]:
+    return ["--", f"-- {SCHEMA_SECTION_RULE} {title} {SCHEMA_SECTION_RULE}", "--", ""]
+
+
+def render_schema_by_table(schema_sql: str) -> str:
+    """Regroup a pg_dump file so each table reads as one contiguous section.
+
+    Pure: no query, no child process, no SQL rewritten. See the section note
+    above for the three properties this guarantees.
+    """
+    dump = parse_schema_dump(schema_sql)
+    if dump is None:
+        return schema_sql
+
+    preamble, tables, trailing = attribute_schema_blocks(dump.blocks)
+    edges, unresolved = foreign_key_edges(tables)
+    order, cut = topological_order(set(tables), edges)
+
+    evicted = {id(block) for block in unresolved} | {id(block) for block in cut}
+    if evicted:
+        for name, blocks in tables.items():
+            tables[name] = [block for block in blocks if id(block) not in evicted]
+            trailing.extend(block for block in blocks if id(block) in evicted)
+    trailing.sort(key=lambda block: block.index)
+
+    out: list[str] = []
+
+    def emit(lines) -> None:
+        kept = list(lines)
+        while kept and not kept[-1].strip():
+            kept.pop()
+        out.extend(kept)
+        out.extend(("", ""))
+
+    emit(dump.preamble)
+
+    out.extend(section_banner("SECTION: PREAMBLE (non-table-scoped objects)"))
+    for block in preamble:
+        emit(block.lines)
+    if dump.session_sets:
+        emit(dump.session_sets)
+
+    for name in order:
+        out.extend(section_banner(f"TABLE: {name}"))
+        for block in sorted(tables[name], key=table_block_order):
+            emit(block.lines)
+
+    if trailing:
+        out.extend(section_banner("SECTION: CROSS-TABLE OBJECTS (FKs, triggers, views, other)"))
+        for block in trailing:
+            emit(block.lines)
+
+    while out and not out[-1].strip():
+        out.pop()
+    out.append("")
+    out.extend(dump.footer)
+    return "\n".join(out)
 
 
 # --- serialization ---------------------------------------------------------
@@ -2795,8 +3191,10 @@ def build_payloads(
     schema_sql: str,
 ) -> tuple[BundleEntry, ...]:
     """Serialize everything collected, dropping the sections that degraded."""
+    by_table = render_schema_by_table(schema_sql)
     entries = [
         BundleEntry(BUNDLE_SCHEMA, schema_sql.encode("utf-8"), schema_sql.count("\n")),
+        BundleEntry(BUNDLE_SCHEMA_BY_TABLE, by_table.encode("utf-8"), by_table.count("\n")),
         BundleEntry(BUNDLE_PROFILE, json_bytes(profile), len(profile.tables)),
         observation_tables(profile),
         observation_columns(profile),
