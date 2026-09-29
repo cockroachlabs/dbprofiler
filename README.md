@@ -186,8 +186,9 @@ python3 dbprofiler.py --check-safety
 ruff check                        # optional
 ```
 
-Integration tests run against a local PostgreSQL 16 in Docker and are skipped unless
-configured — a plain `python3 -m unittest` opens no sockets. They build a uniquely named
+Integration tests run against a PostgreSQL 16 in Docker and are skipped unless
+configured — a plain `python3 -m unittest` opens no sockets. CI runs them from the same
+Compose file; locally you start the server yourself. They build a uniquely named
 disposable schema, run the shipped script against it as a subprocess, check the bundle,
 and drop the schema again:
 
