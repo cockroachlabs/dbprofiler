@@ -2120,6 +2120,17 @@ SCHEMA_SQL = golden_sql("schema_dump")
 # no matter what the renderer did.
 SCHEMA_BY_TABLE_SQL = golden_sql("schema_by_table")
 
+# A dump of a declarative partition hierarchy: range and list parents, a
+# default partition, a partition attached after the fact, a sub-partitioned
+# child, and a partitioned index. require_supported_layout refuses to profile
+# a source containing any of it, so the integration test cannot reach these
+# shapes -- but a dump handed to the renderer still can, and a release that
+# lifts that restriction should not also have to rediscover the ordering
+# rules. Recorded from PostgreSQL 16, which also makes this the one fixture
+# carrying pg_dump's \restrict wrapper.
+SCHEMA_PARTITIONED_SQL = golden_sql("schema_partitioned_dump")
+SCHEMA_PARTITIONED_BY_TABLE_SQL = golden_sql("schema_partitioned_by_table")
+
 FINGERPRINT = "0" * 64
 
 
@@ -2425,6 +2436,101 @@ class TestSchemaRegrouping(unittest.TestCase):
         self.assertGreater(
             rendered.index("orphan_idx"), rendered.index("SECTION: CROSS-TABLE OBJECTS")
         )
+
+
+class TestSchemaRegroupingOfPartitions(unittest.TestCase):
+    """The renderer over a declarative partition hierarchy.
+
+    Partitioning is the one shape where regrouping can break replay in a way
+    the flat dump cannot: ATTACH PARTITION names two tables, so moving either
+    one past it is enough to make the file stop loading.
+    """
+
+    def setUp(self):
+        self.rendered = dbprofiler.render_schema_by_table(SCHEMA_PARTITIONED_SQL)
+
+    def position(self, needle):
+        found = self.rendered.index(needle)
+        self.assertNotIn(needle, self.rendered[found + len(needle):], f"{needle} is ambiguous")
+        return found
+
+    def test_the_recorded_rendering_still_matches(self):
+        self.assertEqual(self.rendered, SCHEMA_PARTITIONED_BY_TABLE_SQL)
+
+    def test_no_sql_is_lost(self):
+        self.assertEqual(sql_lines(SCHEMA_PARTITIONED_SQL), sql_lines(self.rendered))
+
+    def test_every_partition_gets_its_own_block(self):
+        titles = set(SECTION_TITLE.findall(self.rendered))
+        for name in (
+            "sales.shipments", "sales.shipments_2025", "sales.shipments_2026",
+            "sales.shipments_overflow", "sales.accounts", "sales.accounts_standard",
+            "sales.accounts_premium", "sales.events", "sales.events_2026",
+            "sales.events_2026_click", "sales.events_2026_view",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(f"TABLE: {name}", titles)
+
+    def test_a_parent_block_precedes_every_partition_of_it(self):
+        for parent, child in (
+            ("sales.shipments", "sales.shipments_2025"),
+            ("sales.shipments", "sales.shipments_overflow"),
+            ("sales.accounts", "sales.accounts_premium"),
+            ("sales.events", "sales.events_2026"),
+            # Two levels down: the intermediate parent is itself partitioned.
+            ("sales.events_2026", "sales.events_2026_click"),
+        ):
+            with self.subTest(parent=parent, child=child):
+                self.assertLess(
+                    self.position(f"TABLE: {parent} ="),
+                    self.position(f"TABLE: {child} ="),
+                )
+
+    def test_every_attach_partition_follows_both_tables_it_names(self):
+        """The statement that would fail first if regrouping got this wrong."""
+        attaches = re.findall(
+            r"ALTER TABLE ONLY (\S+) ATTACH PARTITION (\S+)", self.rendered
+        )
+        self.assertTrue(attaches, "expected the dump to carry ATTACH PARTITION")
+        for parent, child in attaches:
+            with self.subTest(parent=parent, child=child):
+                attach = self.rendered.index(
+                    f"ALTER TABLE ONLY {parent} ATTACH PARTITION {child}"
+                )
+                self.assertGreater(attach, self.position(f"TABLE: {parent} ="))
+                self.assertGreater(attach, self.position(f"TABLE: {child} ="))
+
+    def test_a_partitioned_index_is_attached_after_the_child_index_exists(self):
+        """CREATE INDEX on the parent fans out to one index per partition,
+        and each child index is then attached to the parent's. A child index
+        arrives either as CREATE INDEX or, when it backs the partitioned
+        primary key, as ADD CONSTRAINT."""
+        attaches = re.findall(
+            r"ALTER INDEX (\S+) ATTACH PARTITION ([^;\s]+);", self.rendered
+        )
+        self.assertTrue(attaches, "expected the dump to carry ALTER INDEX ... ATTACH")
+        for parent_index, child_index in attaches:
+            with self.subTest(index=child_index):
+                bare = child_index.split(".")[-1]
+                created = max(
+                    self.rendered.find(f"CREATE INDEX {bare} ON "),
+                    self.rendered.find(f"CREATE UNIQUE INDEX {bare} ON "),
+                    self.rendered.find(f"ADD CONSTRAINT {bare} PRIMARY KEY"),
+                )
+                self.assertNotEqual(created, -1, f"{child_index} is never created")
+                attach = self.rendered.index(
+                    f"ALTER INDEX {parent_index} ATTACH PARTITION {child_index};"
+                )
+                self.assertGreater(attach, created)
+
+    def test_every_attach_waits_for_the_cross_table_section(self):
+        """Both ATTACH forms name objects from two different blocks, so the
+        only position guaranteed to be after all of them is the section that
+        replays last."""
+        cross_table = self.rendered.index("SECTION: CROSS-TABLE OBJECTS")
+        for match in re.finditer(r"(?m)^ALTER (?:TABLE ONLY|INDEX) .* ATTACH PARTITION", self.rendered):
+            with self.subTest(statement=match.group(0)[:60]):
+                self.assertGreater(match.start(), cross_table)
 
 
 class TestSafeEntryPaths(unittest.TestCase):

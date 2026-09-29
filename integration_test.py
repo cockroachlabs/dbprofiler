@@ -26,10 +26,12 @@ computed, which means something has to compute them first.
 from __future__ import annotations
 
 import csv
+import collections
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,6 +97,15 @@ BUNDLE_ENTRIES = frozenset({
 
 ROWS_CUSTOMERS = 500
 ROWS_ORDERS = 5000
+
+# Every relation create_fixtures() leaves behind, as the collectors name them.
+# Kept in one place because four assertions compare against the whole set, and
+# adding a fixture without updating all four is otherwise an easy miss.
+FIXTURE_TABLES = frozenset({
+    "regions", "tenants", "customers", "orders", "exotic", "receipts",
+    "reservations", "maintenance_windows", "audit_full", "audit_nothing",
+    "audit_indexed", "customer_order_totals",
+})
 
 # How orders are spread over customers, chosen so the fan-out estimate has an
 # exactly predictable right answer rather than one this test has to guess.
@@ -172,6 +183,12 @@ def create_fixtures() -> None:
     column and the sequence behind it, a non-default collation, a raised
     statistics target, a clustered heap, a single-column foreign key, and a
     composite one with extended statistics behind it.
+
+    A second group exists for the regrouped schema rendering rather than for
+    the collectors: a materialized view with an index, plain and partial
+    exclusion constraints, and all three explicit replica identities. pg_dump
+    emits each through a different path, and each lands somewhere different
+    in schema_by_table.sql.
     """
     execute(f"CREATE SCHEMA {SCHEMA}")
 
@@ -270,6 +287,77 @@ def create_fixtures() -> None:
             ON org_id, site_id FROM {SCHEMA}.orders
     """)
 
+    # Exclusion constraints, plain and partial. Both are CONSTRAINT entries
+    # that carry their own index, so they must sort with the primary key
+    # rather than with the plain indexes. A range with && needs no extension;
+    # a multi-column form would drag in btree_gist and a superuser.
+    #
+    # A declarative partition hierarchy is deliberately absent here.
+    # require_supported_layout rejects a source that contains one, so a
+    # partitioned table in this schema would fail the run before any
+    # assertion. The regrouping of partitioned DDL is covered against a
+    # recorded dump in test_dbprofiler.py instead, where the renderer can be
+    # exercised without the profiler having to reach the database.
+    execute(f"""
+        CREATE TABLE {SCHEMA}.reservations (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            during tstzrange NOT NULL,
+            EXCLUDE USING gist (during WITH &&)
+        );
+
+        CREATE TABLE {SCHEMA}.maintenance_windows (
+            id integer PRIMARY KEY,
+            during tstzrange NOT NULL,
+            cancelled boolean NOT NULL DEFAULT false,
+            CONSTRAINT maintenance_windows_no_overlap
+                EXCLUDE USING gist (during WITH &&) WHERE (NOT cancelled)
+        );
+    """)
+
+    # A materialized view and an index on it. It reads like a table to
+    # pg_class and like a view to pg_dump, which is the combination most
+    # likely to strand its index in the wrong section.
+    execute(f"""
+        CREATE MATERIALIZED VIEW {SCHEMA}.customer_order_totals AS
+            SELECT c.id AS customer_id,
+                   count(o.id) AS order_count,
+                   sum(o.total) AS total_value
+            FROM {SCHEMA}.customers c
+            LEFT JOIN {SCHEMA}.orders o ON o.customer_id = c.id
+            GROUP BY c.id
+            WITH NO DATA;
+
+        CREATE UNIQUE INDEX customer_order_totals_pk
+            ON {SCHEMA}.customer_order_totals (customer_id);
+    """)
+
+    # The three explicit replica identities. DEFAULT is left implicit
+    # everywhere else and emits nothing, which is its own case. Only the
+    # USING INDEX form names an index, and that ALTER has to stay beside it.
+    execute(f"""
+        CREATE TABLE {SCHEMA}.audit_full (
+            id integer PRIMARY KEY,
+            payload text
+        );
+        ALTER TABLE {SCHEMA}.audit_full REPLICA IDENTITY FULL;
+
+        CREATE TABLE {SCHEMA}.audit_nothing (
+            id integer PRIMARY KEY,
+            payload text
+        );
+        ALTER TABLE {SCHEMA}.audit_nothing REPLICA IDENTITY NOTHING;
+
+        CREATE TABLE {SCHEMA}.audit_indexed (
+            id integer PRIMARY KEY,
+            tracking_code text NOT NULL,
+            payload text
+        );
+        CREATE UNIQUE INDEX audit_indexed_replica_idx
+            ON {SCHEMA}.audit_indexed (tracking_code);
+        ALTER TABLE {SCHEMA}.audit_indexed
+            REPLICA IDENTITY USING INDEX audit_indexed_replica_idx;
+    """)
+
 
 def seed_fixtures() -> None:
     """Insert synthetic rows, then let PostgreSQL compute statistics over them."""
@@ -323,6 +411,37 @@ def seed_fixtures() -> None:
         FROM generate_series(1, 100) AS g;
     """)
 
+    # Rows for the shapes added for the schema rendering. The reservation
+    # windows are disjoint so the exclusion constraints admit them.
+    execute(f"""
+        INSERT INTO {SCHEMA}.reservations (during)
+        SELECT tstzrange(TIMESTAMPTZ '2026-01-01 00:00:00+00' + (g || ' days')::interval,
+                         TIMESTAMPTZ '2026-01-01 00:00:00+00' + (g || ' days')::interval
+                             + INTERVAL '12 hours')
+        FROM generate_series(1, 40) AS g;
+
+        INSERT INTO {SCHEMA}.maintenance_windows (id, during, cancelled)
+        SELECT g,
+               tstzrange(TIMESTAMPTZ '2026-03-01 00:00:00+00' + (g || ' days')::interval,
+                         TIMESTAMPTZ '2026-03-01 00:00:00+00' + (g || ' days')::interval
+                             + INTERVAL '6 hours'),
+               false
+        FROM generate_series(1, 30) AS g;
+
+        INSERT INTO {SCHEMA}.audit_full (id, payload)
+        SELECT g, 'payload ' || g FROM generate_series(1, 25) AS g;
+
+        INSERT INTO {SCHEMA}.audit_nothing (id, payload)
+        SELECT g, 'payload ' || g FROM generate_series(1, 25) AS g;
+
+        INSERT INTO {SCHEMA}.audit_indexed (id, tracking_code, payload)
+        SELECT g, 'track-' || g, 'payload ' || g FROM generate_series(1, 25) AS g;
+    """)
+
+    # The view was created WITH NO DATA so it could be built before the rows
+    # existed. Populate it now, so pg_class reports a real heap for it.
+    execute(f"REFRESH MATERIALIZED VIEW {SCHEMA}.customer_order_totals")
+
     # Sort the heap so pg_stats.correlation over customers.id comes back at 1
     # and says so. Without it the number would be an accident of insertion
     # order, which is exactly what the statistic is supposed to distinguish.
@@ -334,7 +453,10 @@ def seed_fixtures() -> None:
     # pass vacuously against nulls.
     execute(f"""
         ANALYZE {SCHEMA}.regions, {SCHEMA}.tenants, {SCHEMA}.customers,
-                {SCHEMA}.orders, {SCHEMA}.exotic, {SCHEMA}.receipts
+                {SCHEMA}.orders, {SCHEMA}.exotic, {SCHEMA}.receipts,
+                {SCHEMA}.reservations, {SCHEMA}.maintenance_windows,
+                {SCHEMA}.audit_full, {SCHEMA}.audit_nothing,
+                {SCHEMA}.audit_indexed, {SCHEMA}.customer_order_totals
     """)
 
 
@@ -531,7 +653,7 @@ class TestScope(IntegrationCase):
 
     def test_the_schema_sql_covers_the_fixtures(self):
         schema_sql = self.archive.read("schema.sql").decode("utf-8")
-        for name in ("regions", "tenants", "customers", "orders", "exotic", "receipts"):
+        for name in sorted(FIXTURE_TABLES):
             with self.subTest(name=name):
                 self.assertIn(f"{SCHEMA}.{name}", schema_sql)
 
@@ -541,12 +663,101 @@ class TestScope(IntegrationCase):
         self.assertNotIn("GRANT ", schema_sql)
 
 
+class TestRegroupedSchema(IntegrationCase):
+    """schema_by_table.sql, against DDL a live PostgreSQL really emitted.
+
+    The renderer has unit coverage over recorded dumps. What only a live
+    server can show is that pg_dump still emits the shapes those goldens were
+    recorded from, in the form the renderer expects.
+    """
+
+    def regrouped(self):
+        return self.archive.read("schema_by_table.sql").decode("utf-8")
+
+    def block(self, table):
+        """The regrouped section for one fixture table."""
+        text = self.regrouped()
+        banners = [m.start() for m in re.finditer(r"(?m)^-- =+ (?:TABLE|SECTION): ", text)]
+        start = text.index(f"TABLE: {SCHEMA}.{table} ")
+        opens = max(position for position in banners if position <= start)
+        later = [position for position in banners if position > start]
+        return text[opens: later[0] if later else len(text)]
+
+    def test_it_carries_exactly_the_sql_of_the_flat_dump(self):
+        """Regrouping moves statements; it must never add or drop one."""
+        def statements(payload):
+            text = self.archive.read(payload).decode("utf-8")
+            return collections.Counter(
+                " ".join(line.split())
+                for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith("--")
+            )
+
+        self.assertEqual(statements("schema.sql"), statements("schema_by_table.sql"))
+
+    def test_every_fixture_table_gets_a_block(self):
+        text = self.regrouped()
+        for name in sorted(FIXTURE_TABLES - {"customer_order_totals"}):
+            with self.subTest(name=name):
+                self.assertIn(f"TABLE: {SCHEMA}.{name} ", text)
+
+    def test_an_exclusion_constraint_sorts_with_the_primary_key(self):
+        """It is a CONSTRAINT carrying its own index, so it belongs with the
+        key inside the table's own block rather than stranded cross-table."""
+        text = self.regrouped()
+        cross_table = text.index("SECTION: CROSS-TABLE OBJECTS")
+        for table, constraint in (
+            ("reservations", "reservations_during_excl"),
+            ("maintenance_windows", "maintenance_windows_no_overlap"),
+        ):
+            with self.subTest(table=table):
+                body = self.block(table)
+                self.assertIn(f"ADD CONSTRAINT {constraint} EXCLUDE USING gist", body)
+                self.assertLess(body.index("CREATE TABLE"), body.index("ADD CONSTRAINT"))
+                self.assertLess(text.index(f"ADD CONSTRAINT {constraint}"), cross_table)
+
+    def test_a_partial_exclusion_constraint_keeps_its_predicate(self):
+        self.assertIn(
+            "EXCLUDE USING gist (during WITH &&) WHERE ((NOT cancelled))",
+            self.block("maintenance_windows"),
+        )
+
+    def test_replica_identity_full_and_nothing_stay_with_their_table(self):
+        for table, clause in (("audit_full", "FULL"), ("audit_nothing", "NOTHING")):
+            with self.subTest(table=table):
+                body = self.block(table)
+                self.assertIn(f"REPLICA IDENTITY {clause};", body)
+                self.assertLess(body.index("CREATE TABLE"), body.index("REPLICA IDENTITY"))
+
+    def test_replica_identity_using_index_follows_the_index_it_names(self):
+        """The one form that names another object. Separating the two would
+        leave an ALTER referring to an index that does not exist yet."""
+        body = self.block("audit_indexed")
+        index = body.index("CREATE UNIQUE INDEX audit_indexed_replica_idx")
+        alter = body.index("REPLICA IDENTITY USING INDEX audit_indexed_replica_idx")
+        self.assertLess(index, alter)
+        between = body[body.index(";", index) + 1: alter]
+        self.assertEqual(between.strip(), "ALTER TABLE ONLY " + SCHEMA + ".audit_indexed")
+
+    def test_a_table_left_on_the_default_replica_identity_says_nothing(self):
+        self.assertNotIn("REPLICA IDENTITY", self.block("customers"))
+
+    def test_the_materialized_view_and_its_index_are_cross_table(self):
+        """A materialized view reads like a table to pg_class and like a view
+        to pg_dump. It has no table block, so both it and its index belong in
+        the section that replays last."""
+        text = self.regrouped()
+        cross_table = text.index("SECTION: CROSS-TABLE OBJECTS")
+        view = text.index(f"CREATE MATERIALIZED VIEW {SCHEMA}.customer_order_totals")
+        index = text.index("CREATE UNIQUE INDEX customer_order_totals_pk")
+        self.assertGreater(view, cross_table)
+        self.assertGreater(index, view)
+
+
 class TestShape(IntegrationCase):
     def test_every_fixture_table_is_reported(self):
         found = {table["name"] for table in self.profile["tables"]}
-        self.assertEqual(
-            found, {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
-        )
+        self.assertEqual(found, set(FIXTURE_TABLES))
 
     def test_row_counts_are_estimates_of_the_right_magnitude(self):
         """reltuples after ANALYZE, not a COUNT(*): close, but never promised
@@ -617,9 +828,7 @@ class TestShape(IntegrationCase):
         rows = {row["table"]: row for row in read_rows(
             self.archive, "observations/pg_class.csv"
         )}
-        self.assertEqual(
-            set(rows), {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
-        )
+        self.assertEqual(set(rows), set(FIXTURE_TABLES))
         self.assertEqual(int(rows["orders"]["column_count"]), 6)
 
 
@@ -711,9 +920,7 @@ class TestTier1Telemetry(IntegrationCase):
 
     def test_table_activity_is_populated(self):
         rows = self.table_activity()
-        self.assertEqual(
-            set(rows), {"regions", "tenants", "customers", "orders", "exotic", "receipts"}
-        )
+        self.assertEqual(set(rows), set(FIXTURE_TABLES))
         self.assertEqual(int(rows["orders"]["n_tup_ins"]), ROWS_ORDERS)
         self.assertTrue(rows["orders"]["last_analyze"])
 
@@ -855,6 +1062,14 @@ class TestIndexShape(IntegrationCase):
                 "orders_customer_id_idx", "orders_placed_at_idx",
                 "orders_recent_first_idx", "orders_large_idx",
                 "customers_lower_email_idx",
+                # The shapes added for the schema rendering. The two
+                # exclusion constraints appear here because each one is
+                # backed by a gist index, which is what makes them sort
+                # with the constraints rather than with the plain indexes.
+                "reservations_pkey", "reservations_during_excl",
+                "maintenance_windows_pkey", "maintenance_windows_no_overlap",
+                "audit_full_pkey", "audit_nothing_pkey", "audit_indexed_pkey",
+                "audit_indexed_replica_idx", "customer_order_totals_pk",
             },
         )
 
