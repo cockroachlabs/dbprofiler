@@ -2528,7 +2528,8 @@ class TestSchemaRegroupingOfPartitions(unittest.TestCase):
         only position guaranteed to be after all of them is the section that
         replays last."""
         cross_table = self.rendered.index("SECTION: CROSS-TABLE OBJECTS")
-        for match in re.finditer(r"(?m)^ALTER (?:TABLE ONLY|INDEX) .* ATTACH PARTITION", self.rendered):
+        attach = re.compile(r"(?m)^ALTER (?:TABLE ONLY|INDEX) .* ATTACH PARTITION")
+        for match in attach.finditer(self.rendered):
             with self.subTest(statement=match.group(0)[:60]):
                 self.assertGreater(match.start(), cross_table)
 
