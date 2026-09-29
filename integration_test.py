@@ -1191,14 +1191,27 @@ class TestWhatEscapes(IntegrationCase):
         self.assertGreater(int(found.strip()), 0)
 
     def test_no_credential_appears_in_any_bundle(self):
+        """The password is the credential, and it has no route into a bundle.
+
+        PGUSER is deliberately not checked here. It is a name rather than a
+        secret, and the bundle records identity on purpose -- source.database
+        and source.kind are both published fields. Searching a bundle for a
+        role name therefore reports a collision rather than a leak: a role
+        named for its database matches source.database, and the far more
+        likely `postgres` matches `"kind": "postgres"` in every bundle the
+        tool can produce. stderr is a different matter, and
+        test_no_credential_appears_on_stderr still covers the user there.
+        """
         env = fixture_env()
-        secrets = [env[key] for key in ("PGPASSWORD", "PGUSER") if env.get(key)]
-        self.assertTrue(secrets, "expected the test URL to carry a user")
+        secret = env.get("PGPASSWORD")
+        self.assertTrue(secret, "expected the test URL to carry a password")
         for label, path in BUNDLES.items():
-            payload = bundle_bytes(path)
-            for secret in secrets:
-                with self.subTest(bundle=label):
-                    self.assertNotIn(secret.encode("utf-8"), payload)
+            with self.subTest(bundle=label):
+                self.assertNotIn(
+                    secret.encode("utf-8"),
+                    bundle_bytes(path),
+                    f"the password reached the {label} bundle",
+                )
 
     def test_no_credential_appears_on_stderr(self):
         env = fixture_env()
