@@ -3402,5 +3402,116 @@ class TestReleaseWorkflow(unittest.TestCase):
         self.assertIn(f"sha256sum -c {CHECKSUM_NAME}", readme)
 
 
+# --- continuous integration -------------------------------------------------
+#
+# The integration suite is the only thing in this repository that exercises a
+# real server: subprocess handling, CSV parsing, pg_stat_statements, the whole
+# bundle. It is also opt-in, which means a CI job that forgets to configure it
+# reports success having run nothing at all. These tests read ci.yaml as text
+# and keep that from being possible.
+
+CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yaml"
+
+
+class TestCIWorkflow(unittest.TestCase):
+    def setUp(self):
+        self.text = CI_WORKFLOW.read_text()
+        self.lines = self.text.splitlines()
+
+    def index_of(self, needle):
+        for number, line in enumerate(self.lines):
+            if needle in line:
+                return number
+        raise AssertionError(f"{needle!r} not found in {CI_WORKFLOW.name}")
+
+    def shell_text(self):
+        """Every line a runner executes as a shell command, and nothing else.
+
+        A `run:` opens a block that ends where the indentation comes back, so
+        this separates what lands in a process's argv from what stays a YAML
+        value. Cheaper than a parser, and this repository has no YAML parser.
+        """
+        collected = []
+        depth = None
+        for line in self.lines:
+            indent = len(line) - len(line.lstrip())
+            if depth is not None and line.strip() and indent <= depth:
+                depth = None
+            if depth is not None:
+                collected.append(line)
+            match = re.match(r"(\s*)-?\s*run:(.*)", line)
+            if match:
+                collected.append(match.group(2))
+                depth = len(match.group(1))
+        return "\n".join(collected)
+
+    def test_the_integration_suite_actually_runs(self):
+        """79 tests that only ever run on a laptop are 79 tests nobody has to
+        keep passing."""
+        self.assertRegex(self.text, r"(?m)^  integration:\s*$")
+        self.assertIn("unittest integration_test", self.text)
+
+    def test_a_job_that_skips_every_test_cannot_pass(self):
+        """The most important assertion here. Every class in integration_test is
+        skipUnless(CONFIGURED), so an unset or misspelled URL variable skips all
+        79 and turns the job green having tested nothing. The guard asserts the
+        module's own gate rather than re-reading the variable by name, so it
+        cannot drift away from the thing it guards.
+        """
+        self.assertIn("integration_test", self.text)
+        self.assertIn("CONFIGURED", self.text)
+        self.assertLess(
+            self.index_of("CONFIGURED"), self.index_of("unittest integration_test")
+        )
+
+    def test_the_server_is_the_committed_compose_file(self):
+        """CI and a laptop must start the same server. A services: container
+        cannot override the image command, so it could not preload
+        pg_stat_statements, and the suite would quietly exercise the profiler's
+        degradation path instead. --wait blocks on the health check, so the
+        first connection cannot race the server.
+        """
+        self.assertIn(f"-f {COMPOSE_FILE.name} up -d --wait", self.text)
+
+    def test_the_server_is_destroyed_even_when_the_suite_fails(self):
+        """A kept volume is how a fixture from an earlier run reaches a later
+        assertion, and a failing suite is exactly when one gets left behind."""
+        teardown = self.index_of("down -v")
+        self.assertIn("if: always()", "\n".join(self.lines[teardown - 4:teardown]))
+
+    def test_the_client_is_checked_against_the_pinned_server(self):
+        """pg_dump refuses to dump from a server newer than itself, so bumping
+        the image without a client to match has to fail here rather than inside
+        an unexplained dump error."""
+        major = re.search(r"image:\s*postgres:(\d+)", COMPOSE_FILE.read_text()).group(1)
+        self.assertIn("pg_dump --version", self.text)
+        self.assertIn(f"-lt {major}", self.text)
+
+    def test_no_credential_reaches_a_command_line(self):
+        """Credentials reach children through env=, never argv: an argument is
+        visible in the process table to anything that can read it."""
+        for line in self.lines:
+            if re.search(r"://[^/\s]*:[^/\s]*@", line):
+                self.assertRegex(line, r"^\s*[A-Z_]+:\s")
+        shell = self.shell_text()
+        self.assertNotRegex(shell, r"://[^/\s]*:[^/\s]*@")
+        self.assertNotIn("example-password", shell)
+
+    def test_it_uses_no_secret(self):
+        """Nothing here is worth a secret: the server is disposable and its
+        credentials are the synthetic ones the repository documents."""
+        self.assertNotIn("secrets.", self.text)
+
+    def test_it_never_asks_for_write_permission(self):
+        jobs = self.index_of("jobs:")
+        self.assertIn("contents: read", "\n".join(self.lines[:jobs]))
+        self.assertNotIn("contents: write", self.text)
+
+    def test_every_action_is_pinned_to_a_major_version(self):
+        for match in re.finditer(r"uses:\s*(\S+)", self.text):
+            with self.subTest(action=match.group(1)):
+                self.assertRegex(match.group(1), r"@v\d+$")
+
+
 if __name__ == "__main__":
     unittest.main()
