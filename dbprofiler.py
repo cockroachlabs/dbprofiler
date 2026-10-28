@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import csv
 import datetime
 import hashlib
@@ -61,6 +62,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, fields
@@ -82,6 +84,11 @@ CONTRACT_VERSION = "2.0"
 PROG = "dbprofiler"
 
 URL_ENV_VAR = "DBPROFILER_POSTGRES_URL"
+
+# The reproduction target. Only ever used to record a default in a generated
+# kit -- nothing in this tool connects to it -- and recorded without its
+# userinfo, because a kit is a directory of files that gets copied around.
+TARGET_URL_ENV_VAR = "DBPROFILER_TARGET_URL"
 
 DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -252,6 +259,30 @@ def iter_sql_constants():
             yield name, value
 
 
+def iter_emit_constants():
+    """Yield (name, text) for every module-level EMIT_* constant.
+
+    These are the files `generate` writes, not statements this tool issues. They
+    are audited on a different rule from SQL_*: a generated script legitimately
+    addresses the reproduction database an operator built, but no template may
+    ever carry a credential.
+    """
+    for name, value in sorted(globals().items()):
+        if name.startswith("EMIT_") and isinstance(value, str):
+            yield name, value
+
+
+def audit_emitted(text: str) -> list[str]:
+    """Return every safety violation in one emitted-file template."""
+    violations = []
+    if CREDENTIALED_URL.search(text):
+        violations.append("contains a credentialed connection URL")
+    # A generated script must not teach a scan over a table it just loaded.
+    if "COUNT(" in " ".join(text.split()).upper().replace(" (", "("):
+        violations.append("contains forbidden token 'COUNT('")
+    return violations
+
+
 def own_source() -> str:
     """Return this script's own source text, for the static audit below."""
     return Path(__file__).read_text(encoding="utf-8")
@@ -357,16 +388,27 @@ def check_safety() -> int:
     for name, sql in iter_sql_constants():
         violations.extend(f"{name}: {problem}" for problem in audit_sql(sql))
 
+    for name, sql in iter_target_sql_constants():
+        violations.extend(f"{name}: {problem}" for problem in audit_target_sql(sql))
+
+    for name, text in iter_emit_constants():
+        violations.extend(f"{name}: {problem}" for problem in audit_emitted(text))
+
     violations.extend(f"source: {problem}" for problem in audit_subprocess_usage(own_source()))
 
     checked = sum(1 for _ in iter_sql_constants())
+    emitted = sum(1 for _ in iter_emit_constants())
+    targeted = sum(1 for _ in iter_target_sql_constants())
     if violations:
         print(f"{PROG} --check-safety: FAIL ({len(violations)} violation(s))", file=sys.stderr)
         for violation in violations:
             print(f"  {violation}", file=sys.stderr)
         return 1
 
-    print(f"{PROG} --check-safety: OK ({checked} SQL constant(s) checked)")
+    print(
+        f"{PROG} --check-safety: OK ({checked} source SQL constant(s), "
+        f"{targeted} target SQL constant(s) and {emitted} emitted template(s) checked)"
+    )
     return 0
 
 
@@ -932,6 +974,7 @@ class PostgresConfig:
     schema_exclude: tuple[str, ...] = ()
     psql_path: str = "psql"
     pg_dump_path: str = "pg_dump"
+    dbworkload_path: str = "dbworkload"
     timeout: int = DEFAULT_TIMEOUT_SECONDS
 
     def __repr__(self) -> str:
@@ -3364,6 +3407,2381 @@ def write_bundle(destination, payloads, manifest: Manifest) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Kit generation
+# ---------------------------------------------------------------------------
+# Turns a published bundle into a dbworkload generation kit. This is an offline
+# transform -- bundle in, files out -- and three properties keep it that way:
+#
+#   It opens no connection and starts no child process. The collector owns the
+#   single subprocess call site that audit_subprocess_usage() permits, and this
+#   section must not spend a second one. A kit is built from profile.json and
+#   nothing else.
+#
+#   It carries no knowledge of any particular source. Every schema, table and
+#   column name in an emitted kit is read out of the bundle at run time. A name
+#   belonging to one database hard-coded here would be a bug in this section.
+#
+#   What it cannot derive, it marks. Column-at-a-time shape follows from the
+#   statistics; keys that have to agree across tables, which most-common values
+#   are a closed vocabulary rather than identifiers, and what the workload does
+#   do not. Those are emitted as stubs that say so, never as a plausible guess.
+#
+# The EMIT_* constants below are the files a kit is made of. They are artifacts
+# this tool *writes*, not statements it *issues*: the forbidden-token rule
+# governs SQL_* constants, and a target-side script legitimately refreshes the
+# planner statistics of the reproduction database it just loaded. They are still
+# audited for credentials -- see check_safety().
+
+KIT_YAML = "{schema}.yaml"
+KIT_GEN_YAML = "gen_yaml.py"
+KIT_KEYS = "keys.py"
+KIT_WORKLOAD = "workload.py"
+KIT_GEN_IMPORT = "gen_import.py"
+KIT_REPRODUCE = "reproduce.sh"
+KIT_SCHEMA_SQL = "schema.crdb.sql"
+KIT_MANIFEST = "kit.json"
+KIT_README = "README.md"
+
+# The two files a kit cannot derive. Everything else is output and is refreshed
+# on every run; these hold the work that statistics cannot supply.
+KIT_STUBS = (KIT_KEYS, KIT_WORKLOAD)
+
+# Default generation processes. dbworkload derives one sub-seed per process
+# from the yaml seed, so this number is part of the data definition and not a
+# performance knob: the same yaml generated with a different -x is different
+# data, and any key design that correlates tables is keyed on it.
+DEFAULT_PROCS = 8
+
+# Widths for a string column whose type carries no declared length.
+DEFAULT_STRING_MAX = 64
+
+# Elements to put in a generated array. Nothing in the statistics records how
+# long a source array was -- pg_stats describes the array value as a whole, not
+# its contents -- so this is a stated assumption rather than a derivation, and
+# the kit README flags every array column for review.
+DEFAULT_ARRAY_ELEMENTS = 3
+
+# Generators that accept an `array` argument. Json does not, so an array of
+# json has no faithful generator and falls back to a flagged placeholder.
+ARRAY_CAPABLE = frozenset(
+    {"string", "integer", "float", "choice", "timestamp", "date", "uuid", "bool", "bytes"}
+)
+
+# A placeholder marker that is substituted into the EMIT_* templates. Chosen so
+# it cannot collide with shell, Python or YAML syntax in the templates.
+_SLOT = re.compile(r"@@([A-Z_]+)@@")
+
+
+def _fill(template: str, **values: str) -> str:
+    """Substitute @@NAME@@ slots. Unknown slots are an error, not a silent gap."""
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in values:
+            raise BundleError(f"kit template references unknown slot {name}")
+        return values[name]
+
+    return _SLOT.sub(replace, template)
+
+
+# ----------------------------------------------------------------- reading ---
+
+
+# The macOS compressor stores resource forks in a parallel tree beside the real
+# entries. It is not part of the bundle and must not be read as one.
+ZIP_RESOURCE_FORK_PREFIX = "__MACOSX/"
+
+
+def _zip_root(archive: zipfile.ZipFile) -> str:
+    """Return the prefix the bundle's payloads sit under inside an archive.
+
+    A bundle this tool publishes stores its payloads at the archive root. A
+    bundle that has been extracted and re-zipped usually carries the directory
+    name as a prefix instead -- both `zip -r b.zip bundle/` and the macOS Finder
+    produce that layout, and a bundle emailed between two people has very often
+    made that round trip. Reading only the root would reject those with a
+    complaint about a missing manifest, which points at the wrong problem
+    entirely.
+
+    A single candidate is used. Two are refused rather than guessed between: an
+    archive holding two bundles is a question about which one was meant, and
+    picking the alphabetically first would answer it silently.
+    """
+    names = [n for n in archive.namelist() if not n.startswith(ZIP_RESOURCE_FORK_PREFIX)]
+    if BUNDLE_MANIFEST in names:
+        return ""
+
+    suffix = "/" + BUNDLE_MANIFEST
+    roots = sorted({n[: -len(BUNDLE_MANIFEST)] for n in names if n.endswith(suffix)})
+    if len(roots) == 1:
+        return roots[0]
+    if len(roots) > 1:
+        raise BundleError(
+            "archive holds more than one bundle ("
+            + ", ".join(r.rstrip("/") for r in roots)
+            + "); extract the one you want and point --bundle at it"
+        )
+    # No manifest anywhere. Reported by the caller against the root, so the
+    # message names the file rather than the layout.
+    return ""
+
+
+def _bundle_entry(path: Path, name: str) -> bytes:
+    """Read one payload from a bundle that is either a directory or a .zip."""
+    if path.is_dir():
+        entry = path / name
+        if not entry.is_file():
+            raise BundleError(f"bundle is missing {name}")
+        return entry.read_bytes()
+
+    if not path.is_file():
+        raise BundleError(f"no bundle at {path}")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(_zip_root(archive) + name)
+    except KeyError:
+        raise BundleError(f"bundle is missing {name}") from None
+    except zipfile.BadZipFile as error:
+        raise BundleError(f"{path} is not a readable bundle: {error}") from None
+
+
+def read_bundle_profile(path: Path) -> dict:
+    """Return profile.json from a bundle, after verifying it against the manifest.
+
+    The manifest records a SHA-256 of every payload precisely so a recipient can
+    check a bundle without trusting the transport, and a kit built from a
+    corrupted profile would be wrong in ways that only surface as a failed load
+    hours later. Checking here costs one hash of one file.
+
+    Only profile.json is read. It is the versioned contract; observations/*.csv
+    is the raw material it was normalized from, and reading both would mean two
+    sources of truth for the same numbers.
+    """
+    manifest = json.loads(_bundle_entry(path, BUNDLE_MANIFEST))
+    raw = _bundle_entry(path, BUNDLE_PROFILE)
+
+    for entry in manifest.get("payloads", ()):
+        if entry.get("path") == BUNDLE_PROFILE:
+            actual = hashlib.sha256(raw).hexdigest()
+            if actual != entry.get("sha256"):
+                raise BundleError(
+                    f"{BUNDLE_PROFILE} does not match its manifest checksum; "
+                    "the bundle is corrupt or was modified after publication"
+                )
+            break
+
+    profile = json.loads(raw)
+    found = str(profile.get("contract_version", ""))
+    if found.split(".")[0] != CONTRACT_VERSION.split(".")[0]:
+        raise BundleError(
+            f"bundle declares profile contract {found}, and this release reads "
+            f"{CONTRACT_VERSION}; field names and semantics differ between majors, "
+            "so generating from it would produce confidently wrong output"
+        )
+    return profile
+
+
+def target_dsn(url: str) -> tuple[str, bool]:
+    """Validate a target URL and strip anything secret from it.
+
+    Returns (url safe to write down, whether credentials were removed).
+
+    The source URL is parsed into libpq environment variables and never touches
+    a command line. A target URL has a different hazard: it is written into
+    reproduce.sh, and a kit gets copied, archived and handed to other people. So
+    the userinfo comes off here rather than being trusted not to matter, and the
+    identity is supplied at run time by PGUSER and PGPASSWORD -- which is the
+    pattern the generated driver already documents.
+
+    Raises ConfigError. No message quotes any part of the URL.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise ConfigError("the target URL could not be parsed") from None
+
+    if parts.scheme not in POSTGRES_URL_SCHEMES:
+        raise ConfigError(
+            "the target URL must begin with postgres:// or postgresql://"
+        ) from None
+
+    try:
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ConfigError("the target URL has an invalid port") from None
+    if not host:
+        raise ConfigError("the target URL names no host") from None
+
+    had_credentials = bool(parts.username or parts.password)
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, "")), (
+        had_credentials
+    )
+
+
+# -------------------------------------------------------------- derivation ---
+
+_VARCHAR_LENGTH = re.compile(r"\((\d+)(?:\s*,\s*(\d+))?\)")
+_DATE_PREFIX = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _stable_seed(column: dict) -> int:
+    """A seed that is a pure function of the column's identity.
+
+    Deterministic so two runs over one bundle agree, and derived from the name
+    rather than a running counter so inserting a column upstream does not
+    renumber every column after it.
+    """
+    key = "{}.{}.{}".format(column.get("schema", ""), column.get("table", ""), column["name"])
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=4).digest(), "big") % (2**31)
+
+
+def _declared_size(data_type: str) -> tuple[int | None, int | None]:
+    match = _VARCHAR_LENGTH.search(data_type)
+    if not match:
+        return None, None
+    first = int(match.group(1))
+    second = int(match.group(2)) if match.group(2) else None
+    return first, second
+
+
+def _span(column: dict) -> tuple[str, str] | None:
+    bounds = column.get("histogram_bounds") or ()
+    if len(bounds) < 2:
+        return None
+    return str(bounds[0]), str(bounds[-1])
+
+
+def _as_date(value: str) -> str | None:
+    match = _DATE_PREFIX.search(value)
+    return match.group(0) if match else None
+
+
+def choice_weights(freqs, population_size: int, null_pct: float = 0.0) -> list[float]:
+    """Turn most_common_freqs into Choice weights over population_size values.
+
+    Two corrections are needed and neither is obvious.
+
+    most_common_freqs are fractions of *all* rows, nulls included, but the
+    generator applies null_pct independently -- it decides null first, then
+    picks from the population. Feeding the raw frequencies in would therefore
+    apply the null fraction twice. They are renormalized over the non-null rows
+    first.
+
+    Values past the end of the MCV list are real but unlisted, so they share
+    whatever frequency is left over. When the MCVs already account for
+    everything, the leftover is zero; rather than drop those values, they are
+    made rarer than the rarest listed value, which is what being absent from
+    the MCV list actually means.
+    """
+    freqs = [float(f) for f in freqs]
+    non_null = 1.0 - float(null_pct)
+    weights = [f / non_null for f in freqs] if non_null > 0 else list(freqs)
+
+    tail = population_size - len(weights)
+    if tail > 0:
+        residue = 1.0 - sum(weights)
+        if residue > 1e-12:
+            weights.extend([residue / tail] * tail)
+        else:
+            rarest = min(weights) if weights else 1.0
+            weights.extend([rarest / (tail + 1)] * tail)
+
+    total = sum(weights)
+    if total <= 0:
+        return [1.0 / population_size] * population_size
+    return [w / total for w in weights]
+
+
+def _readable_weight(weight: float) -> float:
+    """Round a weight for legibility without rounding a real value out of existence.
+
+    The most-common list routinely reaches frequencies below 1e-8, and a value
+    PostgreSQL bothered to record is a value the source really holds. Rounding it
+    to a flat zero would drop it from the distribution entirely, so a positive
+    weight is floored at the smallest value this rounding can represent.
+    """
+    rounded = round(float(weight), 8)
+    if rounded == 0.0 and weight > 0:
+        return 1e-8
+    return rounded
+
+
+def column_generator(column: dict) -> tuple[str, dict]:
+    """Map one profiled column to a dbworkload generator and its arguments.
+
+    Returns (type, args). The mapping is deliberately shallow: it reproduces the
+    column's own shape -- width, range, null fraction, value frequencies -- and
+    makes no attempt to relate one column to another. Anything that has to agree
+    across columns or across tables is the kit's keys.py, not this.
+    """
+    data_type = str(column["data_type"]).strip().lower()
+    args: dict = {"seed": _stable_seed(column)}
+
+    null_fraction = column.get("null_fraction")
+    if null_fraction:
+        args["null_pct"] = round(float(null_fraction), 8)
+
+    values = list(column.get("most_common_values") or ())
+    freqs = list(column.get("most_common_freqs") or ())
+
+    # A column PostgreSQL could enumerate is reproduced by enumeration, whatever
+    # its declared type: the frequencies are the most specific thing known about
+    # it. `constant` is never used, even for a single value -- SimpleFaker's
+    # dispatcher drops `seed` for that generator, so it reseeds from OS entropy
+    # and a run would not be reproducible.
+    if values:
+        population = [str(v) for v in values]
+        args["population"] = population
+        args["weights"] = [
+            _readable_weight(w)
+            for w in choice_weights(freqs, len(population), float(null_fraction or 0.0))
+        ]
+        return "choice", args
+
+    if data_type.endswith("[]"):
+        # Generate the element type and ask for an array of it. Reached only
+        # when the column has no most-common values: when it does, those are
+        # already whole array literals and the branch above keeps them verbatim
+        # rather than wrapping them a second time.
+        element_kind, element_args = column_generator(dict(column, data_type=data_type[:-2]))
+        if element_kind in ARRAY_CAPABLE:
+            element_args["array"] = DEFAULT_ARRAY_ELEMENTS
+            return element_kind, element_args
+        # No array-capable generator for this element type. An empty array
+        # literal loads cleanly and is honest about being a placeholder.
+        args["population"] = ["{}"]
+        args["weights"] = [1.0]
+        return "choice", args
+
+    if data_type.startswith("timestamp") or data_type.startswith("time "):
+        span = _span(column)
+        start = _as_date(span[0]) if span else None
+        end = _as_date(span[1]) if span else None
+        args["start"] = start or "2020-01-01"
+        args["end"] = end or "2030-01-01"
+        return "timestamp", args
+
+    if data_type == "date":
+        span = _span(column)
+        args["start"] = (_as_date(span[0]) if span else None) or "2020-01-01"
+        args["end"] = (_as_date(span[1]) if span else None) or "2030-01-01"
+        return "date", args
+
+    if data_type in ("smallint", "integer", "bigint") or data_type.startswith("int"):
+        span = _span(column)
+        lo = hi = None
+        if span:
+            try:
+                lo, hi = int(float(span[0])), int(float(span[1]))
+            except ValueError:
+                lo = hi = None
+        if lo is None:
+            distinct = int(column.get("distinct_estimate") or 0) or 1000
+            lo, hi = 1, max(distinct, 2)
+        args["min"], args["max"] = lo, max(hi, lo + 1)
+        return "integer", args
+
+    if data_type.startswith(("numeric", "decimal", "real", "double")):
+        precision, scale = _declared_size(data_type)
+        span = _span(column)
+        lo = hi = None
+        if span:
+            try:
+                lo, hi = float(span[0]), float(span[1])
+            except ValueError:
+                lo = hi = None
+        args["min"] = lo if lo is not None else 0
+        args["max"] = hi if hi is not None else 10_000
+        if scale is not None:
+            args["round"] = scale
+        return "float", args
+
+    if data_type == "uuid":
+        return "uuid", args
+
+    if data_type == "boolean":
+        return "bool", args
+
+    if data_type.startswith("json"):
+        width = int(column.get("avg_width_bytes") or 64)
+        args["min"], args["max"] = max(width // 2, 8), max(width, 16)
+        return "json", args
+
+    if data_type == "bytea":
+        args["size"] = max(int(column.get("avg_width_bytes") or 16), 1)
+        return "bytes", args
+
+    # Everything remaining is text-shaped. A declared length is an upper bound
+    # the target will enforce, so it wins over the observed average width.
+    declared, _ = _declared_size(data_type)
+    observed = int(column.get("avg_width_bytes") or 0)
+    maximum = declared or (observed if observed > 0 else DEFAULT_STRING_MAX)
+    args["min"] = max(min(observed or 1, maximum), 1)
+    args["max"] = max(maximum, args["min"])
+    return "string", args
+
+
+def scaled_row_count(row_count_estimate, scale: int, procs: int) -> int:
+    """Row count for one table, divided down and made divisible by procs.
+
+    dbworkload splits a count across processes and hands the remainder of an
+    uneven split to the last one, which runs that process past the end of the
+    key space it was given. Flooring to a multiple of procs keeps every process
+    the same size. A table never scales to nothing: a reproduction with an empty
+    parent table exercises none of the joins it was built for.
+    """
+    count = int(float(row_count_estimate or 0)) // max(int(scale), 1)
+    count = (count // procs) * procs
+    return max(count, procs)
+
+
+def table_load_order(tables, relationships) -> list[str]:
+    """Table names ordered so every parent precedes its children.
+
+    Foreign keys are the constraint the load has to respect, and getting it
+    wrong is not a visible failure on every target: IMPORT INTO does not enforce
+    them. A cycle is reported rather than broken at an arbitrary edge, because
+    which edge to break is a decision about the data, not about the sort.
+    """
+    names = [t["name"] for t in tables]
+    present = set(names)
+    children: dict = {name: set() for name in names}
+    parents: dict = {name: set() for name in names}
+
+    for relationship in relationships or ():
+        parent = relationship.get("parent_table")
+        child = relationship.get("child_table")
+        if parent not in present or child not in present or parent == child:
+            # A self-reference orders a table against itself, which no sequence
+            # can satisfy and which a single-table load does not need.
+            continue
+        if child not in children[parent]:
+            children[parent].add(child)
+            parents[child].add(parent)
+
+    ready = sorted(name for name in names if not parents[name])
+    order = []
+    while ready:
+        name = ready.pop(0)
+        order.append(name)
+        for child in sorted(children[name]):
+            parents[child].discard(name)
+            if not parents[child]:
+                ready.append(child)
+        ready.sort()
+
+    if len(order) != len(names):
+        stuck = sorted(set(names) - set(order))
+        raise BundleError(
+            "foreign keys form a cycle among: "
+            + ", ".join(stuck)
+            + "; load order cannot be derived without deciding which key to defer"
+        )
+    return order
+
+
+# ------------------------------------------------------------------ render ---
+
+
+def _yaml_float(value: float) -> str:
+    """Render a float so a YAML 1.1 parser reads it back as a float.
+
+    repr() is not safe here. It renders small magnitudes in exponent form --
+    repr(5e-05) is "5e-05" -- and YAML 1.1 requires both a decimal point in the
+    mantissa and a sign on the exponent before it will call that a number. PyYAML
+    therefore loads "5e-05" as the *string* "5e-05", which survives every schema
+    check and then fails deep inside the generator as an unsupported operand. A
+    rare value's weight is exactly where this bites, so it has to be handled at
+    the point the text is written.
+    """
+    text = repr(float(value))
+    if "e" in text or "E" in text:
+        mantissa, _, exponent = text.lower().partition("e")
+        if "." not in mantissa:
+            mantissa += ".0"
+        if not exponent.startswith(("+", "-")):
+            exponent = "+" + exponent
+        text = mantissa + "e" + exponent
+    return text
+
+
+def _yaml_scalar(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return _yaml_float(value)
+    if isinstance(value, int):
+        return repr(value)
+    text = str(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _yaml_list(values) -> str:
+    return "[" + ", ".join(_yaml_scalar(v) for v in values) + "]"
+
+
+def render_kit_yaml(schema: str, tables, order, scale: int, procs: int) -> str:
+    """Render the dbworkload generation definition."""
+    by_name = {t["name"]: t for t in tables}
+    lines = [
+        "# dbworkload generation definition, derived from a dbprofiler bundle.",
+        "#",
+        "# Regenerate rather than hand-edit: see gen_yaml.py. Every number below",
+        "# comes from the bundle's profile.json -- row counts from the planner's",
+        "# estimates, windows from histogram bounds, weights from most-common",
+        "# frequencies, null_pct from null fractions.",
+        "#",
+        f"# Generated for -x {procs}. That is part of the data definition, not a",
+        "# performance knob: dbworkload derives one sub-seed per process from it,",
+        "# so the same file generated with a different -x is different data.",
+        "",
+    ]
+    for name in order:
+        table = by_name[name]
+        count = scaled_row_count(table.get("row_count_estimate"), scale, procs)
+        source = int(float(table.get("row_count_estimate") or 0))
+        lines.append(f"# source estimate {source:,} rows, scaled by {scale}")
+        lines.append(f"{schema}.{name}:")
+        lines.append(f"  - count: {count}")
+        lines.append("    columns:")
+        for column in sorted(table.get("columns", ()), key=lambda c: c.get("ordinal", 0)):
+            kind, args = column_generator(column)
+            lines.append(f"        {column['name']}:")
+            lines.append(f"          type: {kind}")
+            lines.append("          args:")
+            for key, value in args.items():
+                rendered = _yaml_list(value) if isinstance(value, list) else _yaml_scalar(value)
+                lines.append(f"            {key}: {rendered}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------- templates ---
+# Files a kit is made of. Slots are @@NAME@@; see _fill().
+
+EMIT_GEN_IMPORT = '''\
+"""Emit one IMPORT INTO per table, in foreign-key order, for a URI prefix.
+
+    python3 gen_import.py 's3://bucket/prefix' 'AUTH=implicit' > import.sql
+
+The second argument is optional and is appended to every URI as a query string,
+for a prefix that needs credentials. Files are grouped per table and sorted, so
+one statement covers a table however many chunks it was generated as.
+
+IMPORT INTO does not enforce foreign keys, and it leaves them marked valid
+afterwards -- a file missed here is silent corruption rather than an error.
+Follow the load with ALTER TABLE ... VALIDATE CONSTRAINT on every foreign key.
+It also appends rather than replaces, so TRUNCATE before retrying a load that
+failed partway.
+"""
+
+import os
+import sys
+
+SCHEMA = "@@SCHEMA@@"
+
+# Foreign-key order: a parent is always loaded before its children.
+TABLES = [
+@@TABLE_LIST@@
+]
+
+CSV_DIR = os.environ.get("CSV_DIR", "csv")
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    prefix = sys.argv[1].rstrip("/")
+    query = sys.argv[2] if len(sys.argv) > 2 else ""
+    if query:
+        query = "?" + query.lstrip("?")
+
+    for table in TABLES:
+        stem = "%s.%s." % (SCHEMA, table)
+        files = sorted(
+            f for f in os.listdir(CSV_DIR) if f.startswith(stem) and f.endswith(".tsv")
+        )
+        if not files:
+            print("no TSV files for %s in %s" % (table, CSV_DIR), file=sys.stderr)
+            return 1
+        uris = ",\\n  ".join("'%s/%s%s'" % (prefix, f, query) for f in files)
+        print(
+            "IMPORT INTO %s.%s CSV DATA (\\n  %s\\n) WITH delimiter = e'\\\\t', nullif = '';\\n"
+            % (SCHEMA, table, uris)
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+EMIT_KEYS = '''\
+"""Custom generator for keys that have to agree across tables.
+
+    THIS FILE IS A STUB. TODO: implement, or delete it and remove the
+    `type: custom` entries that point here.
+
+dbprofiler derives each column independently, because that is all per-column
+statistics support. Any column whose value must match a value in another table
+-- a primary key a child references, a composite key whose parts are shared, an
+identifier embedded in a second column's text -- cannot come from that and is
+left to this file.
+
+The pattern that works
+----------------------
+dbworkload expands a yaml `seed` into one sub-seed per generation process, so
+two columns in two tables that share a seed and are generated with the same -x
+receive the same sub-seed in the same process. Make every value a pure function
+of (sub-seed, row ordinal). Then nothing has to be materialised and no column
+needs to know what another emitted, and each process's key space stays disjoint
+from the others' -- which is what keeps the primary keys unique once the
+per-process chunks are concatenated.
+
+The consequence is that -x is part of the data definition. Whatever value the
+yaml was generated with, use it for the whole file and keep PROCS equal to it.
+
+Wiring it up
+------------
+Reference this module from the yaml:
+
+    some_column:
+      type: custom
+      args:
+        path: "/absolute/path/to/keys.py"
+        kind: "<whatever this generator should emit>"
+        seed: <the same seed for every column in one key space>
+
+dbworkload derives the class name from the file name. "keys.py" resolves to
+`Keys` under every version; a module name containing an underscore does not --
+older releases capitalize the whole name and newer ones capitalize each part,
+so such a module needs both spellings bound to the one class.
+
+Foreign keys in this bundle, with the fan-out each one has to reproduce:
+
+@@FAN_OUT@@
+"""
+
+from __future__ import annotations
+
+
+class Keys:
+    """One instance per column per generation process."""
+
+    def __init__(self, kind: str, seed: float):
+        self.kind = kind
+        self.seed = seed
+        # TODO: derive this process's index from `seed` if the key space is
+        # global rather than per-process, and set up whatever the `kind`
+        # requires.
+        self.ordinal = 0
+
+    def __next__(self) -> str:
+        self.ordinal += 1
+        # TODO: return a value that is a pure function of (self.seed,
+        # self.ordinal), so a second table asking for the same kind with the
+        # same seed reproduces exactly this sequence.
+        raise NotImplementedError("keys.py is a stub; implement Keys.__next__")
+
+    def __iter__(self):
+        return self
+'''
+
+
+EMIT_WORKLOAD = '''\
+"""Workload for the reproduction database, plus its bootstrap and finalize steps.
+
+    THIS FILE IS A STUB. TODO: implement the three sections marked below.
+
+    python3 workload.py bootstrap <dsn>    # reference rows the load depends on
+    python3 workload.py finalize <dsn>     # derived rows and fixups
+    dbworkload run -w workload.py --uri <dsn> --driver postgres -c 32
+
+What goes here
+--------------
+1. BOOTSTRAP -- rows that must exist before the bulk load, because the loaded
+   tables' foreign keys point at them. Make it re-runnable: a second bootstrap
+   should conflict rather than insert duplicates.
+
+2. FINALIZE -- anything the bulk load cannot produce. Derived or aggregate
+   tables, sequence values set past the loaded maximum, and fixups for values
+   the CSV path cannot express. Loading with `nullif = ''` means a column whose
+   real value is an empty string arrives as NULL; if the schema distinguishes
+   the two, correct it here. Keep each statement's transaction small.
+
+3. The workload itself -- one method per transaction shape, weighted. The
+   bundle's observations/pg_stat_statements.csv is the source: it carries the
+   statement text, the call count and the total execution time for every shape
+   the source actually ran. Transcribe the shapes that matter, and weight them
+   by call count rather than by guess. Note which ones you chose not to model
+   and why.
+
+Addressing the generated rows
+-----------------------------
+If keys.py gives the data a key space that is a pure function of (sub-seed, row
+ordinal), reuse it here so a read can name a row instead of hunting for one.
+PROCS must match the -x the data was generated with.
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+import sys
+
+SCHEMA = "@@SCHEMA@@"
+
+# Must equal the -x the data was generated with.
+PROCS = @@PROCS@@
+
+
+class Workload:
+    def __init__(self, args: dict):
+        self.args = args
+
+    def setup(self, conn, id: int, total_thread_count: int):
+        # dbworkload calls this once per thread. A connection it reopens after
+        # an error is NOT passed through here again, so anything set on the
+        # session -- search_path above all -- belongs in the connection URI as a
+        # server-side default, not in a SET issued here.
+        self.id = id
+        self.rng = random.Random(id)
+
+    def loop(self):
+        # TODO: return the transaction functions, repeated in proportion to the
+        # call counts in observations/pg_stat_statements.csv.
+        return [self.todo_transaction]
+
+    def todo_transaction(self, conn):
+        """TODO: replace with a transcribed transaction shape."""
+        raise NotImplementedError("workload.py is a stub; implement loop()")
+
+
+# TODO: reference rows the load's foreign keys depend on. (label, statement, rows)
+BOOTSTRAP: tuple = ()
+
+# TODO: derived rows and fixups. (label, statement) runs once; a third element
+# marks a statement that handles one batch and should run until it stops
+# finding rows.
+FINALIZE: tuple = ()
+
+
+def _connect(dsn: str):
+    try:
+        import psycopg
+    except ImportError:
+        raise SystemExit("workload.py needs psycopg; use the interpreter dbworkload runs on")
+    return psycopg.connect(dsn)
+
+
+def bootstrap(dsn: str) -> None:
+    if not BOOTSTRAP:
+        print("  nothing to bootstrap (stub)")
+        return
+    with _connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO %s, public" % SCHEMA)
+            for label, statement, rows in BOOTSTRAP:
+                cur.executemany(statement, rows)
+                print("  %s: %d row(s)" % (label, len(rows)))
+        conn.commit()
+
+
+def finalize(dsn: str) -> None:
+    if not FINALIZE:
+        print("  nothing to finalize (stub)")
+        return
+    with _connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO %s, public" % SCHEMA)
+            for label, statement, *batched in FINALIZE:
+                if not batched:
+                    cur.execute(statement)
+                    print("  %s: done" % label)
+                    continue
+                done = 0
+                while True:
+                    cur.execute(statement)
+                    if not cur.rowcount:
+                        break
+                    done += cur.rowcount
+                    conn.commit()
+                print("  %s: %d rows" % (label, done))
+        conn.commit()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("step", choices=["bootstrap", "finalize"])
+    parser.add_argument("dsn", help="libpq connection string for the target")
+    ns = parser.parse_args()
+    {"bootstrap": bootstrap, "finalize": finalize}[ns.step](ns.dsn)
+    sys.exit(0)
+'''
+
+
+EMIT_GEN_YAML = '''\
+#!/usr/bin/env python3
+"""Rebuild this kit's generation definition from the bundle it came from.
+
+Kept alongside the yaml so the derivation stays auditable: the yaml is output,
+not source, and every number in it is a function of the bundle plus the two
+arguments recorded here.
+
+    python3 gen_yaml.py [--bundle PATH] [--output DIR]
+
+Hand edits to the yaml are lost the next time this runs. To change what is
+generated, change the bundle, the scale, or the generator -- not the output.
+"""
+
+import argparse
+import subprocess
+import sys
+
+BUNDLE = "@@BUNDLE@@"
+OUTPUT = "@@OUTPUT@@"
+SCALE = @@SCALE@@
+PROCS = @@PROCS@@
+DBPROFILER = "@@DBPROFILER@@"
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument("--bundle", default=BUNDLE)
+parser.add_argument("--output", default=OUTPUT)
+parser.add_argument("--dbprofiler", default=DBPROFILER)
+ns = parser.parse_args()
+
+sys.exit(
+    subprocess.call(
+        [
+            sys.executable,
+            ns.dbprofiler,
+            "generate",
+            "--bundle", ns.bundle,
+            "--output", ns.output,
+            "--scale", str(SCALE),
+            "--procs", str(PROCS),
+        ]
+    )
+)
+'''
+
+
+EMIT_REPRODUCE = '''\
+#!/usr/bin/env bash
+#
+# Build a reproduction database from this kit and run the workload against it.
+#
+# Generated by dbprofiler @@TOOL_VERSION@@. Every name below came from the
+# bundle; nothing here is specific to this script.
+#
+# Layout. Run it from the kit directory, or point --kit at it:
+#
+#   <kit>/
+#     @@SCHEMA_SQL@@   CockroachDB schema, applied unless --schema-file is given
+#     @@YAML@@            generation definition
+#     workload.py         workload + bootstrap/finalize
+#     keys.py             custom generators, if the yaml references them
+#     gen_import.py       IMPORT INTO emitter, for a target that prefers it
+#   <schema.sql>          from the bundle; pass with --schema-file
+#
+# Credentials:
+#   DSN         libpq URI for the target; or set @@TARGET_ENV@@. One of the two
+#               is required unless this kit was generated with --target-url.
+#               Keep the password OUT of it
+#               and put it in PGPASSWORD: dbworkload echoes its --uri in the run
+#               summary, and a URI on a command line is in the process table.
+#   PGPASSWORD  optional. Read automatically by psql, psycopg and dbworkload.
+#   PYTHON      optional. Interpreter for workload.py. Defaults to the one in
+#               dbworkload's shebang, which is the one that has psycopg.
+#
+# Example:
+#   export DSN='postgresql://host:26257/reproduction?sslmode=verify-full'
+#   export PGUSER=someone
+#   read -rs PGPASSWORD && export PGPASSWORD
+#   ./reproduce.sh --schema-file ../schema.sql
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+KIT="$SCRIPT_DIR"
+CSV_DIR=""
+SCHEMA_FILE=""
+ADMIN_DB="defaultdb"
+SCHEMA_NAME="@@SCHEMA@@"
+YAML="@@YAML@@"
+
+CONCURRENCY=32
+DURATION=300
+DELAY_STATS=30
+RAMP=0
+APP_NAME="baseline"
+WORKLOAD_ARGS='{}'
+
+START_AT=""
+STOP_AFTER=""
+RECREATE=0
+ASSUME_YES=0
+LENIENT_SCHEMA=0
+REGENERATE=0
+ALLOW_DIRTY=0
+
+# The generation process count. The row counts in the yaml were computed
+# against this split and any custom key generator is keyed on it, so changing
+# it changes the data rather than the speed. Not configurable here on purpose.
+GEN_PROCS=@@PROCS@@
+
+# Foreign-key order: a parent is always loaded before its children.
+TABLES=(
+@@TABLES_BASH@@
+)
+
+STEPS=(preflight database schema bootstrap generate load finalize validate refresh run)
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [options]
+
+  --kit DIR             Kit directory (default: this script's directory)
+  --csv-dir DIR         Where generated TSVs live (default: <kit>/csv)
+  --schema-file FILE    schema.sql from the bundle, applied before loading
+  --admin-db NAME       Database to connect to for CREATE DATABASE (default: $ADMIN_DB)
+
+  --concurrency N       dbworkload workers (default: $CONCURRENCY)
+  --duration N          Run duration in seconds (default: $DURATION)
+  --delay-stats N       Seconds of warmup excluded from stats (default: $DELAY_STATS)
+  --ramp N              Ramp-up seconds (default: $RAMP)
+  --app-name NAME       Run label (default: $APP_NAME)
+  --workload-args JSON  --args payload for dbworkload
+
+  --start-at STEP       Begin at STEP instead of the first
+  --stop-after STEP     Stop after STEP
+  --recreate-database   DROP and recreate the target database first (destructive)
+  --yes                 Skip the confirmation prompt for --recreate-database
+  --lenient-schema      Do not stop on the first error while applying the schema
+  --regenerate          Rebuild the TSVs even if the CSV directory is populated
+  --allow-dirty         Do not refuse to load into a database that already has rows
+
+Steps: ${STEPS[*]}
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kit)               KIT="$2"; shift 2 ;;
+    --csv-dir)           CSV_DIR="$2"; shift 2 ;;
+    --schema-file)       SCHEMA_FILE="$2"; shift 2 ;;
+    --admin-db)          ADMIN_DB="$2"; shift 2 ;;
+    --concurrency|-c)    CONCURRENCY="$2"; shift 2 ;;
+    --duration|-d)       DURATION="$2"; shift 2 ;;
+    --delay-stats)       DELAY_STATS="$2"; shift 2 ;;
+    --ramp|-r)           RAMP="$2"; shift 2 ;;
+    --app-name|-a)       APP_NAME="$2"; shift 2 ;;
+    --workload-args)     WORKLOAD_ARGS="$2"; shift 2 ;;
+    --start-at)          START_AT="$2"; shift 2 ;;
+    --stop-after)        STOP_AFTER="$2"; shift 2 ;;
+    --recreate-database) RECREATE=1; shift ;;
+    --yes)               ASSUME_YES=1; shift ;;
+    --lenient-schema)    LENIENT_SCHEMA=1; shift ;;
+    --regenerate)        REGENERATE=1; shift ;;
+    --allow-dirty)       ALLOW_DIRTY=1; shift ;;
+    -h|--help)           usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+KIT="$(cd -- "$KIT" && pwd)"
+[[ -n "$CSV_DIR" ]] || CSV_DIR="$KIT/csv"
+# The generated CockroachDB schema, unless one was named. Pass the bundle's own
+# schema.sql with --schema-file to apply that instead.
+[[ -n "$SCHEMA_FILE" || ! -f "$KIT/@@SCHEMA_SQL@@" ]] || SCHEMA_FILE="$KIT/@@SCHEMA_SQL@@"
+
+# A target recorded when this kit was generated, without its userinfo. DSN or
+# @@TARGET_ENV@@ in the environment overrides it, and PGUSER/PGPASSWORD supply
+# the identity -- no credential is ever written into this file.
+DEFAULT_DSN="@@DEFAULT_DSN@@"
+DSN="${DSN:-${@@TARGET_ENV@@:-$DEFAULT_DSN}}"
+
+say()  { printf "\\n\\033[1m==> %s\\033[0m\\n" "$*"; }
+info() { printf "    %s\\n" "$*"; }
+
+step_index() {
+  local want="$1" i
+  for i in "${!STEPS[@]}"; do
+    [[ "${STEPS[$i]}" == "$want" ]] && { echo "$i"; return 0; }
+  done
+  echo "unknown step: $want" >&2
+  return 1
+}
+
+FIRST=0; LAST=$(( ${#STEPS[@]} - 1 ))
+[[ -n "$START_AT"   ]] && FIRST="$(step_index "$START_AT")"
+[[ -n "$STOP_AFTER" ]] && LAST="$(step_index "$STOP_AFTER")"
+
+should_run() {
+  local i; i="$(step_index "$1")"
+  (( i >= FIRST && i <= LAST ))
+}
+
+CURRENT_STEP=startup
+trap 'rc=$?; printf "\\n\\033[31mFAILED\\033[0m at step: %s (exit %d)\\n" \\
+  "$CURRENT_STEP" "$rc" >&2; exit $rc' ERR
+
+psql_do()  { psql "$DSN" -v ON_ERROR_STOP=1 -q "$@"; }
+psql_val() { psql "$DSN" -v ON_ERROR_STOP=1 -At -c "$1"; }
+
+###############################################################################
+
+step_preflight() {
+  say "Preflight"
+
+  [[ -n "${DSN:-}" ]] || { echo "DSN is not set. See the header of this script." >&2; exit 2; }
+
+  local missing=0 t
+  for t in psql dbworkload python3; do
+    if ! command -v "$t" >/dev/null 2>&1; then echo "missing required tool: $t" >&2; missing=1; fi
+  done
+  (( missing == 0 )) || exit 2
+
+  # workload.py needs psycopg, and "python3" on PATH is often not the
+  # interpreter that has it. Take it out of dbworkload's shebang: dbworkload's
+  # postgres driver depends on psycopg, so that environment is guaranteed.
+  if [[ -z "${PYTHON:-}" ]]; then
+    local dbw shebang
+    dbw="$(pyenv which dbworkload 2>/dev/null || command -v dbworkload)"
+    shebang="$(head -1 "$dbw" 2>/dev/null || true)"
+    if [[ "$shebang" == '#!'/* ]]; then
+      PYTHON="${shebang#\\#!}"
+    else
+      PYTHON="$(command -v python3)"
+    fi
+  fi
+  if ! "$PYTHON" -c "import psycopg" >/dev/null 2>&1; then
+    echo "$PYTHON cannot import psycopg, which workload.py requires." >&2
+    echo "Set PYTHON to an interpreter that has it." >&2
+    exit 2
+  fi
+
+  [[ -f "$KIT/$YAML" ]] || { echo "missing $KIT/$YAML" >&2; exit 2; }
+
+  # Pull the database out of the DSN and build an admin DSN pointed elsewhere
+  # so CREATE DATABASE has somewhere to run. search_path goes into the URI as a
+  # connection default: dbworkload calls a workload's setup() once per thread,
+  # so a connection reopened after an error never gets a SET again and every
+  # later statement fails with a misleading "relation does not exist".
+  eval "$(DSN="$DSN" ADMIN_DB="$ADMIN_DB" SCHEMA_NAME="$SCHEMA_NAME" "$PYTHON" - <<'PY'
+import os, shlex, urllib.parse as u
+
+dsn = os.environ["DSN"]
+p = u.urlparse(dsn)
+db = p.path.lstrip("/")
+if not db:
+    raise SystemExit("DSN has no database in its path")
+
+q = u.parse_qs(p.query, keep_blank_values=True)
+if "options" not in q:
+    # No space between -c and the setting. dbworkload rebuilds this URI with
+    # parse_qs + urlencode when it stamps application_name, which turns a space
+    # into "+", and libpq decodes %XX but not "+". "-csearch_path=x" survives
+    # that round trip; "-c search_path=x" does not.
+    q["options"] = ["-csearch_path=%s" % os.environ["SCHEMA_NAME"]]
+query = u.urlencode(q, doseq=True, quote_via=u.quote, safe="/")
+
+print("TARGET_DB=%s" % shlex.quote(db))
+print("DSN=%s" % shlex.quote(u.urlunparse(p._replace(query=query))))
+print("ADMIN_DSN=%s" % shlex.quote(
+    u.urlunparse(p._replace(path="/" + os.environ["ADMIN_DB"], query=query))))
+PY
+)"
+  export DSN
+
+  info "kit         $KIT"
+  info "csv dir     $CSV_DIR"
+  info "database    $TARGET_DB"
+  info "schema      $SCHEMA_NAME"
+  info "python      $PYTHON"
+  info "steps       ${STEPS[*]:$FIRST:$((LAST-FIRST+1))}"
+  [[ -n "${PGPASSWORD:-}" ]] \\
+    || info "note        PGPASSWORD is unset; the DSN must carry its own credentials"
+}
+
+step_database() {
+  say "Database"
+  if (( RECREATE )); then
+    if (( ! ASSUME_YES )); then
+      printf "    This DROPS database %s and everything in it.\\n" "$TARGET_DB"
+      read -r -p "    Type the database name to confirm: " confirm
+      [[ "$confirm" == "$TARGET_DB" ]] || { echo "aborted" >&2; exit 1; }
+    fi
+    info "dropping $TARGET_DB"
+    psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q -c "DROP DATABASE IF EXISTS \\"$TARGET_DB\\" CASCADE"
+  fi
+  info "ensuring $TARGET_DB exists"
+  psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE IF NOT EXISTS \\"$TARGET_DB\\""
+}
+
+step_schema() {
+  say "Schema"
+  if [[ -z "$SCHEMA_FILE" ]]; then
+    info "no --schema-file given, skipping (the schema must already exist)"
+  elif (( LENIENT_SCHEMA )); then
+    psql "$DSN" -q -f "$SCHEMA_FILE" || info "continuing past schema errors (--lenient-schema)"
+  else
+    psql_do -f "$SCHEMA_FILE"
+  fi
+
+  info "verifying the tables this kit loads"
+  local want missing
+  want="$(printf "'%s'," "${TABLES[@]}")"
+  missing="$(psql_val "
+    SELECT string_agg(t, ', ')
+      FROM unnest(ARRAY[${want%,}]) AS t
+     WHERE NOT EXISTS (
+       SELECT 1 FROM information_schema.tables
+        WHERE table_schema = '$SCHEMA_NAME' AND table_name = t)")"
+  [[ -z "$missing" ]] || { echo "missing tables: $missing" >&2; exit 1; }
+  info "all ${#TABLES[@]} tables present"
+}
+
+step_bootstrap() {
+  say "Bootstrap"
+  if (( ! ALLOW_DIRTY )); then
+    local populated
+    populated="$(psql_val "SELECT 1 FROM $SCHEMA_NAME.${TABLES[0]} LIMIT 1")"
+    if [[ -n "$populated" ]]; then
+      echo "$SCHEMA_NAME.${TABLES[0]} already has rows." >&2
+      echo "Loading again would append. Use --recreate-database for a clean build," >&2
+      echo "--start-at to resume, or --allow-dirty to proceed anyway." >&2
+      exit 1
+    fi
+  fi
+  "$PYTHON" "$KIT/workload.py" bootstrap "$DSN"
+}
+
+step_generate() {
+  say "Generate"
+  local existing=0
+  [[ -d "$CSV_DIR" ]] && existing="$(find "$CSV_DIR" -name '*.tsv' -type f | wc -l | tr -d ' ')"
+  if (( existing > 0 && ! REGENERATE )); then
+    info "$existing TSV files already in $CSV_DIR, skipping (use --regenerate)"
+    return 0
+  fi
+  info "generating TSVs with -x $GEN_PROCS"
+  dbworkload util csv -i "$KIT/$YAML" -x "$GEN_PROCS" -o "$CSV_DIR"
+  info "$(find "$CSV_DIR" -name '*.tsv' -type f | wc -l | tr -d ' ') files written"
+}
+
+step_load() {
+  say "Load"
+  local t files
+  for t in "${TABLES[@]}"; do
+    # shellcheck disable=SC2206
+    files=( "$CSV_DIR/$SCHEMA_NAME.$t."*.tsv )
+    [[ -e "${files[0]}" ]] || { echo "no TSV files for $t in $CSV_DIR" >&2; exit 1; }
+    info "$t (${#files[@]} files)"
+    cat -- "${files[@]}" | psql "$DSN" -v ON_ERROR_STOP=1 -q \\
+      -c "\\copy $SCHEMA_NAME.$t FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '')"
+  done
+}
+
+step_finalize() {
+  say "Finalize"
+  "$PYTHON" "$KIT/workload.py" finalize "$DSN"
+}
+
+step_validate() {
+  say "Validate"
+  # A bulk path may not enforce foreign keys while it loads, and may leave them
+  # marked valid afterwards, so a file missed during the load is silent
+  # corruption. Re-validating turns that into an error.
+  local constraints
+  constraints="$(psql_val "
+    SELECT string_agg(format('%I.%I|%I', n.nspname, c.relname, k.conname), E'\\n')
+      FROM pg_constraint k
+      JOIN pg_class c ON c.oid = k.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE k.contype = 'f' AND n.nspname = '$SCHEMA_NAME'")"
+  if [[ -z "$constraints" ]]; then
+    info "no foreign keys in $SCHEMA_NAME"
+    return 0
+  fi
+  local line table constraint
+  while IFS='|' read -r table constraint; do
+    [[ -n "$table" ]] || continue
+    info "$table $constraint"
+    psql_do -c "ALTER TABLE $table VALIDATE CONSTRAINT \\"$constraint\\"" \\
+      || { echo "foreign key $constraint did not validate; the load is incomplete" >&2; exit 1; }
+  done <<< "$constraints"
+}
+
+step_refresh() {
+  say "Refresh statistics"
+  # The reproduction database was just bulk loaded, so the planner has nothing
+  # to work with until its statistics are built.
+  info "refreshing planner statistics on $TARGET_DB"
+  psql_do -c "ANALYZE"
+}
+
+step_run() {
+  say "Run"
+  info "$CONCURRENCY workers, ${DURATION}s, ${DELAY_STATS}s excluded from stats"
+  dbworkload run \\
+    -w "$KIT/workload.py" \\
+    --uri "$DSN" \\
+    --driver postgres \\
+    -c "$CONCURRENCY" \\
+    -d "$DURATION" \\
+    -r "$RAMP" \\
+    --delay-stats "$DELAY_STATS" \\
+    -a "$APP_NAME" \\
+    -s \\
+    --args "$WORKLOAD_ARGS"
+}
+
+###############################################################################
+
+CURRENT_STEP=preflight
+step_preflight
+
+for s in "${STEPS[@]}"; do
+  [[ "$s" == preflight ]] && continue
+  should_run "$s" || continue
+  CURRENT_STEP="$s"
+  "step_$s"
+done
+
+printf "\\n\\033[32mDone.\\033[0m\\n"
+'''
+
+
+EMIT_README = '''\
+# Generation kit for `@@SCHEMA@@`
+
+Generated by dbprofiler @@TOOL_VERSION@@ from a profile bundle. Every name here
+was read out of that bundle.
+
+| File | What it is |
+| --- | --- |
+| `@@SCHEMA_SQL@@` | CockroachDB schema, one section per table, with index recommendations |
+| `@@YAML@@` | the generation definition. Output, not source -- see `gen_yaml.py` |
+| `gen_yaml.py` | rebuilds the definition from the bundle |
+| `keys.py` | **stub.** Custom generators for keys that span tables |
+| `workload.py` | **stub.** Workload, plus bootstrap and finalize |
+| `gen_import.py` | emits `IMPORT INTO`, in foreign-key order |
+| `reproduce.sh` | driver: schema, bootstrap, generate, load, finalize, validate, refresh, run |
+
+## Quick start
+
+```bash
+export DSN='postgresql://host:26257/reproduction'
+export PGUSER=someone
+read -rs PGPASSWORD && export PGPASSWORD
+
+./reproduce.sh --schema-file /path/to/schema.sql --stop-after load
+```
+
+`--start-at` and `--stop-after` make each step independently re-runnable.
+
+## What was derived
+
+@@DERIVED@@
+
+Column shape is derived one column at a time, which is all per-column
+statistics support:
+
+- **Type** from the declared type.
+- **Range** for dates, timestamps and numbers from the first and last histogram
+  bucket boundary -- so the span is the observed one, not a guess.
+- **Value frequencies** from the most-common value list. Those frequencies count
+  nulls, but the generator applies `null_pct` separately, so they are
+  renormalized over the non-null rows first. Values past the end of the list
+  share what frequency is left over.
+- **Null fraction** straight from the statistics.
+- **Width** from the declared length where the type has one, otherwise from the
+  observed average.
+- **Row counts** from the planner's estimate, divided by the scale factor and
+  floored to a multiple of the process count.
+
+Each column's seed is a hash of its schema, table and name, so two runs over
+one bundle produce the same definition and adding a column does not renumber
+the others.
+
+## What still needs judgment -- TODO
+
+The three things below cannot be derived from per-column statistics. They are
+emitted as stubs rather than guesses, because a plausible-looking wrong answer
+here is worse than an obvious gap.
+
+1. **TODO: keys that span tables** (`keys.py`). Every column is currently
+   generated independently, so a child's foreign key holds a value that is very
+   unlikely to exist in its parent. Any join in the workload returns nothing
+   until this is implemented. The foreign keys and the fan-out each one has to
+   reproduce are listed in `keys.py`.
+
+2. **TODO: which most-common values are a vocabulary** (`@@YAML@@`). Values are
+   reproduced verbatim. That is right for a closed vocabulary -- statuses,
+   types, enumerations the schema's constraints and the workload's predicates
+   are written against. It is wrong for identifiers, hostnames, account numbers
+   and anything else that is really data: those should be replaced with
+   synthetic values of the same shape, width and cardinality, and the bundle's
+   own documentation warns that these values came from the source.
+
+3. **TODO: the workload** (`workload.py`). The bundle's
+   `observations/pg_stat_statements.csv` carries the statement text, call count
+   and execution time for every shape the source ran. Transcribe the ones that
+   matter and weight them by call count.
+
+@@FLAGGED@@
+
+## Things that will bite
+
+- **`-x` is part of the data definition.** This kit was generated for
+  `-x @@PROCS@@`. dbworkload derives one sub-seed per generation process from
+  it, so the same definition generated with a different `-x` is different data,
+  and any key design in `keys.py` is keyed on it. `reproduce.sh` hard-codes the
+  matching value.
+- **A bulk import may not enforce foreign keys**, and may leave them marked
+  valid afterwards -- so a file missed during a load is silent corruption rather
+  than an error. The `validate` step re-validates every foreign key; do not skip
+  it.
+- **Importing appends.** Truncate before retrying a load that failed partway.
+- **`NULL ''` means empty strings arrive as NULL.** If the schema distinguishes
+  an empty string from NULL, correct it in `finalize`.
+'''
+
+
+# ------------------------------------------------------- CockroachDB DDL ---
+# A schema for the reproduction, synthesized from the contract rather than
+# translated from the dump. profile.json already carries column types,
+# nullability, index key order and direction, STORING payloads, foreign keys
+# and sequences; recovering the same thing by parsing pg_dump text would be
+# strictly less reliable. What the contract cannot express is listed in the
+# emitted header and flagged in place -- never dropped quietly.
+
+CRDB_TYPES = {
+    # Width is part of the type. CockroachDB's bare INT is 8 bytes, so mapping
+    # `integer` to it would silently widen every such column.
+    "smallint": "INT2", "int2": "INT2",
+    "integer": "INT4", "int4": "INT4",
+    "bigint": "INT8", "int8": "INT8",
+    "real": "FLOAT4", "float4": "FLOAT4",
+    "double precision": "FLOAT8", "float8": "FLOAT8",
+    "boolean": "BOOL", "bool": "BOOL",
+    "text": "STRING", "character varying": "STRING",
+    "bytea": "BYTES",
+    "json": "JSONB", "jsonb": "JSONB",
+    "uuid": "UUID",
+    "date": "DATE",
+    "interval": "INTERVAL",
+    "inet": "INET",
+    "numeric": "DECIMAL", "decimal": "DECIMAL",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "time without time zone": "TIME",
+    "time with time zone": "TIMETZ",
+}
+
+_PARAMETERIZED = {
+    "character varying": "VARCHAR",
+    "varchar": "VARCHAR",
+    "character": "CHAR",
+    "char": "CHAR",
+    "numeric": "DECIMAL",
+    "decimal": "DECIMAL",
+}
+
+
+def _crdb_mapped(data_type: str) -> tuple[str, bool]:
+    """Return (CockroachDB spelling, whether the mapping is known)."""
+    raw = str(data_type).strip()
+    low = raw.lower()
+
+    if low.endswith("[]"):
+        element, known = _crdb_mapped(raw[:-2])
+        return element + "[]", known
+
+    match = _VARCHAR_LENGTH.search(low)
+    if match:
+        base = low[: match.start()].strip()
+        if base in _PARAMETERIZED:
+            args = match.group(0)
+            return _PARAMETERIZED[base] + args.replace(" ", ""), True
+
+    if low in CRDB_TYPES:
+        return CRDB_TYPES[low], True
+    return raw, False
+
+
+def crdb_type(data_type: str) -> str:
+    """Map a PostgreSQL declared type to its CockroachDB spelling."""
+    return _crdb_mapped(data_type)[0]
+
+
+def _key_columns(index: dict) -> list:
+    return [c["name"] for c in index.get("columns", ()) if c.get("is_key", True)]
+
+
+def _storing_columns(index: dict) -> list:
+    return [c["name"] for c in index.get("columns", ()) if not c.get("is_key", True)]
+
+
+def _reproducible(index: dict) -> bool:
+    """Whether the contract holds enough to recreate this index.
+
+    A partial index's predicate and an expression key's expression are both
+    recorded only as flags -- the text lives in schema.sql. Emitting such an
+    index without them would create something subtly different from the source
+    and call it a reproduction.
+    """
+    if index.get("is_partial") or index.get("has_expressions"):
+        return False
+    return all(name for name in _key_columns(index))
+
+
+def index_recommendations(table: dict, indexes, relationships) -> list:
+    """Index advice for one table, derived from the profile alone.
+
+    Structural only. Whether an index is ever *scanned* lives in
+    observations/pg_stat_indexes.csv rather than in the contract, so "never
+    used, consider dropping" is deliberately not among these.
+
+    Returning nothing is the common case and the intended one: advice that
+    appears on every table is advice nobody reads.
+    """
+    name = table["name"]
+    rows = int(float(table.get("row_count_estimate") or 0))
+    columns = {c["name"]: c for c in table.get("columns", ())}
+    mine = [i for i in indexes if i.get("table") == name]
+    # Compare only indexes the contract fully describes. A partial index is not
+    # a duplicate of an unfiltered one on the same columns -- its predicate is
+    # the difference -- and an expression index's key is not the column it was
+    # derived from. Judging either by its column list alone produces advice
+    # that is confidently wrong, which is worse than none.
+    comparable = [i for i in mine if _reproducible(i)]
+    out = []
+
+    # A foreign key with no index behind it. Neither PostgreSQL nor CockroachDB
+    # creates one, so the join -- and every cascading delete on the parent --
+    # scans the child.
+    leading = [tuple(_key_columns(i)) for i in comparable]
+    for relationship in relationships:
+        if relationship.get("child_table") != name:
+            continue
+        child = tuple(relationship.get("child_columns") or ())
+        if not child:
+            continue
+        covered = any(tuple(keys[: len(child)]) == child for keys in leading if keys)
+        if not covered:
+            out.append(
+                "no index on ({cols}), the key of {fk}: joins to {parent} and any "
+                "cascade from it scan this table. "
+                "CREATE INDEX ON {schema}.{table} ({cols});".format(
+                    cols=", ".join(child),
+                    fk=relationship.get("constraint_name", "a foreign key"),
+                    parent=relationship.get("parent_table", "the parent"),
+                    schema=table["schema"],
+                    table=name,
+                )
+            )
+
+    # Duplicates and prefixes. An index whose keys are the opening of another's
+    # is served by that other one; keeping it costs writes and space.
+    for a in comparable:
+        ka = _key_columns(a)
+        if not ka or a.get("is_primary"):
+            continue
+        for b in comparable:
+            if a is b or b.get("is_primary"):
+                continue
+            kb = _key_columns(b)
+            if ka == kb and a["name"] < b["name"]:
+                out.append(
+                    f"{a['name']} and {b['name']} are duplicates on "
+                    f"({', '.join(ka)}); drop one."
+                )
+            elif len(ka) < len(kb) and kb[: len(ka)] == ka:
+                out.append(
+                    f"{a['name']} ({', '.join(ka)}) is a prefix of "
+                    f"{b['name']} ({', '.join(kb)}); {b['name']} already serves it."
+                )
+                break
+
+    # A primary key that only ever increases puts every insert on one range.
+    primary = next((i for i in mine if i.get("is_primary")), None)
+    if primary:
+        keys = _key_columns(primary)
+        lead = columns.get(keys[0]) if keys else None
+        if lead is not None:
+            monotonic = bool(lead.get("identity")) or "nextval" in str(
+                lead.get("default_expression") or ""
+            )
+            correlation = lead.get("correlation")
+            if not monotonic and str(lead.get("data_type", "")).startswith(("timestamp", "date")):
+                monotonic = correlation is not None and abs(float(correlation)) > 0.99
+            if monotonic:
+                out.append(
+                    f"the primary key leads with {keys[0]}, which only increases: every "
+                    "insert lands on the last range. Consider a hash-sharded primary "
+                    f"key -- PRIMARY KEY ({', '.join(keys)}) USING HASH -- or a "
+                    "non-sequential key."
+                )
+
+    for index in comparable:
+        keys = _key_columns(index)
+        if not keys or not keys[0]:
+            continue
+        lead = columns.get(keys[0])
+        if lead is None:
+            continue
+        if lead.get("null_fraction") is not None and float(lead["null_fraction"]) >= 1.0:
+            out.append(
+                f"{index['name']} leads with {keys[0]}, which is null in every "
+                "profiled row; the index cannot select anything."
+            )
+            continue
+        if index.get("is_unique") or index.get("is_primary"):
+            continue
+        distinct = lead.get("distinct_estimate")
+        if distinct is not None and rows >= 1000:
+            if 1 <= float(distinct) <= max(2.0, rows * 0.0001):
+                out.append(
+                    f"{index['name']} leads with {keys[0]}, which has about "
+                    f"{int(float(distinct)):,} distinct values over {rows:,} rows; a scan "
+                    "may beat it."
+                )
+    return out
+
+
+def render_crdb_schema(schema, tables, indexes, relationships, sequences, order) -> str:
+    """Render a CockroachDB schema grouped one section per table."""
+    by_name = {t["name"]: t for t in tables}
+    lines = [
+        "-- CockroachDB schema for the reproduction, generated by dbprofiler "
+        f"{VERSION}.",
+        "--",
+        "-- One section per table: its columns, primary key, indexes, foreign keys and",
+        "-- index recommendations together, rather than split by kind the way a dump is.",
+        "-- Tables are in foreign-key order, so this file applies top to bottom.",
+        "--",
+        "-- This is the schema for a REPRODUCTION, not a migration of the source. It is",
+        "-- synthesized from profile.json, which does not carry everything a schema has.",
+        "-- Absent here, and present in the bundle's schema.sql, which stays the source",
+        "-- of truth:",
+        "--",
+        "--   * CHECK constraints -- not collected at all",
+        "--   * the predicate of a partial index, and the expression of an expression",
+        "--     index: each such index is emitted commented out, by name",
+        "--   * triggers, views, comments, partitioning",
+        "--   * column DEFAULT expressions, omitted on purpose: a PostgreSQL default",
+        "--     often does not parse here, and the loaded data supplies every value",
+        "",
+    ]
+
+    # The namespace has to exist before anything in it. A kit applied to a newly
+    # created database would otherwise fail on the first CREATE TABLE, which is
+    # exactly the moment it is most likely to be run.
+    lines.append(f"CREATE SCHEMA IF NOT EXISTS {schema};")
+    lines.append("")
+
+    for sequence in sequences or ():
+        lines.append(
+            "CREATE SEQUENCE IF NOT EXISTS {s}.{n} START {start} INCREMENT {inc};".format(
+                s=schema, n=sequence.get("name"),
+                start=sequence.get("start", 1), inc=sequence.get("increment", 1),
+            )
+        )
+    if sequences:
+        lines.append("")
+
+    rule = "-- " + "-" * 72
+    for table_name in order:
+        table = by_name[table_name]
+        mine = [i for i in indexes if i.get("table") == table_name]
+        rows = int(float(table.get("row_count_estimate") or 0))
+        size = int(float(table.get("size_bytes") or 0))
+
+        lines.append(rule)
+        lines.append(f"-- {schema}.{table_name}")
+        lines.append(f"--   {rows:,} rows, {size / 1024 / 1024:,.1f} MB in the source")
+        lines.append(rule)
+
+        body = []
+        width = max((len(c["name"]) for c in table.get("columns", ())), default=1)
+        for column in sorted(table.get("columns", ()), key=lambda c: c.get("ordinal", 0)):
+            spelling, known = _crdb_mapped(column["data_type"])
+            null = "NULL" if column.get("is_nullable", True) else "NOT NULL"
+            note = ""
+            if not known:
+                note = f"  -- review: no CockroachDB mapping for {column['data_type']!r}"
+            body.append(f"    {column['name']:<{width}} {spelling} {null},{note}")
+
+        primary = next((i for i in mine if i.get("is_primary")), None)
+        if primary and _reproducible(primary):
+            keys = ", ".join(
+                f"{c['name']} {'DESC' if c.get('descending') else 'ASC'}"
+                for c in primary["columns"] if c.get("is_key", True)
+            )
+            body.append(f"    CONSTRAINT {primary['name']} PRIMARY KEY ({keys})")
+        else:
+            body[-1] = body[-1].replace(",  --", "  --", 1)
+            if body[-1].rstrip().endswith(","):
+                body[-1] = body[-1].rstrip()[:-1]
+
+        lines.append(f"CREATE TABLE {schema}.{table_name} (")
+        lines.extend(body)
+        lines.append(");")
+        lines.append("")
+
+        for index in sorted(mine, key=lambda i: i["name"]):
+            if index.get("is_primary"):
+                continue
+            unique = "UNIQUE " if index.get("is_unique") else ""
+            if not _reproducible(index):
+                why = "a WHERE predicate" if index.get("is_partial") else "an expression key"
+                lines.append(f"-- {index['name']} has {why}, which profile.json does not")
+                lines.append("-- carry. Copy it from schema.sql:")
+                lines.append(
+                    f"-- CREATE {unique}INDEX {index['name']} ON {schema}.{table_name} (...);"
+                )
+                lines.append("")
+                continue
+            keys = ", ".join(
+                f"{c['name']} {'DESC' if c.get('descending') else 'ASC'}"
+                for c in index["columns"] if c.get("is_key", True)
+            )
+            storing = _storing_columns(index)
+            tail = f" STORING ({', '.join(storing)})" if storing else ""
+            lines.append(
+                f"CREATE {unique}INDEX {index['name']} ON {schema}.{table_name} ({keys}){tail};"
+            )
+        if any(not i.get("is_primary") for i in mine):
+            lines.append("")
+
+        for relationship in relationships:
+            if relationship.get("child_table") != table_name:
+                continue
+            lines.append(
+                "ALTER TABLE {s}.{t} ADD CONSTRAINT {c}\n"
+                "    FOREIGN KEY ({child}) REFERENCES {s}.{parent} ({pcols});".format(
+                    s=schema, t=table_name, c=relationship.get("constraint_name"),
+                    child=", ".join(relationship.get("child_columns") or ()),
+                    parent=relationship.get("parent_table"),
+                    pcols=", ".join(relationship.get("parent_columns") or ()),
+                )
+            )
+            lines.append("")
+
+        advice = index_recommendations(table, indexes, relationships)
+        if advice:
+            lines.append("-- Index recommendations")
+            for item in advice:
+                wrapped = textwrap.wrap(item, 74)
+                lines.append(f"--   * {wrapped[0]}")
+                lines.extend(f"--     {part}" for part in wrapped[1:])
+            lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------- build ---
+
+
+@dataclass(frozen=True)
+class Kit:
+    """A generated kit, held in memory until it is written.
+
+    Built whole before anything reaches disk, so a failure part way through
+    derivation leaves no half-written directory for someone to mistake for a
+    complete one.
+    """
+
+    schema: str
+    entries: tuple[tuple[str, str], ...]
+
+    @property
+    def files(self) -> dict:
+        return dict(self.entries)
+
+
+def kit_schemas(profile: dict) -> list[str]:
+    """Schemas in the bundle that actually have tables, in a stable order."""
+    return sorted({t["schema"] for t in profile.get("tables", ())})
+
+
+def _fan_out_table(relationships, schema: str) -> str:
+    rows = []
+    for relationship in sorted(
+        relationships or (),
+        key=lambda r: (r.get("child_table", ""), r.get("constraint_name", "")),
+    ):
+        if relationship.get("child_schema") != schema:
+            continue
+        fan_out = relationship.get("fan_out") or {}
+        mean = fan_out.get("mean")
+        mean_text = f"{float(mean):.2f} children per parent" if mean else "fan-out unknown"
+        rows.append(
+            "    {child}.{child_cols} -> {parent}.{parent_cols}  ({mean})".format(
+                child=relationship.get("child_table", "?"),
+                child_cols=",".join(relationship.get("child_columns") or ()),
+                parent=relationship.get("parent_table", "?"),
+                parent_cols=",".join(relationship.get("parent_columns") or ()),
+                mean=mean_text,
+            )
+        )
+    return "\n".join(rows) if rows else "    (none in this schema)"
+
+
+def _derived_summary(tables, order, scale: int, procs: int) -> str:
+    lines = [
+        "| Table | Source estimate | Generated | Columns |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    by_name = {t["name"]: t for t in tables}
+    for name in order:
+        table = by_name[name]
+        source = int(float(table.get("row_count_estimate") or 0))
+        lines.append(
+            "| `{name}` | {source:,} | {count:,} | {columns} |".format(
+                name=name,
+                source=source,
+                count=scaled_row_count(source, scale, procs),
+                columns=len(table.get("columns", ())),
+            )
+        )
+    lines.append("")
+    lines.append(f"Scale factor {scale}, generated for `-x {procs}`.")
+    return "\n".join(lines)
+
+
+# Generators whose output is unique in practice. Everything else draws from a
+# range and will collide, which a UNIQUE or PRIMARY KEY column will not forgive.
+UNIQUE_CAPABLE = frozenset({"uuid"})
+
+
+def _unique_column_warnings(tables, indexes) -> list:
+    """Unique columns that no built-in generator can actually keep unique.
+
+    dbworkload has no sequence generator: `integer` draws from a range, so a
+    single-column integer primary key collides as soon as the table is bigger
+    than the range -- and the collision surfaces as a failed load, long after
+    the kit looked fine. Saying it here is the difference between a TODO and a
+    wasted load.
+    """
+    out = []
+    by_table = {t["name"]: t for t in tables}
+    for index in indexes:
+        if not (index.get("is_primary") or index.get("is_unique")):
+            continue
+        table = by_table.get(index.get("table"))
+        if table is None:
+            continue
+        keys = [c["name"] for c in index.get("columns", ()) if c.get("is_key", True)]
+        columns = {c["name"]: c for c in table.get("columns", ())}
+        for name in keys:
+            column = columns.get(name)
+            if column is None:
+                continue
+            kind, _ = column_generator(column)
+            if kind in UNIQUE_CAPABLE:
+                continue
+            what = "primary key" if index.get("is_primary") else "unique index"
+            out.append(
+                f"- `{table['name']}.{name}` is part of {index['name']}, a {what}, but "
+                f"generates as `{kind}`, which draws from a range and will repeat. The "
+                "load will stop on a duplicate key. This column needs `keys.py`."
+            )
+            break
+    return out
+
+
+def _flagged_columns(tables) -> str:
+    flagged = []
+    for table in tables:
+        for column in table.get("columns", ()):
+            data_type = str(column["data_type"]).lower()
+            if data_type.endswith("[]"):
+                flagged.append(
+                    f"- `{table['name']}.{column['name']}` is `{column['data_type']}`. "
+                    f"It generates arrays of {DEFAULT_ARRAY_ELEMENTS} elements: nothing in "
+                    "the statistics records how long the source arrays were, so the length "
+                    "is an assumption. Adjust `array:` in the yaml if it matters."
+                )
+            elif not column.get("is_supported", True):
+                flagged.append(
+                    f"- `{table['name']}.{column['name']}` is `{column['data_type']}`, "
+                    "which the bundle marks as having no direct CockroachDB equivalent."
+                )
+    if not flagged:
+        return ""
+    return "### Columns that need a second look\n\n" + "\n".join(flagged) + "\n"
+
+
+def _flagged_section(tables, indexes) -> str:
+    parts = []
+    unique = _unique_column_warnings(tables, indexes)
+    if unique:
+        parts.append(
+            "### Unique columns that will collide -- TODO\n\n"
+            + "\n".join(unique)
+            + "\n"
+        )
+    columns = _flagged_columns(tables)
+    if columns:
+        parts.append(columns)
+    return "\n".join(parts)
+
+
+def build_kit(
+    profile: dict,
+    scale: int = 1,
+    procs: int = DEFAULT_PROCS,
+    schema: str | None = None,
+    bundle: str = ".",
+    output: str = ".",
+    dbprofiler_path: str = "dbprofiler.py",
+    target_url: str | None = None,
+) -> Kit:
+    """Derive a complete kit from a profile. Writes nothing."""
+    available = kit_schemas(profile)
+    if not available:
+        raise BundleError("the bundle profiles no tables, so there is nothing to generate")
+    if schema is None:
+        if len(available) > 1:
+            raise BundleError(
+                "the bundle covers more than one schema ("
+                + ", ".join(available)
+                + "); choose one with --schema"
+            )
+        schema = available[0]
+    elif schema not in available:
+        raise BundleError(
+            f"the bundle has no tables in schema {schema}; it covers: " + ", ".join(available)
+        )
+
+    tables = [t for t in profile.get("tables", ()) if t["schema"] == schema]
+    relationships = [
+        r
+        for r in profile.get("relationships", ())
+        if r.get("child_schema") == schema and r.get("parent_schema") == schema
+    ]
+    order = table_load_order(tables, relationships)
+    indexes = [i for i in profile.get("indexes", ()) if i.get("schema") == schema]
+    sequences = [q for q in profile.get("sequences", ()) if q.get("schema") == schema]
+    yaml_name = KIT_YAML.format(schema=schema)
+
+    common = {
+        "SCHEMA": schema,
+        "PROCS": str(procs),
+        "SCALE": str(scale),
+        "YAML": yaml_name,
+        "SCHEMA_SQL": KIT_SCHEMA_SQL,
+        "DEFAULT_DSN": target_dsn(target_url)[0] if target_url else "",
+        "TARGET_ENV": TARGET_URL_ENV_VAR,
+        "TOOL_VERSION": VERSION,
+    }
+
+    entries = (
+        (yaml_name, render_kit_yaml(schema, tables, order, scale, procs)),
+        (
+            KIT_SCHEMA_SQL,
+            render_crdb_schema(schema, tables, indexes, relationships, sequences, order),
+        ),
+        (
+            KIT_GEN_YAML,
+            _fill(
+                EMIT_GEN_YAML,
+                BUNDLE=bundle,
+                OUTPUT=output,
+                DBPROFILER=dbprofiler_path,
+                **common,
+            ),
+        ),
+        (KIT_KEYS, _fill(EMIT_KEYS, FAN_OUT=_fan_out_table(relationships, schema), **common)),
+        (KIT_WORKLOAD, _fill(EMIT_WORKLOAD, **common)),
+        (
+            KIT_GEN_IMPORT,
+            _fill(
+                EMIT_GEN_IMPORT,
+                TABLE_LIST="\n".join(f'    "{name}",' for name in order),
+                **common,
+            ),
+        ),
+        (
+            KIT_REPRODUCE,
+            _fill(
+                EMIT_REPRODUCE,
+                TABLES_BASH="\n".join(f"  {name}" for name in order),
+                **common,
+            ),
+        ),
+        (
+            KIT_MANIFEST,
+            json.dumps(
+                {
+                    "tool_version": VERSION,
+                    "schema": schema,
+                    "scale": scale,
+                    "procs": procs,
+                    "yaml": yaml_name,
+                    "schema_sql": KIT_SCHEMA_SQL,
+                    "tables": list(order),
+                },
+                indent=2,
+            )
+            + "\n",
+        ),
+        (
+            KIT_README,
+            _fill(
+                EMIT_README,
+                DERIVED=_derived_summary(tables, order, scale, procs),
+                FLAGGED=_flagged_section(tables, indexes),
+                **common,
+            ),
+        ),
+    )
+    return Kit(schema=schema, entries=entries)
+
+
+def default_kit_output(bundle: Path) -> Path:
+    """Where a kit goes when --output is not given: beside the bundle it came from.
+
+    A kit is only meaningful next to the bundle it was derived from -- same
+    scale, same schema, same key space -- and the pair is what gets archived or
+    handed on. Defaulting to a sibling keeps them together without the operator
+    having to name a second path that is almost always a function of the first.
+    """
+    bundle = Path(bundle)
+    name = bundle.name
+    if name.lower().endswith(".zip"):
+        name = name[: -len(".zip")]
+    # Deliberately not resolved: the kit path should read the way the operator
+    # spelled the bundle, and resolving would print a path through whatever
+    # symlinks the platform happens to use for temporary and home directories.
+    return bundle.parent / (name + "-kit")
+
+
+def write_kit(kit: Kit, destination: Path, force: bool = False) -> tuple[str, ...]:
+    """Write a kit into destination. Returns the names of stubs left untouched.
+
+    The derived files are regenerated every time; they are output, and the
+    bundle is their only source. The stubs are not. They hold the correlated-key
+    generator and the workload -- the part of a kit that cannot be rebuilt from
+    statistics, and the only part someone spends real time on. Overwriting an
+    implemented generator with a fresh stub because the scale changed would
+    destroy exactly the work the kit exists to carry, so a stub that differs
+    from what this run would emit is kept.
+
+    Comparing bytes is what makes that judgement, which means no marker file, no
+    timestamp, and nothing to go stale: a stub nobody has touched is byte-equal
+    to a fresh one and is simply rewritten.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    preserved = []
+    for name, body in kit.entries:
+        target = destination / name
+        if not force and name in KIT_STUBS and target.is_file():
+            try:
+                existing = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                existing = None
+            if existing is not None and existing != body:
+                preserved.append(name)
+                continue
+        target.write_text(body, encoding="utf-8")
+        if name.endswith(".sh"):
+            target.chmod(0o755)
+    return tuple(preserved)
+
+
+def run_generate(args) -> int:
+    """Build a kit from a bundle. Opens no connection and starts no child process."""
+    bundle = Path(args.bundle)
+    profile = read_bundle_profile(bundle)
+
+    available = kit_schemas(profile)
+    schema = args.schema
+    if schema is None and len(available) == 1:
+        schema = available[0]
+
+    destination = Path(args.output) if args.output else default_kit_output(bundle)
+
+    target = args.target_url or os.environ.get(TARGET_URL_ENV_VAR)
+    if target:
+        # Validated here so a bad URL fails before anything is written, and so
+        # the notice below is printed once rather than per file.
+        _, had_credentials = target_dsn(target)
+        if had_credentials:
+            progress(
+                "the target URL carried a username or password; the kit records it "
+                "without them. Set PGUSER and PGPASSWORD, or keep them in the URL you "
+                "pass at run time -- that one is never written down"
+            )
+
+    kit = build_kit(
+        profile,
+        scale=args.scale,
+        procs=args.procs,
+        schema=schema,
+        bundle=str(bundle.resolve()),
+        output=str(destination.resolve()),
+        dbprofiler_path=str(Path(__file__).resolve()),
+        target_url=target,
+    )
+
+    progress(f"schema {kit.schema}: {len(kit.entries)} files")
+    preserved = write_kit(kit, destination, force=args.force)
+    for name in preserved:
+        progress(f"kept {name}: it has been edited, so it was not replaced")
+    if not preserved:
+        progress("keys.py and workload.py are stubs; see README.md")
+
+    # stdout carries the output path and nothing else, as with a bundle.
+    print(destination)
+    return 0
+
+
+# ----------------------------------------------------------- reproduction ---
+# Driving a kit into a target. Everything here runs through run_command(), the
+# single subprocess call site, so this adds none: a new call site would fail
+# audit_subprocess_usage() and it would deserve to.
+#
+# Two consequences of going through that helper, both deliberate:
+#
+#   No stdin. run_command passes stdin=DEVNULL, so a `\copy ... FROM STDIN`
+#   would hang forever. Loading uses `\copy ... FROM '<path>'` in a script file
+#   instead, which psql reads itself.
+#
+#   Credentials never reach a command line. The target URL is parsed into libpq
+#   environment variables by the same parse_connection_url() the collector
+#   uses, and safe_env() strips every DBPROFILER_* variable before a child sees
+#   the environment.
+
+# A catalog query and the statements that follow it are issued against the
+# reproduction target, not against anyone's source. They are audited on their
+# own rule -- see audit_target_sql() -- which is why they are not SQL_*.
+TARGET_SQL_FOREIGN_KEYS = """
+SELECT format('%I.%I', n.nspname, c.relname), k.conname
+  FROM pg_constraint k
+  JOIN pg_class c ON c.oid = k.conrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE k.contype = 'f' AND n.nspname = %(schema)s
+ ORDER BY 1, 2
+"""
+
+TARGET_SQL_VALIDATE = "ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}"
+
+# The planner has nothing to work with until a bulk-loaded target is analyzed.
+# Named per table rather than bare: PostgreSQL treats a bare ANALYZE as "every
+# table", but CockroachDB requires a target and rejects it outright. Per table
+# is accepted by both, and it reports progress on a load worth analyzing.
+TARGET_SQL_ANALYZE = "ANALYZE {table}"
+
+TARGET_SQL_COPY = (
+    "\\copy {table} FROM '{path}' WITH (FORMAT csv, DELIMITER E'\\t', NULL '')"
+)
+
+# A bulk load is not a catalog query. The collector's 300 seconds would abort
+# one partway and leave a half-populated table behind.
+DEFAULT_REPRODUCE_TIMEOUT = 7200
+
+REPRODUCE_STEPS = ("schema", "generate", "load", "validate", "analyze")
+
+# psql for running a script. PSQL_ARGS is shaped for single queries whose rows
+# are parsed; a script's output is for the operator.
+PSQL_SCRIPT_ARGS = ("-X", "-w", "-v", "ON_ERROR_STOP=1")
+
+
+def iter_target_sql_constants():
+    """Yield (name, sql) for every module-level TARGET_SQL_* constant."""
+    for name, value in sorted(globals().items()):
+        if name.startswith("TARGET_SQL_") and isinstance(value, str):
+            yield name, value
+
+
+def audit_target_sql(sql: str) -> list:
+    """Return every safety violation in one target-side statement.
+
+    A different rule from audit_sql(), because these address a reproduction the
+    operator built rather than a source this tool was pointed at. Refreshing
+    that target's planner statistics is the right thing to do and is allowed.
+    Scanning a table still is not -- a loaded reproduction can be very large,
+    and nothing here needs a row count -- and neither is computing statistics
+    that the source did not have.
+    """
+    violations = []
+    normalized = " ".join(sql.split()).upper().replace(" (", "(")
+    for token in ("COUNT(", "CREATE STATISTICS"):
+        if token in normalized:
+            violations.append(f"contains forbidden token {token!r}")
+    if CREDENTIALED_URL.search(sql):
+        violations.append("contains a credentialed connection URL")
+    return violations
+
+
+def build_target_config(args, env: dict | None = None) -> PostgresConfig:
+    """Validate the target URL into a PostgresConfig.
+
+    Reuses parse_connection_url(), so the target's credentials travel the same
+    way the source's do: through the environment of a child process, never on
+    its command line.
+    """
+    env = os.environ if env is None else env
+    url = getattr(args, "target_url", None) or env.get(TARGET_URL_ENV_VAR)
+    if not url:
+        raise ConfigError(
+            f"no target URL: set {TARGET_URL_ENV_VAR} or pass --target-url"
+        )
+    timeout = getattr(args, "timeout", DEFAULT_REPRODUCE_TIMEOUT)
+    if timeout <= 0:
+        raise ConfigError("--timeout must be a positive number of seconds")
+    return PostgresConfig(
+        env=parse_connection_url(url),
+        output=Path("."),
+        psql_path=getattr(args, "psql_path", "psql"),
+        dbworkload_path=getattr(args, "dbworkload_path", "dbworkload"),
+        timeout=timeout,
+    )
+
+
+def selected_steps(spec: str | None) -> list:
+    """Resolve a --steps selection, keeping dependency order whatever was typed."""
+    if not spec:
+        return list(REPRODUCE_STEPS)
+    wanted = {part.strip() for part in spec.split(",") if part.strip()}
+    unknown = sorted(wanted - set(REPRODUCE_STEPS))
+    if unknown:
+        raise ConfigError(
+            "unknown step(s): " + ", ".join(unknown) + "; choose from "
+            + ", ".join(REPRODUCE_STEPS)
+        )
+    return [step for step in REPRODUCE_STEPS if step in wanted]
+
+
+def reproduce_start(kit, bundle) -> str:
+    """Where the one command begins, given what the operator supplied.
+
+    Supplying nothing is the whole job: collect from the source, derive a kit,
+    load the target. Supplying a bundle skips the collection; supplying a kit
+    skips the derivation too. Each is a resumption of the same pipeline rather
+    than a different command to learn.
+    """
+    if kit and bundle:
+        raise ConfigError("pass --kit or --bundle, not both: they name different steps")
+    if kit:
+        return "kit"
+    if bundle:
+        return "bundle"
+    return "source"
+
+
+def reproduce_workdir(workdir) -> Path:
+    """Where a bundle and kit land when the command made them itself."""
+    return Path(workdir) if workdir else Path.cwd()
+
+
+def read_kit_manifest(kit: Path) -> dict:
+    """Read kit.json, which records what the kit was generated for."""
+    path = Path(kit) / KIT_MANIFEST
+    if not path.is_file():
+        raise ConfigError(
+            f"{kit} does not look like a kit: no {KIT_MANIFEST}. Generate one with "
+            "`dbprofiler generate`"
+        )
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        raise ConfigError(f"{path} is not readable JSON") from None
+
+
+def _psql_script(path: Path, config: PostgresConfig) -> str:
+    return run_command(
+        [config.psql_path, *PSQL_SCRIPT_ARGS, "-f", str(path)], config, "psql"
+    )
+
+
+def _reproduce_schema(kit: Path, manifest: dict, config: PostgresConfig) -> None:
+    schema_file = kit / manifest.get("schema_sql", KIT_SCHEMA_SQL)
+    if not schema_file.is_file():
+        raise ConfigError(f"the kit has no {schema_file.name}")
+    progress(f"applying {schema_file.name}")
+    _psql_script(schema_file, config)
+
+
+def _reproduce_generate(kit: Path, manifest: dict, config: PostgresConfig, regenerate) -> None:
+    csv_dir = kit / "csv"
+    existing = sorted(csv_dir.glob("*.tsv")) if csv_dir.is_dir() else []
+    if existing and not regenerate:
+        progress(f"{len(existing)} TSV files already present; skipping (use --regenerate)")
+        return
+    procs = int(manifest.get("procs", DEFAULT_PROCS))
+    progress(f"generating TSV files with -x {procs}")
+    run_command(
+        [
+            config.dbworkload_path, "util", "csv",
+            "-i", str(kit / manifest["yaml"]),
+            "-x", str(procs),
+            "-o", str(csv_dir),
+        ],
+        config,
+        "dbworkload",
+    )
+
+
+def _explain_load_failure(error: CommandError, table: str) -> CommandError:
+    """Turn the one predictable load failure into the sentence that explains it.
+
+    A kit whose keys.py is still a stub generates every column independently,
+    so a child's foreign key holds a value no parent row has and the load stops
+    on a constraint violation. That is the stub working as designed, not a bug
+    in the data path, and saying so here saves reading a constraint name and
+    inferring it.
+    """
+    text = str(error)
+    low = text.lower()
+    if "foreign key constraint" in low:
+        return CommandError(
+            f"loading {table} violated a foreign key. If keys.py is still the generated "
+            "stub, this is expected: every column is generated independently, so a child "
+            "row references a parent that was never generated. Implement keys.py (see the "
+            "kit's README), or load without the constraints and add them afterwards.\n"
+            f"{text}"
+        )
+    if "duplicate key" in low or "unique constraint" in low:
+        return CommandError(
+            f"loading {table} hit a duplicate key. If keys.py is still the generated "
+            "stub, this is expected for any unique column that is not a uuid: no "
+            "built-in generator produces a unique sequence, so values repeat. The "
+            "kit's README lists the affected columns; implement keys.py for them.\n"
+            f"{text}"
+        )
+    return error
+
+
+def _reproduce_load(kit: Path, manifest: dict, config: PostgresConfig) -> None:
+    schema = manifest["schema"]
+    csv_dir = kit / "csv"
+    for table in manifest["tables"]:
+        files = sorted(csv_dir.glob(f"{schema}.{table}.*.tsv"))
+        if not files:
+            raise ConfigError(
+                f"no TSV files for {table} in {csv_dir}; run the generate step first"
+            )
+        # A script file rather than stdin: run_command gives children no stdin,
+        # so `\\copy ... FROM STDIN` would wait forever.
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sql", delete=False, encoding="utf-8"
+        ) as handle:
+            for path in files:
+                handle.write(
+                    TARGET_SQL_COPY.format(table=f"{schema}.{table}", path=path) + "\n"
+                )
+            script = Path(handle.name)
+        try:
+            progress(f"{table}: {len(files)} file(s)")
+            _psql_script(script, config)
+        except CommandError as error:
+            raise _explain_load_failure(error, table) from None
+        finally:
+            script.unlink(missing_ok=True)
+
+
+def _reproduce_validate(manifest: dict, config: PostgresConfig) -> None:
+    schema = manifest["schema"]
+    rows = run_psql(
+        TARGET_SQL_FOREIGN_KEYS.replace("%(schema)s", f"'{schema}'"), config
+    )
+    pairs = [row for row in rows if len(row) == 2 and row[0]]
+    if not pairs:
+        progress(f"no foreign keys in {schema}")
+        return
+    for table, constraint in pairs:
+        progress(f"validating {constraint} on {table}")
+        run_psql(
+            TARGET_SQL_VALIDATE.format(table=table, constraint=f'"{constraint}"'), config
+        )
+
+
+def _reproduce_analyze(manifest: dict, config: PostgresConfig) -> None:
+    schema = manifest["schema"]
+    for table in manifest["tables"]:
+        progress(f"analyzing {schema}.{table}")
+        run_psql(TARGET_SQL_ANALYZE.format(table=f"{schema}.{table}"), config)
+
+
+def run_reproduce(args) -> int:
+    """Collect, derive and load as far as the operator's arguments require."""
+    start = reproduce_start(getattr(args, "kit", None), getattr(args, "bundle", None))
+    workdir = reproduce_workdir(getattr(args, "workdir", None))
+    bundle = getattr(args, "bundle", None)
+
+    if start == "source":
+        # No bundle to work from, so make one. run_postgres owns the single
+        # child-process call site; nothing new is spent here.
+        workdir.mkdir(parents=True, exist_ok=True)
+        bundle = str(workdir / "source-profile.zip")
+        progress(f"collecting the source profile into {bundle}")
+        collect = argparse.Namespace(
+            output=bundle,
+            url=getattr(args, "url", None),
+            schema_include=[args.schema] if getattr(args, "schema", None) else None,
+            schema_exclude=getattr(args, "schema_exclude", None),
+            psql_path=getattr(args, "psql_path", "psql"),
+            pg_dump_path=getattr(args, "pg_dump_path", "pg_dump"),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        status = run_postgres(collect)
+        if status != 0:
+            return status
+        start = "bundle"
+
+    if start == "bundle":
+        generate = argparse.Namespace(
+            bundle=bundle,
+            output=None,
+            scale=getattr(args, "scale", 1),
+            procs=getattr(args, "procs", DEFAULT_PROCS),
+            schema=getattr(args, "schema", None),
+            force=getattr(args, "force", False),
+            target_url=getattr(args, "target_url", None),
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            status = run_generate(generate)
+        if status != 0:
+            return status
+        kit = Path(captured.getvalue().strip())
+    else:
+        kit = Path(args.kit)
+
+    manifest = read_kit_manifest(kit)
+    steps = selected_steps(getattr(args, "steps", None))
+    config = build_target_config(args)
+
+    progress(f"kit {kit} -> schema {manifest['schema']}, steps: {', '.join(steps)}")
+    for step in steps:
+        if step == "schema":
+            _reproduce_schema(kit, manifest, config)
+        elif step == "generate":
+            _reproduce_generate(kit, manifest, config, getattr(args, "regenerate", False))
+        elif step == "load":
+            _reproduce_load(kit, manifest, config)
+        elif step == "validate":
+            _reproduce_validate(manifest, config)
+        elif step == "analyze":
+            _reproduce_analyze(manifest, config)
+
+    progress("done")
+    print(kit)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -3541,6 +5959,166 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"per-command timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS})",
     )
 
+    generate = subparsers.add_parser(
+        "generate",
+        help="build a dbworkload generation kit from a bundle",
+        description=(
+            "Build a dbworkload generation kit from a profile bundle. Reads the "
+            "bundle and writes files; it opens no connection and runs nothing."
+        ),
+    )
+    generate.add_argument(
+        "--bundle",
+        required=True,
+        metavar="PATH",
+        help="profile bundle to read, as a .zip or an extracted directory",
+    )
+    generate.add_argument(
+        "--output",
+        metavar="DIR",
+        help=(
+            "directory to write the kit into; created if absent. Defaults to a "
+            "'-kit' directory beside the bundle"
+        ),
+    )
+    generate.add_argument(
+        "--target-url",
+        metavar="URL",
+        help=(
+            f"reproduction target to record in the kit; defaults to {TARGET_URL_ENV_VAR}. "
+            "Nothing here connects to it. Its username and password are stripped before "
+            "it is written: supply those at run time with PGUSER and PGPASSWORD"
+        ),
+    )
+    generate.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace keys.py and workload.py even if they have been edited. "
+            "Without it, an edited stub is kept and every other file is refreshed"
+        ),
+    )
+    generate.add_argument(
+        "--scale",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "divide every row count by N (default: 1, meaning source size). Counts "
+            "are floored to a multiple of --procs"
+        ),
+    )
+    generate.add_argument(
+        "--procs",
+        type=int,
+        default=DEFAULT_PROCS,
+        metavar="N",
+        help=(
+            f"generation processes the kit is built for (default: {DEFAULT_PROCS}). "
+            "Part of the data definition, not a performance setting: the same kit "
+            "generated with a different value is different data"
+        ),
+    )
+    generate.add_argument(
+        "--schema",
+        metavar="NAME",
+        help="schema to generate for; required when the bundle covers more than one",
+    )
+
+    reproduce = subparsers.add_parser(
+        "reproduce",
+        help="drive a generated kit into a target database",
+        description=(
+            "Apply a kit's schema to a target, generate its data, load it, validate "
+            f"the foreign keys and refresh statistics. Set {TARGET_URL_ENV_VAR} to the "
+            "target connection string."
+        ),
+    )
+    reproduce.add_argument(
+        "--kit",
+        metavar="DIR",
+        help="drive this existing kit. Omit to derive one first",
+    )
+    reproduce.add_argument(
+        "--bundle",
+        metavar="PATH",
+        help=(
+            "derive a kit from this bundle, then drive it. Omit both --kit and "
+            f"--bundle to collect from {URL_ENV_VAR} first"
+        ),
+    )
+    reproduce.add_argument(
+        "--workdir",
+        metavar="DIR",
+        help="where a collected bundle and derived kit are written (default: .)",
+    )
+    reproduce.add_argument(
+        "--url",
+        metavar="URL",
+        help=f"source connection string for the collect step; defaults to {URL_ENV_VAR}",
+    )
+    reproduce.add_argument(
+        "--scale", type=int, default=1, metavar="N",
+        help="divide every row count by N when deriving the kit (default: 1)",
+    )
+    reproduce.add_argument(
+        "--procs", type=int, default=DEFAULT_PROCS, metavar="N",
+        help=f"generation processes the kit is built for (default: {DEFAULT_PROCS})",
+    )
+    reproduce.add_argument(
+        "--schema", metavar="NAME",
+        help="schema to collect and reproduce; required when a bundle covers several",
+    )
+    reproduce.add_argument(
+        "--schema-exclude", action="append", metavar="NAME",
+        help="skip this schema while collecting; repeatable",
+    )
+    reproduce.add_argument(
+        "--force", action="store_true",
+        help="when deriving a kit, replace keys.py and workload.py even if edited",
+    )
+    reproduce.add_argument(
+        "--pg-dump-path", default="pg_dump", metavar="PATH",
+        help="pg_dump executable for the collect step",
+    )
+    reproduce.add_argument(
+        "--target-url",
+        metavar="URL",
+        help=(
+            f"target connection string; defaults to {TARGET_URL_ENV_VAR}. Prefer the "
+            "environment variable: a URL passed here is visible in the process list"
+        ),
+    )
+    reproduce.add_argument(
+        "--steps",
+        metavar="LIST",
+        help="comma-separated subset of: " + ", ".join(REPRODUCE_STEPS),
+    )
+    reproduce.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="rebuild the TSV files even if the kit's csv directory is populated",
+    )
+    reproduce.add_argument(
+        "--psql-path", default="psql", metavar="PATH", help="psql executable to use"
+    )
+    reproduce.add_argument(
+        "--dbworkload-path",
+        default="dbworkload",
+        metavar="PATH",
+        help="dbworkload executable to use",
+    )
+    reproduce.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_REPRODUCE_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            f"per-command timeout (default: {DEFAULT_REPRODUCE_TIMEOUT}). A bulk load "
+            "is not a catalog query; the collector's timeout would abort one"
+        ),
+    )
+
     return parser
 
 
@@ -3551,9 +6129,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_safety:
         return check_safety()
 
-    if args.command == "postgres":
+    if args.command in ("postgres", "generate", "reproduce"):
+        runner = {
+            "postgres": run_postgres,
+            "generate": run_generate,
+            "reproduce": run_reproduce,
+        }[args.command]
         try:
-            return run_postgres(args)
+            return runner(args)
         except DbprofilerError as error:
             # Expected failures are reported as a message, not a traceback: a
             # traceback here would be noise, and stack frames can carry values
@@ -3563,7 +6146,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             # write_bundle removes its own temporary file on the way out, so
             # there is nothing to clean up here -- only something to say.
-            print(f"{PROG}: cancelled; no bundle was written", file=sys.stderr)
+            print(f"{PROG}: cancelled; nothing was written", file=sys.stderr)
             return 130
 
     parser.print_help(sys.stderr)
