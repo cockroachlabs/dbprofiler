@@ -8,8 +8,8 @@ Three suites, in increasing order of what they need from you.
 | Unit | `python3 -m unittest -v` | nothing |
 | Integration | `python3 -m unittest integration_test -v` | a local PostgreSQL 16 |
 
-The first two open no sockets and start no containers. Run both before every commit;
-CI runs them on every push.
+The first two open no sockets and start no containers. Run both before every commit.
+CI runs all three, on every pull request and every push to `main`.
 
 ## The safety audit
 
@@ -40,6 +40,13 @@ variable:
 
 - `DBPROFILER_POSTGRES_TEST_URL` — a connection string for a database you are willing to
   have fixtures created and dropped in.
+
+CI runs this suite too, on every pull request and every push to `main`, from the same
+`docker-compose.postgres-test.yml` you use here — a second server definition written for
+CI is how the two would quietly stop agreeing about `shared_preload_libraries`. There the
+variables come from the job's environment rather than `.env.test.local`, since Compose
+interpolates from the process environment either way, and the job fails if the suite would
+skip: a green run has to mean the tests ran, not that they were configured out.
 
 ### Configuration lives in `.env.test.local`
 

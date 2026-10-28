@@ -31,6 +31,80 @@ jobs:
       - name: Version
         run: python dbprofiler.py --version
 
+  # Everything above this line runs offline. This job is the only one that
+  # exercises a real server -- subprocess handling, CSV parsing,
+  # pg_stat_statements, bundle assembly -- and integration_test.py skips itself
+  # entirely unless it is configured, so read the skip guard below before
+  # trusting a green result here.
+  integration:
+    runs-on: ubuntu-latest
+    # The same disposable server the local loop uses. Compose interpolates
+    # ${VAR} from the process environment in preference to a .env file, so CI
+    # needs no --env-file and writes no credential to disk; a job-level env
+    # also covers the teardown step, which still has to interpolate.
+    #
+    # These are the synthetic values docs/TESTING.md documents, so a reviewer
+    # grepping this public repository reads them as test data at a glance. One
+    # deviation: the documented host is db.invalid, which is reserved by RFC
+    # 2606 and can never resolve -- deliberately, for tests that must not
+    # connect. This one connects, so it uses loopback.
+    env:
+      DBPROFILER_TEST_PGUSER: example-user
+      DBPROFILER_TEST_PGPASSWORD: example-password
+      DBPROFILER_TEST_PGDATABASE: example-db
+      DBPROFILER_TEST_PGPORT: "5432"
+      DBPROFILER_POSTGRES_TEST_URL: postgresql://example-user:example-password@127.0.0.1:5432/example-db
+    steps:
+      - uses: actions/checkout@v4
+
+      # The oldest supported version, which is what release.yaml gates on. The
+      # matrix above already covers the offline path on everything newer.
+      # integration_test.py has `from __future__ import annotations`, so its
+      # annotations are never evaluated and it imports fine here.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      # pg_dump refuses to dump from a server newer than itself, and the server
+      # is pinned to postgres:16. The runner is expected to already ship a
+      # client at least that new; this only makes it obvious if it stops doing
+      # so, rather than leaving a dump error to be decoded.
+      - name: pg_dump must not be older than the server
+        run: |
+          set -euo pipefail
+          # "pg_dump (PostgreSQL) 16.4" -- field 3, then the leading digits,
+          # so a packaging suffix or a beta tag cannot turn into a bad compare.
+          version="$(pg_dump --version | awk '{print $3}')"
+          major="${version%%[!0-9]*}"
+          if [ -z "${major}" ] || [ "${major}" -lt 16 ]; then
+            echo "pg_dump ${version} cannot dump from a PostgreSQL 16 server" >&2
+            exit 1
+          fi
+
+      # --wait blocks on the health check in the Compose file, so the suite
+      # cannot race the first connection. Started from the committed file
+      # rather than a services: container because a service cannot override the
+      # image command, and without shared_preload_libraries=pg_stat_statements
+      # this would silently test the profiler's degradation path instead.
+      - name: Start PostgreSQL
+        run: docker compose -f docker-compose.postgres-test.yml up -d --wait
+
+      # Without this, an unset or misspelled URL variable skips all of
+      # integration_test and the job passes having run nothing. Asserting the
+      # module's own gate, rather than re-reading the variable by name, means
+      # the guard cannot drift from what it guards.
+      - name: Refuse to pass a suite that would skip every test
+        run: python -c "import integration_test as t; raise SystemExit(0 if t.CONFIGURED else 1)"
+
+      - name: Integration tests
+        run: python -m unittest integration_test -v
+
+      # -v takes the volume too. A reused volume is how a fixture from one run
+      # reaches the next run's assertions.
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker compose -f docker-compose.postgres-test.yml down -v
+
   lint:
     runs-on: ubuntu-latest
     steps:
