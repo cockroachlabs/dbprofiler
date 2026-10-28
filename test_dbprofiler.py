@@ -12,6 +12,7 @@ so that a reviewer grepping for a credential leak can tell test data apart from
 the real thing.
 """
 
+import argparse
 import ast
 import contextlib
 import csv
@@ -3401,6 +3402,1659 @@ class TestReleaseWorkflow(unittest.TestCase):
         self.assertIn(f"releases/latest/download/{CHECKSUM_NAME}", readme)
         self.assertIn(f"sha256sum -c {CHECKSUM_NAME}", readme)
 
+
+# ---------------------------------------------------------------------------
+# Kit generation
+# ---------------------------------------------------------------------------
+# A bundle carries a sample of a source database, so no real bundle is read
+# here. Every fixture below is synthetic and built in-test, and the names in it
+# are the ones fixed by .claude/rules/development.md.
+
+KIT_SCHEMA = "example_schema"
+
+
+def kit_column(name, data_type, **overrides):
+    column = {
+        "schema": KIT_SCHEMA,
+        "table": overrides.pop("table", "parent"),
+        "name": name,
+        "ordinal": overrides.pop("ordinal", 1),
+        "data_type": data_type,
+        "is_nullable": True,
+        "is_supported": True,
+        "null_fraction": 0.0,
+        "avg_width_bytes": 16,
+        "distinct_estimate": 100.0,
+        "most_common_values": [],
+        "most_common_freqs": [],
+        "histogram_bounds": [],
+        "correlation": None,
+        "collation": None,
+        "default_expression": None,
+        "identity": None,
+        "statistics_target": None,
+        "provenance": "",
+    }
+    column.update(overrides)
+    return column
+
+
+def kit_table(name, columns, row_count_estimate=1000):
+    return {
+        "schema": KIT_SCHEMA,
+        "name": name,
+        "row_count_estimate": row_count_estimate,
+        "size_bytes": 8192,
+        "columns": columns,
+        "provenance": "",
+    }
+
+
+def kit_relationship(child, parent, child_columns=("parent_id",), parent_columns=("id",)):
+    return {
+        "constraint_name": f"fk_{child}_{parent}",
+        "child_schema": KIT_SCHEMA,
+        "child_table": child,
+        "child_columns": list(child_columns),
+        "parent_schema": KIT_SCHEMA,
+        "parent_table": parent,
+        "parent_columns": list(parent_columns),
+        "on_update": "NO ACTION",
+        "on_delete": "RESTRICT",
+        "fan_out": {"status": "estimated", "basis": "single_column", "mean": 3.0, "p99": 9.0},
+    }
+
+
+def kit_index(table, name, columns, is_primary=False, is_unique=False,
+              storing=(), descending=(), is_partial=False, has_expressions=False):
+    keys = [
+        {"position": i, "name": c, "is_key": True,
+         "descending": c in descending, "nulls_first": False,
+         "operator_class": None, "collation": None}
+        for i, c in enumerate(columns, 1)
+    ]
+    payload = [
+        {"position": len(columns) + i, "name": c, "is_key": False,
+         "descending": False, "nulls_first": False,
+         "operator_class": None, "collation": None}
+        for i, c in enumerate(storing, 1)
+    ]
+    if has_expressions:
+        keys[0] = dict(keys[0], name=None)
+    return {
+        "schema": KIT_SCHEMA, "table": table, "name": name,
+        "is_unique": is_unique or is_primary, "is_primary": is_primary,
+        "is_valid": True, "is_clustered": False, "is_partial": is_partial,
+        "has_expressions": has_expressions, "columns": keys + payload, "provenance": "",
+    }
+
+
+def kit_profile(tables=None, relationships=None, contract_version=None,
+                indexes=None, sequences=None):
+    if tables is None:
+        tables = [
+            kit_table("parent", [kit_column("id", "uuid", table="parent")]),
+            kit_table(
+                "child",
+                [
+                    kit_column("id", "uuid", table="child"),
+                    kit_column("parent_id", "uuid", table="child", ordinal=2),
+                ],
+            ),
+        ]
+    if relationships is None:
+        relationships = [kit_relationship("child", "parent")]
+    return {
+        "source": {
+            "kind": "postgres",
+            "server_version_num": 160013,
+            "server_version": "16.13",
+            "database": DATABASE,
+            "collected_schemas": [KIT_SCHEMA],
+            "collate": "en_US.utf8",
+            "ctype": "en_US.utf8",
+        },
+        "contract_version": contract_version or dbprofiler.CONTRACT_VERSION,
+        "tables": tables,
+        "relationships": relationships,
+        "indexes": indexes if indexes is not None else [
+            kit_index("parent", "parent_pkey", ["id"], is_primary=True),
+            kit_index("child", "child_pkey", ["id"], is_primary=True),
+        ],
+        "sequences": sequences or [],
+        "warnings": [],
+    }
+
+
+def write_kit_bundle(directory, profile=None, corrupt=False):
+    """Write a minimal but checksum-correct bundle directory."""
+    directory = Path(directory)
+    (directory / "observations").mkdir(parents=True, exist_ok=True)
+    profile = profile if profile is not None else kit_profile()
+
+    payloads = {
+        "profile.json": json.dumps(profile, indent=2).encode(),
+        "schema.sql": b"-- synthetic schema\n",
+    }
+    entries = []
+    for name, data in payloads.items():
+        (directory / name).write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        if corrupt and name == "profile.json":
+            digest = "0" * 64
+        entries.append({"path": name, "sha256": digest, "row_count": 1})
+
+    manifest = {
+        "tool": "dbprofiler",
+        "tool_version": dbprofiler.VERSION,
+        "contract_version": profile["contract_version"],
+        "created_at": "2026-01-01T00:00:00Z",
+        "source": profile["source"],
+        "schema_fingerprint": "f" * 64,
+        "payloads": entries,
+        "warnings": [],
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return directory
+
+
+class TestKitBundleReader(unittest.TestCase):
+    def test_reads_a_directory_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_kit_bundle(tmp)
+            profile = dbprofiler.read_bundle_profile(Path(tmp))
+        self.assertEqual(profile["source"]["database"], DATABASE)
+
+    def test_reads_a_zip_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write_kit_bundle(Path(tmp) / "bundle")
+            archive = Path(tmp) / "bundle.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                for path in sorted(source.rglob("*")):
+                    if path.is_file():
+                        zf.write(path, path.relative_to(source).as_posix())
+            profile = dbprofiler.read_bundle_profile(archive)
+        self.assertEqual(profile["source"]["database"], DATABASE)
+
+    def test_refuses_a_checksum_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_kit_bundle(tmp, corrupt=True)
+            with self.assertRaises(dbprofiler.BundleError) as caught:
+                dbprofiler.read_bundle_profile(Path(tmp))
+        self.assertIn("profile.json", str(caught.exception))
+
+    def test_refuses_an_unsupported_contract_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_kit_bundle(tmp, profile=kit_profile(contract_version="1.0"))
+            with self.assertRaises(dbprofiler.BundleError) as caught:
+                dbprofiler.read_bundle_profile(Path(tmp))
+        message = str(caught.exception)
+        self.assertIn("1.0", message)
+        self.assertIn(dbprofiler.CONTRACT_VERSION, message)
+
+
+class TestKitTypeMapping(unittest.TestCase):
+    def generator(self, data_type, **overrides):
+        return dbprofiler.column_generator(kit_column("c", data_type, **overrides))
+
+    def test_maps_the_observed_type_vocabulary(self):
+        cases = {
+            "timestamp with time zone": "timestamp",
+            "timestamp without time zone": "timestamp",
+            "date": "date",
+            "integer": "integer",
+            "bigint": "integer",
+            "numeric(38,20)": "float",
+            "character varying(255)": "string",
+            "text": "string",
+            "uuid": "uuid",
+            "boolean": "bool",
+            "jsonb": "json",
+            "bytea": "bytes",
+        }
+        for data_type, expected in cases.items():
+            with self.subTest(data_type=data_type):
+                kind, _ = self.generator(data_type)
+                self.assertEqual(kind, expected)
+
+    def test_declared_width_bounds_a_string(self):
+        _, args = self.generator("character varying(64)")
+        self.assertLessEqual(args["max"], 64)
+
+    def test_histogram_bounds_become_a_timestamp_window(self):
+        _, args = self.generator(
+            "timestamp with time zone",
+            histogram_bounds=["2024-01-01 00:00:00+00", "2024-06-01 00:00:00+00"],
+        )
+        self.assertTrue(args["start"].startswith("2024-01-01"))
+        self.assertTrue(args["end"].startswith("2024-06-01"))
+
+    def test_most_common_values_force_a_choice(self):
+        kind, args = self.generator(
+            "character varying(20)",
+            most_common_values=["alpha", "beta"],
+            most_common_freqs=[0.75, 0.25],
+        )
+        self.assertEqual(kind, "choice")
+        self.assertEqual(args["population"][:2], ["alpha", "beta"])
+
+    def test_null_fraction_becomes_null_pct(self):
+        _, args = self.generator("uuid", null_fraction=0.25)
+        self.assertAlmostEqual(args["null_pct"], 0.25)
+
+    def test_every_generator_is_seeded(self):
+        for data_type in ("uuid", "integer", "text", "timestamp with time zone"):
+            with self.subTest(data_type=data_type):
+                _, args = self.generator(data_type)
+                self.assertIn("seed", args)
+
+    def test_seeds_are_stable_across_runs(self):
+        column = kit_column("c", "uuid")
+        self.assertEqual(
+            dbprofiler.column_generator(column)[1]["seed"],
+            dbprofiler.column_generator(column)[1]["seed"],
+        )
+
+    def test_distinct_columns_get_distinct_seeds(self):
+        first = dbprofiler.column_generator(kit_column("a", "uuid"))[1]["seed"]
+        second = dbprofiler.column_generator(kit_column("b", "uuid"))[1]["seed"]
+        self.assertNotEqual(first, second)
+
+
+class TestKitChoiceWeights(unittest.TestCase):
+    def test_weights_sum_to_one(self):
+        weights = dbprofiler.choice_weights([0.5, 0.25], 4, 0.0)
+        self.assertAlmostEqual(sum(weights), 1.0, places=6)
+
+    def test_residue_is_spread_over_unlisted_values(self):
+        weights = dbprofiler.choice_weights([0.5, 0.25], 4, 0.0)
+        self.assertEqual(len(weights), 4)
+        self.assertGreater(weights[2], 0.0)
+        self.assertAlmostEqual(weights[2], weights[3])
+
+    def test_frequencies_are_renormalized_over_non_null_rows(self):
+        # most_common_freqs are fractions of all rows including nulls, but the
+        # generator applies null_pct independently.
+        weights = dbprofiler.choice_weights([0.4, 0.4], 2, 0.2)
+        self.assertAlmostEqual(sum(weights), 1.0, places=6)
+        self.assertAlmostEqual(weights[0], 0.5, places=6)
+
+    def test_exhaustive_frequencies_leave_unlisted_values_rarest(self):
+        weights = dbprofiler.choice_weights([0.6, 0.4], 3, 0.0)
+        self.assertAlmostEqual(sum(weights), 1.0, places=6)
+        self.assertGreater(weights[2], 0.0)
+        self.assertLess(weights[2], min(weights[0], weights[1]))
+
+
+class TestKitConstantGuard(unittest.TestCase):
+    def test_never_emits_constant_with_a_fractional_null_pct(self):
+        # SimpleFaker's dispatcher discards `seed` for `constant`, so such a
+        # column would reseed from OS entropy and change on every run.
+        kind, args = dbprofiler.column_generator(
+            kit_column(
+                "c",
+                "character varying(20)",
+                most_common_values=["only"],
+                most_common_freqs=[0.6],
+                null_fraction=0.4,
+            )
+        )
+        self.assertNotEqual(kind, "constant")
+        self.assertIn("seed", args)
+
+    def test_no_emitted_yaml_pairs_constant_with_a_fractional_null_pct(self):
+        profile = kit_profile(
+            tables=[
+                kit_table(
+                    "only",
+                    [
+                        kit_column(
+                            "c",
+                            "text",
+                            table="only",
+                            most_common_values=["x"],
+                            most_common_freqs=[0.5],
+                            null_fraction=0.5,
+                        )
+                    ],
+                )
+            ],
+            relationships=[],
+        )
+        kit = dbprofiler.build_kit(profile, scale=1, procs=8)
+        for name, body in kit.files.items():
+            if name.endswith(".yaml"):
+                self.assertNotIn("type: constant", body)
+
+
+class TestKitRowCounts(unittest.TestCase):
+    def test_counts_land_on_a_multiple_of_procs(self):
+        for estimate in (1, 7, 999, 1_000_000):
+            with self.subTest(estimate=estimate):
+                self.assertEqual(dbprofiler.scaled_row_count(estimate, 1, 8) % 8, 0)
+
+    def test_scale_divides_the_estimate(self):
+        self.assertEqual(dbprofiler.scaled_row_count(80_000, 1000, 8), 80)
+
+    def test_never_returns_zero(self):
+        self.assertGreaterEqual(dbprofiler.scaled_row_count(1, 1_000_000, 8), 8)
+
+
+class TestKitLoadOrder(unittest.TestCase):
+    def test_parents_precede_children(self):
+        profile = kit_profile()
+        order = dbprofiler.table_load_order(profile["tables"], profile["relationships"])
+        self.assertLess(order.index("parent"), order.index("child"))
+
+    def test_unrelated_tables_are_included(self):
+        profile = kit_profile(
+            tables=[kit_table("solo", [kit_column("id", "uuid", table="solo")])],
+            relationships=[],
+        )
+        order = dbprofiler.table_load_order(profile["tables"], profile["relationships"])
+        self.assertEqual(order, ["solo"])
+
+    def test_self_reference_does_not_deadlock(self):
+        profile = kit_profile(
+            tables=[kit_table("node", [kit_column("id", "uuid", table="node")])],
+            relationships=[kit_relationship("node", "node")],
+        )
+        order = dbprofiler.table_load_order(profile["tables"], profile["relationships"])
+        self.assertEqual(order, ["node"])
+
+    def test_a_cycle_is_reported_not_broken_silently(self):
+        profile = kit_profile(
+            tables=[
+                kit_table("a", [kit_column("id", "uuid", table="a")]),
+                kit_table("b", [kit_column("id", "uuid", table="b")]),
+            ],
+            relationships=[kit_relationship("a", "b"), kit_relationship("b", "a")],
+        )
+        with self.assertRaises(dbprofiler.BundleError) as caught:
+            dbprofiler.table_load_order(profile["tables"], profile["relationships"])
+        self.assertIn("cycle", str(caught.exception).lower())
+
+
+class TestKitEmission(unittest.TestCase):
+    def build(self, profile=None, scale=1, procs=8):
+        return dbprofiler.build_kit(profile or kit_profile(), scale=scale, procs=procs)
+
+    def test_emits_the_expected_file_set(self):
+        kit = self.build()
+        self.assertEqual(
+            set(kit.files),
+            {
+                f"{KIT_SCHEMA}.yaml",
+                "schema.crdb.sql",
+                "kit.json",
+                "gen_yaml.py",
+                "keys.py",
+                "workload.py",
+                "gen_import.py",
+                "reproduce.sh",
+                "README.md",
+            },
+        )
+
+    def test_names_come_from_the_bundle(self):
+        kit = self.build()
+        yaml_body = kit.files[f"{KIT_SCHEMA}.yaml"]
+        self.assertIn(f"{KIT_SCHEMA}.parent:", yaml_body)
+        self.assertIn(f"{KIT_SCHEMA}.child:", yaml_body)
+
+    def test_load_order_is_recorded_in_fk_order(self):
+        kit = self.build()
+        self.assertLess(
+            kit.files["gen_import.py"].index("parent"),
+            kit.files["gen_import.py"].index("child"),
+        )
+
+    def test_procs_is_carried_into_the_driver(self):
+        kit = self.build(procs=4)
+        self.assertIn("4", kit.files["reproduce.sh"])
+
+    def test_readme_records_what_needs_judgment(self):
+        readme = self.build().files["README.md"]
+        self.assertIn("TODO", readme)
+
+    def test_stubs_are_marked_todo(self):
+        kit = self.build()
+        for name in ("keys.py", "workload.py"):
+            with self.subTest(name=name):
+                self.assertIn("TODO", kit.files[name])
+
+    def test_written_to_disk_under_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.build(), out)
+            written = {p.name for p in out.iterdir()}
+        self.assertIn("reproduce.sh", written)
+        self.assertIn("README.md", written)
+
+    def test_the_driver_is_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.build(), out)
+            self.assertTrue(os.access(out / "reproduce.sh", os.X_OK))
+
+
+class TestKitSafety(unittest.TestCase):
+    """The generate path must not weaken the collector's safety boundary."""
+
+    def emitted_text(self):
+        kit = dbprofiler.build_kit(kit_profile(), scale=1, procs=8)
+        return "\n".join(kit.files.values())
+
+    def test_check_safety_still_passes(self):
+        self.assertEqual(dbprofiler.check_safety(), 0)
+
+    def test_emit_templates_carry_no_credentialed_url(self):
+        for name, value in sorted(vars(dbprofiler).items()):
+            if name.startswith("EMIT_") and isinstance(value, str):
+                with self.subTest(name=name):
+                    self.assertIsNone(dbprofiler.CREDENTIALED_URL.search(value))
+
+    def test_no_emitted_file_contains_a_forbidden_scan(self):
+        # ANALYZE is permitted in a target-side artifact; a table scan is not.
+        self.assertNotIn("COUNT(", self.emitted_text().upper())
+
+    def test_the_generate_path_starts_no_child_process(self):
+        source = ast.parse(dbprofiler.own_source())
+        generate = next(
+            node
+            for node in ast.walk(source)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_generate"
+        )
+        for node in ast.walk(generate):
+            if isinstance(node, ast.Call):
+                func = node.func
+                self.assertFalse(
+                    isinstance(func, ast.Attribute)
+                    and dbprofiler._is_name(func.value, "subprocess"),
+                    "run_generate must not start a child process",
+                )
+
+    def test_the_generate_path_opens_no_connection(self):
+        source = ast.parse(dbprofiler.own_source())
+        generate = next(
+            node
+            for node in ast.walk(source)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_generate"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(generate)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertEqual(called & {"run_psql", "run_pg_dump", "build_postgres_config"}, set())
+
+    def test_no_name_from_one_bundle_reaches_another_kit(self):
+        # Every name in a kit must be read out of the bundle it was built from.
+        # A schema, table or column name hard-coded in a template would pass
+        # every other test here, so the check is that building from a second
+        # bundle leaves no trace of the first. The fixture names are deliberately
+        # unlike any English word that appears in the templates.
+        def profile_named(tag):
+            tables = [
+                kit_table(f"{tag}tbl", [kit_column(f"{tag}col", "uuid", table=f"{tag}tbl")])
+            ]
+            for table in tables:
+                table["schema"] = f"{tag}schema"
+                for column in table["columns"]:
+                    column["schema"] = f"{tag}schema"
+            return kit_profile(tables=tables, relationships=[])
+
+        first_tag, second_tag = "qqaa_", "wwbb_"
+        first = dbprofiler.build_kit(profile_named(first_tag), scale=1, procs=8)
+        second = dbprofiler.build_kit(profile_named(second_tag), scale=1, procs=8)
+
+        first_body = "\n".join(list(first.files) + list(first.files.values()))
+        second_body = "\n".join(list(second.files) + list(second.files.values()))
+
+        self.assertIn(f"{first_tag}tbl", first_body)
+        self.assertIn(f"{second_tag}tbl", second_body)
+        self.assertNotIn(first_tag, second_body)
+        self.assertNotIn(second_tag, first_body)
+
+
+class TestKitCli(unittest.TestCase):
+    def test_generate_writes_a_kit_and_prints_only_the_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = dbprofiler.main(
+                    ["generate", "--bundle", str(bundle), "--output", str(out)]
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(stdout.getvalue().strip(), str(out))
+            self.assertTrue((out / "README.md").exists())
+
+    def test_generate_reports_a_bad_bundle_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = dbprofiler.main(
+                    ["generate", "--bundle", str(Path(tmp) / "absent"),
+                     "--output", str(Path(tmp) / "k")]
+                )
+        self.assertEqual(status, 2)
+        self.assertIn(dbprofiler.PROG, stderr.getvalue())
+
+    def test_scale_and_procs_reach_the_kit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                dbprofiler.main(
+                    ["generate", "--bundle", str(bundle), "--output", str(out),
+                     "--scale", "10", "--procs", "4"]
+                )
+            self.assertIn("4", (out / "reproduce.sh").read_text())
+
+
+# PyYAML resolves a scalar to a float only when the mantissa carries a decimal
+# point and any exponent carries a sign. Anything else loads as a string, which
+# is how a weight reaches random.choices as text.
+YAML_11_FLOAT = re.compile(r"^[-+]?(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9_]+)(?:[eE][-+][0-9]+)?$")
+
+
+class TestKitYamlFloats(unittest.TestCase):
+    def test_small_magnitudes_round_trip_as_floats(self):
+        # repr(5e-05) is "5e-05", which YAML 1.1 reads as a string.
+        self.assertEqual(dbprofiler._yaml_float(5e-05), "5.0e-05")
+
+    def test_rendered_floats_match_the_yaml_float_grammar(self):
+        for value in (0.5, 5e-05, 1e-08, 1.7e-05, 4.2e-09, 123.0, 1e20, 0.0):
+            with self.subTest(value=value):
+                self.assertRegex(dbprofiler._yaml_float(value), YAML_11_FLOAT)
+
+    def test_integers_stay_integers(self):
+        self.assertEqual(dbprofiler._yaml_scalar(8), "8")
+
+    def test_every_emitted_weight_is_a_yaml_float(self):
+        profile = kit_profile(
+            tables=[
+                kit_table(
+                    "t",
+                    [
+                        kit_column(
+                            "c",
+                            "text",
+                            table="t",
+                            most_common_values=["a", "b", "c"],
+                            most_common_freqs=[0.9999, 0.00005, 0.00005],
+                        )
+                    ],
+                )
+            ],
+            relationships=[],
+        )
+        kit = dbprofiler.build_kit(profile, scale=1, procs=8)
+        body = kit.files[f"{KIT_SCHEMA}.yaml"]
+        weights = re.search(r"weights: \[([^\]]*)\]", body).group(1)
+        for token in weights.split(","):
+            with self.subTest(token=token):
+                self.assertRegex(token.strip(), YAML_11_FLOAT)
+
+
+class TestKitWeightFloor(unittest.TestCase):
+    def test_a_positive_weight_never_rounds_away_to_zero(self):
+        self.assertGreater(dbprofiler._readable_weight(4.2e-12), 0.0)
+
+    def test_an_ordinary_weight_is_rounded_for_legibility(self):
+        self.assertEqual(dbprofiler._readable_weight(0.123456789123), 0.12345679)
+
+    def test_a_rare_value_survives_into_the_emitted_weights(self):
+        weights = dbprofiler.column_generator(
+            kit_column(
+                "c",
+                "text",
+                most_common_values=["common", "vanishing"],
+                most_common_freqs=[0.999999999, 1e-11],
+            )
+        )[1]["weights"]
+        self.assertTrue(all(w > 0 for w in weights), weights)
+
+class TestEmittedTemplateAudit(unittest.TestCase):
+    def test_every_emit_constant_is_audited(self):
+        names = {name for name, _ in dbprofiler.iter_emit_constants()}
+        self.assertIn("EMIT_REPRODUCE", names)
+        self.assertGreaterEqual(len(names), 5)
+
+    def test_a_credentialed_url_is_caught(self):
+        problems = dbprofiler.audit_emitted(f"DSN='postgres://{USER}:{PASSWORD}@{HOST}/db'")
+        self.assertTrue(any("credential" in p for p in problems), problems)
+
+    def test_a_table_scan_is_caught(self):
+        problems = dbprofiler.audit_emitted("SELECT COUNT(*) FROM t")
+        self.assertTrue(any("COUNT(" in p for p in problems), problems)
+
+    def test_spacing_cannot_evade_the_scan_check(self):
+        problems = dbprofiler.audit_emitted("SELECT COUNT (*) FROM t")
+        self.assertTrue(any("COUNT(" in p for p in problems), problems)
+
+    def test_analyze_is_permitted_in_an_emitted_artifact(self):
+        # A generated script refreshes the planner statistics of the
+        # reproduction database it just loaded. That is not a source read.
+        self.assertEqual(dbprofiler.audit_emitted('psql -c "ANALYZE"'), [])
+
+    def test_the_shipped_driver_refreshes_statistics(self):
+        self.assertIn("ANALYZE", dbprofiler.EMIT_REPRODUCE)
+
+    def test_the_shipped_driver_validates_foreign_keys(self):
+        self.assertIn("VALIDATE CONSTRAINT", dbprofiler.EMIT_REPRODUCE)
+
+class TestKitZipLayouts(unittest.TestCase):
+    """A bundle that has been extracted and re-zipped keeps working."""
+
+    def archive(self, tmp, prefix="", extra=()):
+        source = write_kit_bundle(Path(tmp) / "src")
+        target = Path(tmp) / "bundle.zip"
+        with zipfile.ZipFile(target, "w") as zf:
+            for path in sorted(source.rglob("*")):
+                if path.is_file():
+                    zf.writestr(prefix + path.relative_to(source).as_posix(), path.read_bytes())
+            for name in extra:
+                zf.writestr(name, b"junk")
+        return target
+
+    def test_payloads_at_the_archive_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = dbprofiler.read_bundle_profile(self.archive(tmp))
+        self.assertEqual(profile["source"]["database"], DATABASE)
+
+    def test_payloads_under_a_single_directory_prefix(self):
+        # `zip -r bundle.zip bundle/` stores the directory name as a prefix.
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = dbprofiler.read_bundle_profile(self.archive(tmp, prefix="some-bundle/"))
+        self.assertEqual(profile["source"]["database"], DATABASE)
+
+    def test_macos_resource_fork_entries_are_ignored(self):
+        # The macOS compressor writes a parallel __MACOSX tree beside the real one.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self.archive(
+                tmp,
+                prefix="some-bundle/",
+                extra=("__MACOSX/", "__MACOSX/some-bundle/._manifest.json"),
+            )
+            profile = dbprofiler.read_bundle_profile(archive)
+        self.assertEqual(profile["source"]["database"], DATABASE)
+
+    def test_two_bundles_in_one_archive_is_refused_not_guessed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write_kit_bundle(Path(tmp) / "src")
+            target = Path(tmp) / "bundle.zip"
+            with zipfile.ZipFile(target, "w") as zf:
+                for prefix in ("first/", "second/"):
+                    for path in sorted(source.rglob("*")):
+                        if path.is_file():
+                            zf.writestr(
+                                prefix + path.relative_to(source).as_posix(), path.read_bytes()
+                            )
+            with self.assertRaises(dbprofiler.BundleError) as caught:
+                dbprofiler.read_bundle_profile(target)
+        message = str(caught.exception)
+        self.assertIn("first", message)
+        self.assertIn("second", message)
+
+    def test_an_archive_with_no_manifest_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "bundle.zip"
+            with zipfile.ZipFile(target, "w") as zf:
+                zf.writestr("readme.txt", b"not a bundle")
+            with self.assertRaises(dbprofiler.BundleError) as caught:
+                dbprofiler.read_bundle_profile(target)
+        self.assertIn("manifest.json", str(caught.exception))
+
+    def test_a_path_that_is_not_an_archive_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "bundle.zip"
+            target.write_bytes(b"this is not a zip")
+            with self.assertRaises(dbprofiler.BundleError) as caught:
+                dbprofiler.read_bundle_profile(target)
+        self.assertIn("readable bundle", str(caught.exception))
+
+class TestKitRegeneration(unittest.TestCase):
+    """A kit is regenerated in place without destroying the work in it."""
+
+    def kit(self, scale=1):
+        return dbprofiler.build_kit(kit_profile(), scale=scale, procs=8)
+
+    def test_an_edited_stub_survives_a_regeneration(self):
+        marker = "# an implemented generator\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.kit(), out)
+            (out / "keys.py").write_text((out / "keys.py").read_text() + marker)
+
+            preserved = dbprofiler.write_kit(self.kit(scale=10), out)
+
+            self.assertIn("keys.py", preserved)
+            self.assertIn(marker, (out / "keys.py").read_text())
+
+    def test_derived_files_are_refreshed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.kit(scale=1), out)
+            before = (out / f"{KIT_SCHEMA}.yaml").read_text()
+            dbprofiler.write_kit(self.kit(scale=10), out)
+            after = (out / f"{KIT_SCHEMA}.yaml").read_text()
+        self.assertNotEqual(before, after)
+
+    def test_a_pristine_stub_is_not_reported_as_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.kit(), out)
+            self.assertEqual(dbprofiler.write_kit(self.kit(), out), ())
+
+    def test_force_replaces_an_edited_stub(self):
+        marker = "# an implemented generator\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.kit(), out)
+            (out / "keys.py").write_text((out / "keys.py").read_text() + marker)
+            preserved = dbprofiler.write_kit(self.kit(), out, force=True)
+            self.assertEqual(preserved, ())
+            self.assertNotIn(marker, (out / "keys.py").read_text())
+
+    def test_both_stubs_are_protected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(self.kit(), out)
+            for name in ("keys.py", "workload.py"):
+                (out / name).write_text("edited\n")
+            preserved = dbprofiler.write_kit(self.kit(), out)
+        self.assertEqual(set(preserved), {"keys.py", "workload.py"})
+
+    def test_the_cli_reports_what_it_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            argv = ["generate", "--bundle", str(bundle), "--output", str(out)]
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                dbprofiler.main(argv)
+            (out / "workload.py").write_text("edited\n")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                status = dbprofiler.main(argv)
+            self.assertEqual(status, 0)
+            self.assertIn("workload.py", stderr.getvalue())
+            self.assertIn("edited\n", (out / "workload.py").read_text())
+
+
+class TestKitDefaultOutput(unittest.TestCase):
+    def test_a_zip_bundle_puts_the_kit_beside_itself(self):
+        self.assertEqual(
+            dbprofiler.default_kit_output(Path("/srv/bundles/shop.zip")).name, "shop-kit"
+        )
+        self.assertEqual(
+            dbprofiler.default_kit_output(Path("/srv/bundles/shop.zip")).parent,
+            Path("/srv/bundles"),
+        )
+
+    def test_a_directory_bundle_gets_a_sibling(self):
+        self.assertEqual(
+            dbprofiler.default_kit_output(Path("/srv/bundles/shop")).name, "shop-kit"
+        )
+
+    def test_an_uppercase_extension_is_handled(self):
+        self.assertEqual(
+            dbprofiler.default_kit_output(Path("/srv/bundles/SHOP.ZIP")).name, "SHOP-kit"
+        )
+
+    def test_the_cli_uses_it_when_output_is_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                status = dbprofiler.main(["generate", "--bundle", str(bundle)])
+            self.assertEqual(status, 0)
+            self.assertEqual(stdout.getvalue().strip(), str(Path(tmp) / "bundle-kit"))
+            self.assertTrue((Path(tmp) / "bundle-kit" / "README.md").exists())
+
+class TestKitGeneratorArguments(unittest.TestCase):
+    """Emitted args must match the generator signatures dbworkload actually has."""
+
+    def gen(self, data_type, **kw):
+        return dbprofiler.column_generator(kit_column("c", data_type, **kw))
+
+    def test_bytea_uses_size_not_n(self):
+        kind, args = self.gen("bytea", avg_width_bytes=32)
+        self.assertEqual(kind, "bytes")
+        self.assertIn("size", args)
+        self.assertNotIn("n", args)
+
+    def test_an_array_column_generates_a_real_array(self):
+        kind, args = self.gen("text[]")
+        self.assertEqual(kind, "string")
+        self.assertGreater(args.get("array", 0), 0)
+
+    def test_an_array_uses_its_element_type(self):
+        self.assertEqual(self.gen("integer[]")[0], "integer")
+        self.assertEqual(self.gen("uuid[]")[0], "uuid")
+        self.assertEqual(self.gen("timestamp with time zone[]")[0], "timestamp")
+
+    def test_an_array_with_most_common_values_keeps_them_verbatim(self):
+        # pg_stats records the whole array value, so the literals are already
+        # arrays and must not be wrapped a second time.
+        kind, args = self.gen(
+            "text[]", most_common_values=["{a,b}", "{c}"], most_common_freqs=[0.7, 0.3]
+        )
+        self.assertEqual(kind, "choice")
+        self.assertEqual(args["population"], ["{a,b}", "{c}"])
+        self.assertNotIn("array", args)
+
+    def test_a_scalar_column_asks_for_no_array(self):
+        for data_type in ("text", "uuid", "integer", "boolean", "jsonb", "bytea"):
+            with self.subTest(data_type=data_type):
+                self.assertNotIn("array", self.gen(data_type)[1])
+
+    def test_every_emitted_argument_is_accepted_by_its_generator(self):
+        """The real guard: emitted args must bind to SimpleFaker's signatures.
+
+        Skipped where dbworkload is absent, since the tool has no runtime
+        dependencies; it is the check that catches an argument renamed or
+        invented, which no amount of YAML validation would.
+        """
+        try:
+            import inspect
+
+            from dbworkload.utils.simplefaker import SimpleFaker
+        except ImportError:
+            self.skipTest("dbworkload is not installed")
+
+        classes = {
+            "string": SimpleFaker.String, "integer": SimpleFaker.Integer,
+            "float": SimpleFaker.Float, "choice": SimpleFaker.Choice,
+            "timestamp": SimpleFaker.Timestamp, "date": SimpleFaker.Date,
+            "uuid": SimpleFaker.UUIDv4, "bool": SimpleFaker.Bool,
+            "json": SimpleFaker.Json, "bytes": SimpleFaker.Bytes,
+        }
+        types = [
+            "timestamp with time zone", "timestamp without time zone", "date",
+            "integer", "bigint", "numeric(38,20)", "character varying(255)", "text",
+            "uuid", "boolean", "jsonb", "bytea", "text[]", "integer[]",
+        ]
+        for data_type in types:
+            with self.subTest(data_type=data_type):
+                kind, args = self.gen(data_type, null_fraction=0.1)
+                inspect.signature(classes[kind].__init__).bind(None, **args)
+
+    def test_arguments_bind_for_a_most_common_value_column(self):
+        try:
+            import inspect
+
+            from dbworkload.utils.simplefaker import SimpleFaker
+        except ImportError:
+            self.skipTest("dbworkload is not installed")
+        _, args = self.gen(
+            "text", most_common_values=["a", "b"], most_common_freqs=[0.6, 0.3],
+            null_fraction=0.1,
+        )
+        inspect.signature(SimpleFaker.Choice.__init__).bind(None, **args)
+
+class TestCrdbTypeMapping(unittest.TestCase):
+    def test_maps_the_observed_vocabulary(self):
+        cases = {
+            "smallint": "INT2", "integer": "INT4", "bigint": "INT8",
+            "numeric(38,20)": "DECIMAL(38,20)", "numeric": "DECIMAL",
+            "real": "FLOAT4", "double precision": "FLOAT8",
+            "character varying(255)": "VARCHAR(255)", "character(3)": "CHAR(3)",
+            "text": "STRING", "boolean": "BOOL", "bytea": "BYTES",
+            "jsonb": "JSONB", "json": "JSONB", "uuid": "UUID", "date": "DATE",
+            "timestamp without time zone": "TIMESTAMP",
+            "timestamp with time zone": "TIMESTAMPTZ",
+            "interval": "INTERVAL", "inet": "INET",
+        }
+        for pg, crdb in cases.items():
+            with self.subTest(pg=pg):
+                self.assertEqual(dbprofiler.crdb_type(pg), crdb)
+
+    def test_integer_does_not_widen_to_eight_bytes(self):
+        # CockroachDB's bare INT is 8-byte; mapping `integer` to it would
+        # silently change the column's width.
+        self.assertEqual(dbprofiler.crdb_type("integer"), "INT4")
+        self.assertNotEqual(dbprofiler.crdb_type("integer"), "INT")
+
+    def test_arrays_map_their_element_type(self):
+        self.assertEqual(dbprofiler.crdb_type("text[]"), "STRING[]")
+        self.assertEqual(dbprofiler.crdb_type("integer[]"), "INT4[]")
+
+    def test_an_unknown_type_is_passed_through_not_guessed(self):
+        self.assertIn("tsvector", dbprofiler.crdb_type("tsvector"))
+
+
+def schema_profile():
+    """A profile with indexes, a foreign key, and things worth recommending."""
+    customer = kit_table("customer", [
+        kit_column("id", "uuid", table="customer", is_nullable=False),
+        kit_column("status", "character varying(20)", table="customer", ordinal=2),
+        kit_column("created_at", "timestamp with time zone", table="customer", ordinal=3),
+    ], row_count_estimate=50_000)
+    orders = kit_table("orders", [
+        kit_column("id", "bigint", table="orders", is_nullable=False, identity="always"),
+        kit_column("customer_id", "uuid", table="orders", ordinal=2),
+        kit_column("note", "text", table="orders", ordinal=3),
+    ], row_count_estimate=900_000)
+    return kit_profile(
+        tables=[customer, orders],
+        relationships=[kit_relationship("orders", "customer",
+                                        child_columns=("customer_id",), parent_columns=("id",))],
+        indexes=[
+            kit_index("customer", "customer_pkey", ["id"], is_primary=True),
+            kit_index("customer", "customer_status_idx", ["status"]),
+            kit_index("orders", "orders_pkey", ["id"], is_primary=True),
+        ],
+    )
+
+
+def render(profile):
+    tables = profile["tables"]
+    order = dbprofiler.table_load_order(tables, profile["relationships"])
+    return dbprofiler.render_crdb_schema(
+        KIT_SCHEMA, tables, profile["indexes"], profile["relationships"],
+        profile["sequences"], order,
+    )
+
+
+class TestCrdbSchemaGrouping(unittest.TestCase):
+    """Everything about one table lives in that table's section."""
+
+    def section(self, body, table):
+        marker = f"-- {KIT_SCHEMA}.{table}"
+        start = body.index(marker)
+        rest = body[start + len(marker):]
+        nxt = min(
+            (rest.index(f"-- {KIT_SCHEMA}.{o}") for o in ("customer", "orders")
+             if o != table and f"-- {KIT_SCHEMA}.{o}" in rest),
+            default=len(rest),
+        )
+        return rest[:nxt]
+
+    def test_a_tables_index_sits_in_its_own_section(self):
+        body = render(schema_profile())
+        self.assertIn("customer_status_idx", self.section(body, "customer"))
+        self.assertNotIn("customer_status_idx", self.section(body, "orders"))
+
+    def test_a_tables_foreign_key_sits_in_its_own_section(self):
+        body = render(schema_profile())
+        self.assertIn("fk_orders_customer", self.section(body, "orders"))
+        self.assertNotIn("fk_orders_customer", self.section(body, "customer"))
+
+    def test_create_table_is_in_the_section_too(self):
+        body = render(schema_profile())
+        self.assertIn(f"CREATE TABLE {KIT_SCHEMA}.orders", self.section(body, "orders"))
+
+    def test_a_parent_is_created_before_its_child(self):
+        body = render(schema_profile())
+        self.assertLess(
+            body.index(f"CREATE TABLE {KIT_SCHEMA}.customer"),
+            body.index(f"CREATE TABLE {KIT_SCHEMA}.orders"),
+        )
+
+    def test_the_primary_key_is_inline_on_the_table(self):
+        self.assertIn("PRIMARY KEY", self.section(render(schema_profile()), "customer"))
+
+    def test_not_null_is_carried(self):
+        self.assertIn("NOT NULL", self.section(render(schema_profile()), "customer"))
+
+    def test_a_descending_key_keeps_its_direction(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_created_idx", ["created_at"],
+                      descending=("created_at",))
+        )
+        self.assertIn("created_at DESC", render(profile))
+
+    def test_an_include_column_becomes_storing(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_cover_idx", ["status"], storing=("created_at",))
+        )
+        self.assertIn("STORING (created_at)", render(profile))
+
+
+class TestCrdbSchemaCaveats(unittest.TestCase):
+    """What the contract cannot express is flagged, never dropped silently."""
+
+    def test_a_partial_index_is_commented_out_and_named(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_live_idx", ["status"], is_partial=True)
+        )
+        body = render(profile)
+        self.assertIn("customer_live_idx", body)
+        line = next(x for x in body.splitlines()
+                    if "customer_live_idx" in x and "CREATE" in x)
+        self.assertTrue(line.lstrip().startswith("--"), line)
+
+    def test_an_expression_index_is_commented_out_and_named(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_lower_idx", ["status"], has_expressions=True)
+        )
+        body = render(profile)
+        line = next(x for x in body.splitlines()
+                    if "customer_lower_idx" in x and "CREATE" in x)
+        self.assertTrue(line.lstrip().startswith("--"), line)
+
+    def test_the_header_says_what_is_missing(self):
+        body = render(schema_profile())
+        head = body[:body.index("CREATE TABLE")].upper()
+        self.assertIn("CHECK", head)
+        self.assertIn("SCHEMA.SQL", head)
+
+    def test_the_schema_creates_its_own_namespace_first(self):
+        # Applied to a freshly created database, the first CREATE TABLE fails
+        # unless the schema exists.
+        body = render(schema_profile())
+        self.assertIn(f"CREATE SCHEMA IF NOT EXISTS {KIT_SCHEMA};", body)
+        self.assertLess(body.index("CREATE SCHEMA"), body.index("CREATE TABLE"))
+
+    def test_no_table_scan_is_taught(self):
+        self.assertNotIn("COUNT(", render(schema_profile()).upper())
+
+
+class TestIndexRecommendations(unittest.TestCase):
+    def recs(self, profile, table):
+        by_name = {t["name"]: t for t in profile["tables"]}
+        return dbprofiler.index_recommendations(
+            by_name[table], profile["indexes"], profile["relationships"]
+        )
+
+    def test_an_unindexed_foreign_key_is_reported(self):
+        text = " ".join(self.recs(schema_profile(), "orders"))
+        self.assertIn("customer_id", text)
+
+    def test_an_indexed_foreign_key_is_not_reported(self):
+        profile = schema_profile()
+        profile["indexes"].append(kit_index("orders", "orders_customer_idx", ["customer_id"]))
+        text = " ".join(self.recs(profile, "orders"))
+        self.assertNotIn("customer_id", text)
+
+    def test_a_redundant_prefix_index_is_reported(self):
+        profile = schema_profile()
+        profile["indexes"] += [
+            kit_index("customer", "cust_a", ["status"]),
+            kit_index("customer", "cust_ab", ["status", "created_at"]),
+        ]
+        found = self.recs(profile, "customer")
+        self.assertTrue(any("cust_a" in r and "cust_ab" in r for r in found))
+
+    def test_a_duplicate_index_is_reported(self):
+        profile = schema_profile()
+        profile["indexes"].append(kit_index("customer", "customer_status_dup", ["status"]))
+        self.assertTrue(any("duplicat" in r.lower() for r in self.recs(profile, "customer")))
+
+    def test_a_sequential_primary_key_is_flagged_as_a_hotspot(self):
+        text = " ".join(self.recs(schema_profile(), "orders")).lower()
+        self.assertIn("hash", text)
+
+    def test_a_uuid_primary_key_is_not_flagged_as_a_hotspot(self):
+        text = " ".join(self.recs(schema_profile(), "customer")).lower()
+        self.assertNotIn("hash", text)
+
+    def test_an_always_null_indexed_column_is_reported(self):
+        profile = schema_profile()
+        for t in profile["tables"]:
+            if t["name"] == "customer":
+                t["columns"][1]["null_fraction"] = 1.0
+        self.assertTrue(any("null" in r.lower() for r in self.recs(profile, "customer")))
+
+    def test_a_weak_leading_column_is_reported(self):
+        profile = schema_profile()
+        for t in profile["tables"]:
+            if t["name"] == "customer":
+                t["columns"][1]["distinct_estimate"] = 2.0
+        self.assertTrue(any("distinct" in r.lower() for r in self.recs(profile, "customer")))
+
+    def test_a_clean_table_gets_no_recommendation_block(self):
+        profile = kit_profile(
+            tables=[kit_table("solo", [kit_column("id", "uuid", table="solo", is_nullable=False)])],
+            relationships=[],
+            indexes=[kit_index("solo", "solo_pkey", ["id"], is_primary=True)],
+        )
+        self.assertEqual(self.recs(profile, "solo"), [])
+        self.assertNotIn("Index recommendations", render(profile))
+
+
+class TestCrdbSchemaInKit(unittest.TestCase):
+    def test_the_schema_joins_the_kit_file_set(self):
+        kit = dbprofiler.build_kit(schema_profile(), scale=1, procs=8)
+        self.assertIn("schema.crdb.sql", kit.files)
+
+    def test_the_driver_defaults_to_it(self):
+        kit = dbprofiler.build_kit(schema_profile(), scale=1, procs=8)
+        driver = kit.files["reproduce.sh"]
+        self.assertIn("schema.crdb.sql", driver)
+        # ... and only when --schema-file was not given.
+        self.assertIn('[[ -n "$SCHEMA_FILE"', driver)
+
+class TestRecommendationsIgnoreUndescribedIndexes(unittest.TestCase):
+    """A partial or expression index must not be judged by its column list."""
+
+    def recs(self, profile, table):
+        by_name = {t["name"]: t for t in profile["tables"]}
+        return dbprofiler.index_recommendations(
+            by_name[table], profile["indexes"], profile["relationships"]
+        )
+
+    def test_a_partial_index_is_not_called_a_duplicate(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_live_idx", ["status"], is_partial=True)
+        )
+        joined = " ".join(self.recs(profile, "customer"))
+        self.assertNotIn("customer_live_idx", joined)
+
+    def test_an_expression_index_is_not_called_a_duplicate(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_expr_idx", ["status"], has_expressions=True)
+        )
+        joined = " ".join(self.recs(profile, "customer"))
+        self.assertNotIn("customer_expr_idx", joined)
+
+    def test_a_partial_index_does_not_count_as_covering_a_foreign_key(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("orders", "orders_cust_partial", ["customer_id"], is_partial=True)
+        )
+        self.assertTrue(any("customer_id" in r for r in self.recs(profile, "orders")))
+
+class TestTargetUrl(unittest.TestCase):
+    """A target URL is recorded for the driver, never with its credentials.
+
+    The kit is a directory of files that gets copied, archived and shared. A
+    connection string written into it is a credential at rest, so the userinfo
+    is stripped before anything reaches disk and the identity comes from PGUSER
+    and PGPASSWORD at run time -- the pattern reproduce.sh already documents.
+    """
+
+    TARGET = f"postgresql://{HOST}:26257/example-db?sslmode=verify-full"
+    WITH_CREDS = f"postgresql://{USER}:{PASSWORD}@{HOST}:26257/example-db?sslmode=verify-full"
+
+    def test_the_env_var_is_named_for_the_tool(self):
+        self.assertEqual(dbprofiler.TARGET_URL_ENV_VAR, "DBPROFILER_TARGET_URL")
+
+    def test_a_clean_url_survives_intact(self):
+        dsn, had = dbprofiler.target_dsn(self.TARGET)
+        self.assertFalse(had)
+        self.assertIn(HOST, dsn)
+        self.assertIn("26257", dsn)
+        self.assertIn("example-db", dsn)
+        self.assertIn("sslmode=verify-full", dsn)
+
+    def test_a_password_never_survives(self):
+        dsn, had = dbprofiler.target_dsn(self.WITH_CREDS)
+        self.assertTrue(had)
+        self.assertNotIn(PASSWORD, dsn)
+
+    def test_a_username_is_stripped_too(self):
+        dsn, _ = dbprofiler.target_dsn(self.WITH_CREDS)
+        self.assertNotIn(USER, dsn)
+        self.assertNotIn("@", dsn)
+
+    def test_the_stripped_url_keeps_everything_that_is_not_secret(self):
+        dsn, _ = dbprofiler.target_dsn(self.WITH_CREDS)
+        for part in (HOST, "26257", "example-db", "sslmode=verify-full"):
+            with self.subTest(part=part):
+                self.assertIn(part, dsn)
+
+    def test_a_bad_scheme_is_refused(self):
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.target_dsn("mysql://" + HOST + "/example-db")
+
+    def test_an_error_never_quotes_the_url(self):
+        with self.assertRaises(dbprofiler.ConfigError) as caught:
+            dbprofiler.target_dsn("mysql://" + USER + ":" + PASSWORD + "@" + HOST + "/x")
+        message = str(caught.exception)
+        for secret in (PASSWORD, USER, HOST):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, message)
+
+    def test_a_url_with_no_host_is_refused(self):
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.target_dsn("postgresql:///example-db")
+
+
+class TestTargetUrlInKit(unittest.TestCase):
+    TARGET = f"postgresql://{HOST}:26257/example-db"
+    WITH_CREDS = f"postgresql://{USER}:{PASSWORD}@{HOST}:26257/example-db"
+
+    def kit(self, target=None):
+        return dbprofiler.build_kit(kit_profile(), scale=1, procs=8, target_url=target)
+
+    def test_the_driver_records_the_target(self):
+        driver = self.kit(self.TARGET).files["reproduce.sh"]
+        self.assertIn(self.TARGET, driver)
+
+    def test_no_credential_reaches_any_file(self):
+        for name, body in self.kit(self.WITH_CREDS).entries:
+            with self.subTest(name=name):
+                self.assertNotIn(PASSWORD, body)
+                self.assertNotIn(USER + ":", body)
+
+    def test_the_recorded_target_is_not_a_credentialed_url(self):
+        driver = self.kit(self.WITH_CREDS).files["reproduce.sh"]
+        self.assertIsNone(dbprofiler.CREDENTIALED_URL.search(driver))
+
+    def test_the_environment_still_overrides_at_run_time(self):
+        driver = self.kit(self.TARGET).files["reproduce.sh"]
+        self.assertIn("DBPROFILER_TARGET_URL", driver)
+        self.assertIn('${DSN:-', driver)
+
+    def test_without_a_target_the_driver_still_demands_one(self):
+        driver = self.kit().files["reproduce.sh"]
+        self.assertIn("DSN is not set", driver)
+
+    def test_the_cli_accepts_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                status = dbprofiler.main([
+                    "generate", "--bundle", str(bundle), "--output", str(out),
+                    "--target-url", self.TARGET,
+                ])
+            self.assertEqual(status, 0)
+            self.assertIn(self.TARGET, (out / "reproduce.sh").read_text())
+
+    def test_the_cli_reads_the_environment_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            env = {dbprofiler.TARGET_URL_ENV_VAR: self.TARGET}
+            with mock.patch.dict(os.environ, env, clear=False):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                    status = dbprofiler.main(
+                        ["generate", "--bundle", str(bundle), "--output", str(out)]
+                    )
+            self.assertEqual(status, 0)
+            self.assertIn(self.TARGET, (out / "reproduce.sh").read_text())
+
+    def test_the_cli_says_when_it_dropped_a_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = Path(tmp) / "kit"
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                dbprofiler.main([
+                    "generate", "--bundle", str(bundle), "--output", str(out),
+                    "--target-url", self.WITH_CREDS,
+                ])
+            message = stderr.getvalue()
+            self.assertIn("PGPASSWORD", message)
+            self.assertNotIn(PASSWORD, message)
+
+class TestKitManifest(unittest.TestCase):
+    """The kit records what it is, so the driver need not parse shell."""
+
+    def test_the_kit_carries_a_manifest(self):
+        kit = dbprofiler.build_kit(kit_profile(), scale=7, procs=4)
+        self.assertIn("kit.json", kit.files)
+        manifest = json.loads(kit.files["kit.json"])
+        self.assertEqual(manifest["schema"], KIT_SCHEMA)
+        self.assertEqual(manifest["procs"], 4)
+        self.assertEqual(manifest["scale"], 7)
+
+    def test_the_manifest_lists_tables_in_foreign_key_order(self):
+        manifest = json.loads(dbprofiler.build_kit(kit_profile()).files["kit.json"])
+        self.assertEqual(manifest["tables"], ["parent", "child"])
+
+    def test_the_manifest_names_the_generated_files(self):
+        manifest = json.loads(dbprofiler.build_kit(kit_profile()).files["kit.json"])
+        self.assertEqual(manifest["yaml"], f"{KIT_SCHEMA}.yaml")
+        self.assertEqual(manifest["schema_sql"], "schema.crdb.sql")
+
+    def test_read_kit_manifest_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "kit"
+            dbprofiler.write_kit(dbprofiler.build_kit(kit_profile(), scale=3, procs=8), out)
+            manifest = dbprofiler.read_kit_manifest(out)
+            self.assertEqual(manifest["procs"], 8)
+
+    def test_a_directory_that_is_not_a_kit_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(dbprofiler.ConfigError) as caught:
+                dbprofiler.read_kit_manifest(Path(tmp))
+        self.assertIn("kit.json", str(caught.exception))
+
+
+class TestTargetSqlAudit(unittest.TestCase):
+    """Statements issued against a reproduction target are a third category."""
+
+    def test_target_constants_are_enumerated(self):
+        names = {name for name, _ in dbprofiler.iter_target_sql_constants()}
+        self.assertTrue(names)
+        self.assertTrue(all(n.startswith("TARGET_SQL_") for n in names))
+
+    def test_analyze_is_allowed_against_a_target(self):
+        # The reproduction was just bulk loaded; the planner has nothing until
+        # its statistics are built. That is not a read of anyone's source.
+        self.assertEqual(dbprofiler.audit_target_sql("ANALYZE"), [])
+
+    def test_a_table_scan_is_still_refused(self):
+        self.assertTrue(dbprofiler.audit_target_sql("SELECT COUNT(*) FROM t"))
+
+    def test_create_statistics_is_still_refused(self):
+        self.assertTrue(dbprofiler.audit_target_sql("CREATE STATISTICS s ON a FROM t"))
+
+    def test_a_credentialed_url_is_refused(self):
+        self.assertTrue(
+            dbprofiler.audit_target_sql(f"-- postgres://{USER}:{PASSWORD}@{HOST}/db")
+        )
+
+    def test_no_shipped_target_constant_violates_the_rule(self):
+        for name, sql in dbprofiler.iter_target_sql_constants():
+            with self.subTest(name=name):
+                self.assertEqual(dbprofiler.audit_target_sql(sql), [])
+
+    def test_source_constants_still_ban_analyze(self):
+        self.assertTrue(dbprofiler.audit_sql("ANALYZE"))
+
+    def test_check_safety_reports_all_three_categories(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(dbprofiler.check_safety(), 0)
+        line = stdout.getvalue()
+        self.assertIn("SQL constant", line)
+        self.assertIn("target", line)
+        self.assertIn("emitted template", line)
+
+
+class TestReproduceConfig(unittest.TestCase):
+    TARGET = f"postgresql://{HOST}:26257/example-db"
+
+    def args(self, **kw):
+        base = dict(target_url=self.TARGET, psql_path="psql",
+                    dbworkload_path="dbworkload", timeout=3600)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_the_target_url_becomes_libpq_environment(self):
+        config = dbprofiler.build_target_config(self.args(), env={})
+        self.assertEqual(config.env["PGHOST"], HOST)
+        self.assertEqual(config.env["PGDATABASE"], "example-db")
+
+    def test_the_environment_variable_is_the_default(self):
+        config = dbprofiler.build_target_config(
+            self.args(target_url=None), env={dbprofiler.TARGET_URL_ENV_VAR: self.TARGET}
+        )
+        self.assertEqual(config.env["PGHOST"], HOST)
+
+    def test_a_missing_target_names_the_variable(self):
+        with self.assertRaises(dbprofiler.ConfigError) as caught:
+            dbprofiler.build_target_config(self.args(target_url=None), env={})
+        self.assertIn(dbprofiler.TARGET_URL_ENV_VAR, str(caught.exception))
+
+    def test_the_config_never_prints_its_password(self):
+        config = dbprofiler.build_target_config(
+            self.args(target_url=f"postgresql://{USER}:{PASSWORD}@{HOST}/example-db"), env={}
+        )
+        self.assertNotIn(PASSWORD, repr(config))
+
+    def test_the_timeout_is_generous_enough_for_a_load(self):
+        # A bulk load is not a catalog query; the collector's 300s would abort it.
+        self.assertGreaterEqual(dbprofiler.DEFAULT_REPRODUCE_TIMEOUT, 3600)
+
+
+class TestReproduceSteps(unittest.TestCase):
+    def test_the_steps_are_in_dependency_order(self):
+        self.assertEqual(
+            list(dbprofiler.REPRODUCE_STEPS),
+            ["schema", "generate", "load", "validate", "analyze"],
+        )
+
+    def test_an_unknown_step_is_refused(self):
+        with self.assertRaises(dbprofiler.ConfigError):
+            dbprofiler.selected_steps("schema,nonsense")
+
+    def test_a_subset_keeps_dependency_order(self):
+        self.assertEqual(dbprofiler.selected_steps("analyze,schema"), ["schema", "analyze"])
+
+    def test_no_selection_means_everything(self):
+        self.assertEqual(dbprofiler.selected_steps(None), list(dbprofiler.REPRODUCE_STEPS))
+
+
+class TestReproduceDrivesChildren(unittest.TestCase):
+    """What reproduce actually runs, without running anything."""
+
+    def kit_dir(self, tmp):
+        out = Path(tmp) / "kit"
+        dbprofiler.write_kit(dbprofiler.build_kit(kit_profile(), scale=1, procs=8), out)
+        (out / "csv").mkdir()
+        for table in ("parent", "child"):
+            (out / "csv" / f"{KIT_SCHEMA}.{table}.0_0_0.tsv").write_text("x\n")
+        return out
+
+    def run_with_spy(self, tmp, steps, regenerate=False):
+        calls = []
+
+        def spy(argv, config, what):
+            script = ""
+            if "-f" in argv:
+                path = Path(argv[argv.index("-f") + 1])
+                if path.is_file():
+                    script = path.read_text()
+            calls.append((what, list(argv), script))
+            return ""
+
+        args = argparse.Namespace(
+            kit=str(self.kit_dir(tmp)), target_url=f"postgresql://{HOST}:26257/example-db",
+            psql_path="psql", dbworkload_path="dbworkload",
+            timeout=dbprofiler.DEFAULT_REPRODUCE_TIMEOUT, steps=steps,
+            regenerate=regenerate,
+        )
+        with mock.patch.object(dbprofiler, "run_command", spy):
+            dbprofiler.run_reproduce(args)
+        return calls
+
+    def test_the_schema_step_applies_the_generated_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = self.run_with_spy(tmp, "schema")
+            self.assertEqual(len(calls), 1)
+            what, argv, _ = calls[0]
+            self.assertEqual(what, "psql")
+            self.assertIn("-f", argv)
+            self.assertTrue(any(a.endswith("schema.crdb.sql") for a in argv))
+
+    def test_the_generate_step_invokes_dbworkload_with_the_kit_procs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = self.run_with_spy(tmp, "generate", regenerate=True)
+            what, argv, _ = calls[0]
+            self.assertEqual(what, "dbworkload")
+            self.assertIn("csv", argv)
+            self.assertIn("-x", argv)
+            self.assertEqual(argv[argv.index("-x") + 1], "8")
+
+    def test_the_load_step_runs_one_psql_per_table_in_fk_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = self.run_with_spy(tmp, "load")
+            self.assertEqual([what for what, _, _ in calls], ["psql", "psql"])
+            scripts = "\n".join(script for _, _, script in calls)
+            self.assertIn("\\copy", scripts)
+            self.assertLess(scripts.index("parent"), scripts.index("child"))
+
+    def test_nothing_puts_a_credential_on_a_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for _, argv, _ in self.run_with_spy(tmp, "schema,generate,load"):
+                for arg in argv:
+                    with self.subTest(arg=arg):
+                        self.assertIsNone(dbprofiler.CREDENTIALED_URL.search(arg))
+                        self.assertNotIn(PASSWORD, arg)
+
+    def test_the_load_step_never_uses_stdin(self):
+        # run_command passes stdin=DEVNULL, so a \\copy FROM STDIN would hang.
+        with tempfile.TemporaryDirectory() as tmp:
+            for _, argv, script in self.run_with_spy(tmp, "load"):
+                self.assertNotIn("STDIN", (" ".join(argv) + script).upper())
+
+class TestLoadFailureExplanation(unittest.TestCase):
+    def test_a_foreign_key_violation_names_the_stub(self):
+        raw = dbprofiler.CommandError(
+            'psql exited with status 3: ERROR: insert on table "orders" violates '
+            'foreign key constraint "fk_orders_customer"'
+        )
+        explained = str(dbprofiler._explain_load_failure(raw, "orders"))
+        self.assertIn("keys.py", explained)
+        self.assertIn("expected", explained)
+
+    def test_the_original_error_is_kept(self):
+        raw = dbprofiler.CommandError("ERROR: violates foreign key constraint \"fk_x\"")
+        self.assertIn("fk_x", str(dbprofiler._explain_load_failure(raw, "t")))
+
+    def test_an_unrelated_failure_is_passed_through_untouched(self):
+        raw = dbprofiler.CommandError("psql: could not connect to server")
+        self.assertIs(dbprofiler._explain_load_failure(raw, "t"), raw)
+
+class TestUniqueColumnWarnings(unittest.TestCase):
+    def readme(self, profile):
+        return dbprofiler.build_kit(profile, scale=1, procs=8).files["README.md"]
+
+    def test_an_integer_primary_key_is_flagged(self):
+        readme = self.readme(schema_profile())
+        self.assertIn("orders.id", readme)
+        self.assertIn("duplicate key", readme.lower())
+
+    def test_a_uuid_primary_key_is_not_flagged(self):
+        readme = self.readme(schema_profile())
+        section = readme[readme.index("Unique columns"):] if "Unique columns" in readme else ""
+        self.assertNotIn("customer.id", section)
+
+    def test_a_unique_index_counts_too(self):
+        profile = schema_profile()
+        profile["indexes"].append(
+            kit_index("customer", "customer_status_uq", ["status"], is_unique=True)
+        )
+        self.assertIn("customer.status", self.readme(profile))
+
+    def test_a_duplicate_key_failure_names_the_stub(self):
+        raw = dbprofiler.CommandError(
+            'ERROR: duplicate key value violates unique constraint "orders_pkey"'
+        )
+        explained = str(dbprofiler._explain_load_failure(raw, "orders"))
+        self.assertIn("keys.py", explained)
+        self.assertIn("unique", explained.lower())
+
+class TestAnalyzeStep(unittest.TestCase):
+    def test_analyze_names_a_table(self):
+        # CockroachDB rejects a bare ANALYZE; PostgreSQL accepts either form.
+        self.assertIn("{table}", dbprofiler.TARGET_SQL_ANALYZE)
+        rendered = dbprofiler.TARGET_SQL_ANALYZE.format(table="s.t")
+        self.assertEqual(rendered.strip(), "ANALYZE s.t")
+
+    def test_one_analyze_per_table(self):
+        calls = []
+        config = dbprofiler.PostgresConfig(env={}, output=Path("."))
+        with mock.patch.object(dbprofiler, "run_psql", lambda sql, c: calls.append(sql) or []):
+            dbprofiler._reproduce_analyze(
+                {"schema": "shop", "tables": ["a", "b"]}, config
+            )
+        self.assertEqual(calls, ["ANALYZE shop.a", "ANALYZE shop.b"])
+
+class TestReproduceEntryPoints(unittest.TestCase):
+    """How much you supply decides where the one command starts."""
+
+    def test_a_kit_is_driven_directly(self):
+        self.assertEqual(dbprofiler.reproduce_start(kit="k", bundle=None), "kit")
+
+    def test_a_bundle_is_generated_then_driven(self):
+        self.assertEqual(dbprofiler.reproduce_start(kit=None, bundle="b.zip"), "bundle")
+
+    def test_neither_means_collect_first(self):
+        self.assertEqual(dbprofiler.reproduce_start(kit=None, bundle=None), "source")
+
+    def test_both_is_refused_rather_than_ranked(self):
+        with self.assertRaises(dbprofiler.ConfigError) as caught:
+            dbprofiler.reproduce_start(kit="k", bundle="b.zip")
+        self.assertIn("--kit", str(caught.exception))
+
+
+class TestReproduceFullPipeline(unittest.TestCase):
+    def args(self, tmp, **kw):
+        base = dict(
+            kit=None, bundle=None, workdir=str(tmp), scale=1, procs=8, schema=None,
+            steps="schema", regenerate=False, force=False,
+            target_url=f"postgresql://{HOST}:26257/example-db", url=None,
+            psql_path="psql", pg_dump_path="pg_dump", dbworkload_path="dbworkload",
+            timeout=dbprofiler.DEFAULT_REPRODUCE_TIMEOUT,
+            schema_include=None, schema_exclude=None, output=None,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_a_bundle_is_turned_into_a_kit_in_the_workdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            calls = []
+            with mock.patch.object(dbprofiler, "run_command",
+                                   lambda a, c, w: calls.append(w) or ""):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    dbprofiler.run_reproduce(self.args(tmp, bundle=str(bundle)))
+            self.assertTrue((Path(tmp) / "bundle-kit" / "kit.json").exists())
+            self.assertEqual(calls, ["psql"])
+
+    def test_collection_runs_when_nothing_is_supplied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collected = []
+
+            def fake_collect(args):
+                collected.append(Path(args.output))
+                write_kit_bundle(Path(tmp) / "src")
+                shutil.make_archive(str(Path(tmp) / "source-profile"), "zip",
+                                    str(Path(tmp) / "src"))
+                return 0
+
+            with mock.patch.object(dbprofiler, "run_postgres", fake_collect), \
+                 mock.patch.object(dbprofiler, "run_command", lambda a, c, w: ""):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    dbprofiler.run_reproduce(self.args(tmp))
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(collected[0].suffix, ".zip")
+            self.assertEqual(collected[0].parent, Path(tmp))
+
+    def test_the_workdir_defaults_to_the_current_directory(self):
+        self.assertEqual(dbprofiler.reproduce_workdir(None), Path.cwd())
+
+    def test_a_named_workdir_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(dbprofiler.reproduce_workdir(tmp), Path(tmp))
+
+    def test_stdout_is_the_kit_path_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_kit_bundle(Path(tmp) / "bundle")
+            out = io.StringIO()
+            with mock.patch.object(dbprofiler, "run_command", lambda a, c, w: ""):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    dbprofiler.run_reproduce(self.args(tmp, bundle=str(bundle)))
+            self.assertEqual(out.getvalue().strip(), str(Path(tmp) / "bundle-kit"))
+
+
+class TestReproduceCliSurface(unittest.TestCase):
+    def parse(self, argv):
+        return dbprofiler.build_parser().parse_args(argv)
+
+    def test_kit_is_no_longer_required(self):
+        args = self.parse(["reproduce"])
+        self.assertIsNone(args.kit)
+        self.assertIsNone(args.bundle)
+
+    def test_the_whole_pipeline_has_the_flags_it_needs(self):
+        args = self.parse(["reproduce", "--scale", "70", "--procs", "4",
+                           "--schema", "s", "--workdir", "/srv/work"])
+        self.assertEqual((args.scale, args.procs, args.schema), (70, 4, "s"))
+        self.assertEqual(args.workdir, "/srv/work")
 
 if __name__ == "__main__":
     unittest.main()
