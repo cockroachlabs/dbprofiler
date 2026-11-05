@@ -32,7 +32,40 @@ deliberately. A bundle carries a sample of the source data, and the README says 
   `--check-safety` enumerates them by reflection, and a query built inline is a query the
   audit cannot see.
 - Never issue `COUNT(*)`, `ANALYZE`, or `CREATE STATISTICS` against customer data. None of
-  the three may appear in `dbprofiler.py` at all; `--check-safety` enforces that.
+  the three may appear in any `SQL_*` constant; `--check-safety` enforces that.
+
+### Three kinds of SQL
+
+`SQL_*` constants are statements issued against a **source** database. The forbidden
+tokens must never appear in one, and every relation they read must be on the allowlist.
+
+`TARGET_SQL_*` constants are issued against a **reproduction target** the operator built
+and named. Refreshing that target's planner statistics is the right thing to do, so
+`ANALYZE` is allowed there. `COUNT(` and `CREATE STATISTICS` are not: a loaded
+reproduction can be enormous, nothing here needs a row count, and inventing statistics
+the source did not have would make the reproduction lie. `--check-safety` audits them on
+that rule, and `audit_target_sql()` is where it lives.
+
+### Statements issued versus artifacts written
+
+The ban above governs what this tool *issues*. `SQL_*` constants are statements sent to a
+source database, and the forbidden tokens must never appear in one.
+
+`EMIT_*` constants are different in kind: they are the text of files the `generate`
+subcommand *writes*, which an operator later runs against a reproduction database they
+built themselves. A script that bulk-loads a target and then refreshes its planner
+statistics is doing the right thing, and it is not reaching a source. So `EMIT_*` may
+contain `ANALYZE`.
+
+It may not contain anything else on the list. `COUNT(*)` stays banned everywhere, emitted
+text included — a generated script that scans a table teaches the wrong habit, and an
+emptiness check has `SELECT 1 ... LIMIT 1`. `--check-safety` audits `EMIT_*` for
+credentials, and the unit suite asserts that no emitted file contains `COUNT(`.
+
+The boundary that makes this safe is structural rather than textual, and it is tested:
+`generate` opens no connection and starts no child process. `audit_subprocess_usage()`
+permits exactly one subprocess call site in the whole file and the collector owns it, so
+a second one anywhere — including in the generate path — fails the audit.
 - `ANALYZE`, `CREATE STATISTICS`, and the DDL and DML around them are permitted in
   `integration_test.py`, and only there, against the uniquely named disposable schema that
   test creates and drops. That is not a loophole in the boundary: the tool reads statistics

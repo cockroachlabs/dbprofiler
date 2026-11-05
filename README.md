@@ -160,6 +160,127 @@ The bundle is published atomically. It is built in a temporary file beside the
 destination, flushed to disk, and moved into place with a rename, so an interrupted run
 leaves either the previous bundle or nothing — never a truncated archive.
 
+## Generating a reproduction
+
+A bundle describes a database; `generate` turns that description into the kit that builds
+one.
+
+```bash
+python3 dbprofiler.py generate --bundle source-profile.zip --scale 1000
+```
+
+`--output` defaults to a `-kit` directory beside the bundle, so the pair stays together;
+pass it to put the kit somewhere else.
+
+`--target-url`, or `DBPROFILER_TARGET_URL`, records the reproduction target in the kit so
+`reproduce.sh` has a default to connect to — the mirror of `DBPROFILER_POSTGRES_URL` on
+the collection side. Nothing in the tool connects to it. **Its username and password are
+stripped before it is written**: a kit is a directory of files that gets copied and
+shared, so the identity is supplied at run time by `PGUSER` and `PGPASSWORD` instead.
+`DSN` and `DBPROFILER_TARGET_URL` in the environment both override what was recorded.
+
+It reads the bundle and writes files. It opens no connection and starts no child process,
+so it cannot reach either the source or the target — the kit it writes is what an operator
+runs, when they choose to.
+
+`--bundle` takes a `.zip` or an extracted directory, at any path, and `--output` is
+independent of it, so a bundle can be archived wherever you keep them. Payloads are
+verified against `manifest.json` before anything is derived. A bundle that has been
+extracted and re-zipped is read as well as a freshly published one: a single top-level
+directory prefix is resolved, and macOS resource-fork entries are ignored.
+
+```text
+kit/
+├── schema.crdb.sql    # CockroachDB schema, one section per table
+├── <schema>.yaml      # dbworkload generation definition
+├── gen_yaml.py        # rebuilds that definition from the bundle
+├── keys.py            # stub: keys that must agree across tables
+├── workload.py        # stub: the workload, plus bootstrap and finalize
+├── gen_import.py      # emits IMPORT INTO, in foreign-key order
+├── reproduce.sh       # driver: schema, load, validate, refresh, run
+└── README.md          # what was derived, and what still needs judgment
+```
+
+`schema.crdb.sql` is grouped by table rather than by kind the way a dump is: each
+table's columns, primary key, indexes, foreign keys and index recommendations sit
+together, and tables are in foreign-key order so the file applies top to bottom. It is
+synthesized from `profile.json`, so it carries no CHECK constraints, no partial-index
+predicates and no expression keys — each affected index is emitted commented out and
+named, and the header says `schema.sql` remains the source of truth for the real schema.
+
+Recommendations are structural: a foreign key with no index behind it, an index that is a
+prefix of another, a primary key that only increases (and will hotspot), a leading column
+with too few distinct values. A table with nothing worth saying gets no block.
+
+Column shape is derived from the statistics: type from the declared type, ranges from
+histogram bounds, value frequencies from the most-common lists, null fractions and widths
+as recorded, and row counts from the planner's estimates divided by `--scale`.
+
+`--procs` is part of the data definition rather than a performance setting. dbworkload
+derives one sub-seed per generation process from it, so the same definition generated with
+a different `-x` is different data.
+
+Three things do not follow from per-column statistics, and `generate` emits them as stubs
+that say so rather than as plausible guesses:
+
+- **Keys that span tables.** Each column is generated independently, so a child's foreign
+  key holds a value its parent does not have. Until `keys.py` is implemented, joins return
+  nothing. The foreign keys and their fan-out are listed there.
+- **Which most-common values are a vocabulary.** They are reproduced verbatim, which is
+  right for statuses and types the schema's constraints are written against, and wrong for
+  identifiers that should be synthesized at the same shape and cardinality.
+- **The workload.** `observations/pg_stat_statements.csv` has the statement text and call
+  counts to transcribe it from.
+
+The generated `README.md` lists these per bundle, with the table it applies to.
+
+Regenerating over an existing kit is safe. The derived files are refreshed, and a `keys.py`
+or `workload.py` that differs from a fresh stub is kept and reported rather than
+overwritten — so changing `--scale` after implementing a key generator does not cost that
+work. `--force` replaces the stubs instead.
+
+## Building a reproduction
+
+```bash
+export DBPROFILER_POSTGRES_URL='postgres://...'      # the source
+export DBPROFILER_TARGET_URL='postgresql://host:26257/reproduction?sslmode=verify-full'
+export PGUSER=someone
+read -rs PGPASSWORD && export PGPASSWORD
+
+python3 dbprofiler.py reproduce --scale 1000
+```
+
+One command, from a downloaded `dbprofiler.py` in any directory: it collects the source
+profile, derives a kit beside it, applies the schema, generates the data, loads every
+table in foreign-key order, validates the foreign keys and refreshes the target's
+statistics.
+
+How much you supply decides where it starts, so a run can be resumed rather than redone:
+
+| Invocation | Starts at |
+| --- | --- |
+| `reproduce` | collect from `DBPROFILER_POSTGRES_URL` |
+| `reproduce --bundle b.zip` | derive a kit from that bundle |
+| `reproduce --kit ./b-kit` | drive that kit |
+
+`--workdir` says where a collected bundle and derived kit land (default: the current
+directory). `--steps` runs a subset (`schema`, `generate`, `load`, `validate`,
+`analyze`), so each stage is independently re-runnable.
+
+The target database must already exist; everything inside it is created by the kit.
+
+This is the one part of the tool that writes to a database, and it writes only to the
+target you name. It reuses the same single child-process call site the collector uses, so
+the audited guarantees hold unchanged: credentials reach `psql` through the environment,
+never on a command line, and `--check-safety` still enforces exactly one call site.
+Statements issued against a target are `TARGET_SQL_*` constants, audited separately from
+the `SQL_*` constants that address a source.
+
+A kit whose `keys.py` is still a stub will stop during the load, on a duplicate key or a
+foreign key violation. That is the stub working as designed — every column is generated
+independently until `keys.py` says otherwise — and the error says so rather than leaving
+you to infer it from a constraint name. The kit's `README.md` lists the affected columns.
+
 ## What this release does not do
 
 Deliberately out of scope for now, so that what is here can be reviewed as a whole:
@@ -167,6 +288,8 @@ Deliberately out of scope for now, so that what is here can be reviewed as a who
 - **PostgreSQL 16 only.** Other majors are refused rather than approximated; the catalog
   and statistics shapes this reads are version-specific.
 - **No other source types.** MySQL and Oracle would each be their own subcommand.
+- **`generate` does not load anything.** It writes a kit; running it is the operator's
+  step, and the stubs it leaves have to be filled before a reproduction is meaningful.
 - **Tier 1 workload telemetry only** — table, index, and statement counters. Per-block
   I/O, replication, bgwriter and WAL, and function statistics are not collected.
 - **No redaction or masking.** Statistics are published as PostgreSQL computed them.

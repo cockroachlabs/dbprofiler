@@ -1,6 +1,11 @@
 # Local test environment — contains connection strings. Never commit.
 .env.test.local
 
+# Per-machine Claude Code state: permission grants and absolute paths from
+# whoever ran it. .claude/rules/ and .claude/skills/ are shared and tracked;
+# this one is not.
+.claude/settings.local.json
+
 # Profile bundles produced by running the tool, and anything extracted from one.
 # A bundle carries a sample of the source database: statistics values, query
 # text, and the schema. None of it belongs in a public repository.
@@ -11,6 +16,12 @@ source-profile/
 **/observations/
 **/profile.json
 **/schema.sql
+
+# Pasted captures dropped into the fixture directory. Every real fixture there
+# is a recorded `psql --csv` capture with synthetic values, and the loader only
+# ever reads `.csv` -- so a `.txt` is something a human pasted, usually straight
+# out of a DB Console, carrying a real application's schema and query text.
+testdata/golden/*.txt
 
 # Python
 __pycache__/
